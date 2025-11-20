@@ -335,6 +335,34 @@ void runFilterOnGpu(Parameters & par, BaseMatrix * subMat,
 }
 #endif
 
+#ifdef HAVE_DPU
+#include "DpuPrefilterHostPipeline.h"
+
+void runFilterOnDpu(
+    Parameters& par,
+    BaseMatrix* subMat,
+    int8_t* tinySubMat,
+    DBReader<unsigned int>* qdbr,
+    DBReader<unsigned int>* tdbr,
+    SequenceLookup* sequenceLookup,
+    bool sameDB,
+    DBWriter& resultWriter,
+    EvalueComputation* evaluer,
+    QueryMatcherTaxonomyHook* taxonomyHook,
+    int alignmentMode) {
+  
+    int numDpus = par.dpuNumDpus;
+    if (numDpus <= 0) {
+        Debug(Debug::WARNING) << "DPU count <= 0 (" << numDpus << ") - defaulting to 8 DPUs to avoid allocation error\n";
+        numDpus = 8;
+    }
+    mmseqs::dpu::DpuPrefilterHostPipeline pipeline(numDpus);
+    pipeline.runPrefilterOnDpu(par, subMat, tinySubMat, qdbr, tdbr, 
+                                                         sequenceLookup, sameDB, resultWriter,
+                                                         evaluer, taxonomyHook, alignmentMode);
+}
+#endif
+
 void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
                     DBReader<unsigned int> * qdbr, DBReader<unsigned int> * tdbr,
                     SequenceLookup * sequenceLookup, bool sameDB, DBWriter & resultWriter, EvalueComputation * evaluer,
@@ -551,6 +579,15 @@ int prefilterInternal(int argc, const char **argv, const Command &command, int m
                        resultWriter, evaluer, taxonomyHook);
 #else
         Debug(Debug::ERROR) << "MMseqs2 was compiled without CUDA support\n";
+        EXIT(EXIT_FAILURE);
+#endif
+    }else if(par.dpu){
+#ifdef HAVE_DPU
+        runFilterOnDpu(par, subMat, tinySubMat, qdbr, tdbr,
+                    sequenceLookup, sameDB, resultWriter,
+                    evaluer, taxonomyHook, mode);
+#else
+        Debug(Debug::ERROR)<< "DPU not available\n";
         EXIT(EXIT_FAILURE);
 #endif
     }else{

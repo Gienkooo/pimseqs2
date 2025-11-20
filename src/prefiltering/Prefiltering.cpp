@@ -15,6 +15,10 @@
 #include "FastSort.h"
 #include <sys/mman.h>
 
+#ifdef HAVE_DPU
+#include "dpu/DpuPrefilterHostPipeline.h"
+#endif
+
 #ifdef OPENMP
 #include <omp.h>
 #endif
@@ -786,6 +790,38 @@ bool Prefiltering::runSplit(const std::string &resultDB, const std::string &resu
     Debug(Debug::INFO) << "Query db start " << (queryFrom + 1) << " to " << queryFrom + querySize << "\n";
     Debug(Debug::INFO) << "Target db start " << (dbFrom + 1) << " to " << dbFrom + dbSize << "\n";
     Debug::Progress progress(querySize);
+
+#ifdef HAVE_DPU
+    const Parameters& par = Parameters::getInstance(); 
+    
+    if (par.dpu) {
+        mmseqs::dpu::DpuPrefilterHostPipeline pipeline(par.dpuNumDpus);
+        Parameters& nonConstPar = const_cast<Parameters&>(par);
+
+        pipeline.runPrefilterOnDpu(
+            nonConstPar,
+            kmerSubMat,                // BaseMatrix*
+            NULL,                      // tinySubMat (not used for kmer)
+            qdbr,                      // Query DB
+            tdbr,                      // Target DB
+            sequenceLookup,            // SequenceLookup
+            sameQTDB,                  // sameDB flag
+            tmpDbw,                    // ResultWriter
+            NULL,                      // EvalueComputation* (not used for kmer)
+            taxonomyHook,              // Taxonomy
+            Parameters::PREF_MODE_KMER // Mode 0
+        );
+
+        // Cleanup
+        delete[] notEmpty;
+        for (size_t i = 0; i < localThreads; ++i) delete reslens[i];
+        delete[] reslens;
+
+        tmpDbw.close(merge);
+
+        return true; 
+    }
+#endif
 
 #pragma omp parallel num_threads(localThreads)
     {

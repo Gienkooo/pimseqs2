@@ -103,6 +103,11 @@ Parameters::Parameters():
         PARAM_SIMILARITYSCORE(PARAM_SIMILARITYSCORE_ID, "--similarity-type", "Similarity type", "Type of score used for clustering. 1: alignment score 2: sequence identity", typeid(int), (void *) &similarityScoreType, "^[1-2]{1}$", MMseqsParameter::COMMAND_CLUST | MMseqsParameter::COMMAND_EXPERT),
         // logging
         PARAM_V(PARAM_V_ID, "-v", "Verbosity", "Verbosity level: 0: quiet, 1: +errors, 2: +warnings, 3: +info", typeid(int), (void *) &verbosity, "^[0-3]{1}$", MMseqsParameter::COMMAND_COMMON),
+        // dpu
+        PARAM_DPU(PARAM_DPU_ID, "--dpu", "Use DPU", "Use UPMEM DPU accelerator if available", typeid(int), (void *) &dpu, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_DPU_NUM_DPUS(PARAM_DPU_NUM_DPUS_ID, "--dpu-num-dpus", "Number of DPUs", "Number of DPUs to use (0: auto-detect)", typeid(int), (void *) &dpuNumDpus, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DPU_BATCH_SIZE(PARAM_DPU_BATCH_SIZE_ID, "--dpu-batch-size", "DPU batch size", "Number of sequences per DPU batch (0: use config default)", typeid(int), (void *) &dpuBatchSize, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DPU_SHARD_SIZE(PARAM_DPU_SHARD_SIZE_ID, "--dpu-shard-size", "DPU shard size", "Database shard size in MB (0: use config default)", typeid(int), (void *) &dpuShardSize, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         // gpu
         PARAM_GPU(PARAM_GPU_ID, "--gpu", "Use GPU", "Use GPU (CUDA) if possible", typeid(int), (void *) &gpu, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
         PARAM_GPU_SERVER(PARAM_GPU_SERVER_ID, "--gpu-server", "Use GPU server", "Use GPU server", typeid(int), (void *) &gpuServer, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
@@ -395,6 +400,7 @@ Parameters::Parameters():
     alignall.push_back(&PARAM_THREADS);
     alignall.push_back(&PARAM_COMPRESSED);
     alignall.push_back(&PARAM_V);
+    alignall.push_back(&PARAM_DPU);
 
     // alignment
     align.push_back(&PARAM_SUB_MAT);
@@ -412,6 +418,8 @@ Parameters::Parameters():
     align.push_back(&PARAM_MAX_SEQ_LEN);
     align.push_back(&PARAM_NO_COMP_BIAS_CORR);
     align.push_back(&PARAM_NO_COMP_BIAS_CORR_SCALE);
+
+    align.push_back(&PARAM_DPU);
 
     align.push_back(&PARAM_MAX_REJECTED);
     align.push_back(&PARAM_MAX_ACCEPT);
@@ -463,6 +471,7 @@ Parameters::Parameters():
     prefilter.push_back(&PARAM_PCB);
     prefilter.push_back(&PARAM_SPACED_KMER_PATTERN);
     prefilter.push_back(&PARAM_LOCAL_TMP);
+    prefilter.push_back(&PARAM_DPU);
     prefilter.push_back(&PARAM_THREADS);
     prefilter.push_back(&PARAM_COMPRESSED);
     prefilter.push_back(&PARAM_V);
@@ -478,6 +487,7 @@ Parameters::Parameters():
     ungappedprefilter.push_back(&PARAM_MAX_SEQS);
     ungappedprefilter.push_back(&PARAM_TAXON_LIST);
     ungappedprefilter.push_back(&PARAM_PRELOAD_MODE);
+    ungappedprefilter.push_back(&PARAM_DPU);
     ungappedprefilter.push_back(&PARAM_GPU);
     ungappedprefilter.push_back(&PARAM_GPU_SERVER);
     ungappedprefilter.push_back(&PARAM_GPU_SERVER_WAIT_TIMEOUT);
@@ -869,6 +879,7 @@ Parameters::Parameters():
     createdb.push_back(&PARAM_MASK_PROBABILTY);
     createdb.push_back(&PARAM_MASK_LOWER_CASE);
     createdb.push_back(&PARAM_MASK_N_REPEAT);
+    createdb.push_back(&PARAM_DPU);
     createdb.push_back(&PARAM_GPU);
     createdb.push_back(&PARAM_V);
 
@@ -1556,6 +1567,7 @@ Parameters::Parameters():
     gpuserver.push_back(&PARAM_PREF_MODE);
 
     // tsv2exprofiledb
+    tsv2exprofiledb.push_back(&PARAM_DPU);
     tsv2exprofiledb.push_back(&PARAM_GPU);
     tsv2exprofiledb.push_back(&PARAM_THREADS);
     tsv2exprofiledb.push_back(&PARAM_COMPRESSED);
@@ -2575,6 +2587,11 @@ void Parameters::setDefaults() {
         gpuServer = 1;
     }
 #endif
+    // DPU defaults
+    dpu = 0;             // do not use DPU by default
+    dpuNumDpus = 8;      // default to 8 DPUs unless user overrides (0 = auto-detect)
+    dpuBatchSize = 0;    // 0 = use config default
+    dpuShardSize = 0;    // 0 = use config default (MB)
     //extractorfs
     orfMinLength = 30;
     orfMaxLength = 32734;

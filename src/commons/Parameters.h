@@ -406,6 +406,10 @@ public:
     size_t maxSeqLen;                    // sequence length
     size_t maxResListLen;                // Maximal result list length per query
     int    verbosity;                    // log level
+    int    dpu;
+    int    dpuNumDpus;
+    int    dpuBatchSize;
+    int    dpuShardSize;
     int    gpu;                          // use GPU
     int    gpuServer;                    // use the gpu server
     int    gpuServerWaitTimeout;         // wait for this many seconds until GPU server is ready
@@ -861,6 +865,11 @@ public:
 
     // logging
     PARAMETER(PARAM_V)
+    // dpu
+    PARAMETER(PARAM_DPU)
+    PARAMETER(PARAM_DPU_NUM_DPUS)
+    PARAMETER(PARAM_DPU_BATCH_SIZE)
+    PARAMETER(PARAM_DPU_SHARD_SIZE)
     std::vector<MMseqsParameter*> clust;
     // gpu
     PARAMETER(PARAM_GPU)

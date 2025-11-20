@@ -36,6 +36,9 @@ set(TESTS
         TestUngappedCpuPerf.cpp
         )
 
+# DPU smoke test (requires HAVE_DPU and is built when tests are enabled)
+list(APPEND TESTS TestDpuSmoke.cpp)
+
 
 FOREACH (TEST ${TESTS})
     mmseqs_setup_test(${TEST})

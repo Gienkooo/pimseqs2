@@ -7,6 +7,14 @@ set(ENABLE_WERROR 0 CACHE BOOL "Enable Warnings as Errors")
 set(REQUIRE_OPENMP 1 CACHE BOOL "Require availability of OpenMP")
 set(ATOMIC_LIB_OVERRIDE "" CACHE PATH "Override path to libatomic")
 
+# DPU sources are built in lib/dpu as a separate target (`mmseqs_dpu`).
+# Avoid globbing or adding the lib/dpu directory here to prevent double
+# compilation or duplicate add_subdirectory() errors. The top-level
+# CMakeLists.txt will add the lib/dpu subdirectory when DPU support is
+# enabled.
+set(dpu_source_files "")
+set(dpu_header_files "")
+
 include(AppendTargetProperty)
 
 add_subdirectory(alignment)
@@ -121,13 +129,13 @@ if (NOT DISABLE_IPS4O)
     if (ATOMIC_LIB_OVERRIDE)
         add_library(LibAtomic STATIC IMPORTED)
         set_target_properties(LibAtomic PROPERTIES IMPORTED_LOCATION ${ATOMIC_LIB_OVERRIDE})
-        target_link_libraries(mmseqs-framework LibAtomic)
+    target_link_libraries(mmseqs-framework PUBLIC LibAtomic)
         target_compile_definitions(mmseqs-framework PUBLIC -DENABLE_IPS4O=1)
         message("-- IPS4O sorting forced with ${ATOMIC_LIB_OVERRIDE}")
     else()
         find_package(Atomic)
         if (ATOMIC_FOUND)
-            target_link_libraries(mmseqs-framework ${ATOMIC_LIBRARIES})
+            target_link_libraries(mmseqs-framework PUBLIC ${ATOMIC_LIBRARIES})
             target_compile_definitions(mmseqs-framework PUBLIC -DENABLE_IPS4O=1)
             message("-- IPS4O sorting works")
         else ()
@@ -138,10 +146,29 @@ else ()
     message("-- OMPTL sorting fallback")
 endif ()
 
-target_link_libraries(mmseqs-framework tinyexpr ${ZSTD_LIBRARIES} microtar tantan block_aligner_c)
+target_link_libraries(mmseqs-framework PUBLIC tinyexpr ${ZSTD_LIBRARIES} microtar tantan block_aligner_c)
 # if (CYGWIN)
 #     target_link_libraries(mmseqs-framework nedmalloc)
 # endif ()
+
+if(HAVE_DPU)
+    # Prefer linking the DPU::sdk interface target so mmseqs-framework gets
+    # the correct include directories and interface libraries. Fall back to
+    # raw linker flags when DPU::sdk is not available.
+    if(TARGET DPU::sdk)
+        target_link_libraries(mmseqs-framework PUBLIC DPU::sdk)
+        if(TARGET mmseqs_dpu)
+            target_link_libraries(mmseqs-framework PUBLIC mmseqs_dpu)
+        endif()
+    else()
+        separate_arguments(DPU_LDFLAGS_LIST UNIX_COMMAND "${DPU_LDFLAGS_CACHED}")
+    target_link_libraries(mmseqs-framework PUBLIC ${DPU_LDFLAGS_LIST})
+    endif()
+endif()
+
+# DPU: linking of SDK flags for the final executable is done after the
+# executable target is created (see bottom of this file). Removing early
+# linking here prevents trying to link to a target that does not yet exist.
 
 if (EMSCRIPTEN)
     target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_ZLIB=1 -DHAVE_BZLIB=1)
@@ -168,7 +195,7 @@ if (ZLIB_FOUND)
         message("-- ZLIB works")
         target_include_directories(mmseqs-framework PUBLIC ${ZLIB_INCLUDE_DIRS})
         target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_ZLIB=1)
-        target_link_libraries(mmseqs-framework ${ZLIB_LIBRARIES})
+    target_link_libraries(mmseqs-framework PUBLIC ${ZLIB_LIBRARIES})
     else ()
         message("-- ZLIB does not work")
     endif()
@@ -196,7 +223,7 @@ if (BZIP2_FOUND)
         message("-- BZLIB works")
         target_include_directories(mmseqs-framework PUBLIC ${BZIP_INCLUDE_DIRS})
         target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_BZLIB=1)
-        target_link_libraries(mmseqs-framework ${BZIP2_LIBRARIES})
+    target_link_libraries(mmseqs-framework PUBLIC ${BZIP2_LIBRARIES})
     else ()
         message("-- BZLIB does not work")
     endif()
@@ -213,7 +240,7 @@ if (HAVE_MPI)
         target_include_directories(mmseqs-framework PUBLIC ${MPI_INCLUDE_PATH})
         #Hack (OMPI_SKIP_MPICXX=1): https://github.com/open-mpi/ompi/issues/5157#issuecomment-388495496
         target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_MPI=1 -DOMPI_SKIP_MPICXX=1)
-        target_link_libraries(mmseqs-framework ${MPI_LIBRARIES})
+    target_link_libraries(mmseqs-framework PUBLIC ${MPI_LIBRARIES})
         append_target_property(mmseqs-framework COMPILE_FLAGS ${MPI_COMPILE_FLAGS})
         append_target_property(mmseqs-framework LINK_FLAGS ${MPI_LINK_FLAGS})
     endif ()
@@ -234,7 +261,7 @@ if (OPENMP_FOUND)
         endforeach ()
         set(OpenMP_CXX_LIBRARIES ${FILTERED_LIBRARIES})
     endif ()
-    target_link_libraries(mmseqs-framework ${OpenMP_CXX_LIBRARIES})
+    target_link_libraries(mmseqs-framework PUBLIC ${OpenMP_CXX_LIBRARIES})
     target_include_directories(mmseqs-framework PUBLIC ${OpenMP_CXX_INCLUDE_DIRS})
     append_target_property(mmseqs-framework COMPILE_FLAGS ${OpenMP_CXX_FLAGS})
     append_target_property(mmseqs-framework LINK_FLAGS ${OpenMP_CXX_FLAGS})
@@ -256,10 +283,10 @@ endif ()
 if (ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_CUDA=1)
-    target_link_libraries(mmseqs-framework marv)
+    target_link_libraries(mmseqs-framework PUBLIC marv)
     if (FORCE_STATIC_DEPS)
         # link to rt explicitly so it doesn't get statically compiled and adds GLIBC_PRIVATE symbols
-        target_link_libraries(mmseqs-framework rt)
+    target_link_libraries(mmseqs-framework PUBLIC rt)
         # remove librt.a which introduces GLIBC_PRIVATE symbols
         get_property(linked_libraries TARGET CUDA::cudart_static_deps PROPERTY INTERFACE_LINK_LIBRARIES)
         set(FILTERED_LIBRARIES "")
@@ -270,8 +297,18 @@ if (ENABLE_CUDA)
         endforeach ()
         set_target_properties(CUDA::cudart_static_deps PROPERTIES INTERFACE_LINK_LIBRARIES "${FILTERED_LIBRARIES}")
     endif ()
-    target_link_libraries(mmseqs-framework CUDA::cudart_static)
+    target_link_libraries(mmseqs-framework PUBLIC CUDA::cudart_static)
 endif ()
+
+# Add DPU kernel paths to compile definitions
+if(DEFINED DPU_KERNEL_BINARIES)
+    foreach(KERNEL_BIN ${DPU_KERNEL_BINARIES})
+        get_filename_component(KERNEL_NAME "${KERNEL_BIN}" NAME_WE)
+        string(TOUPPER ${KERNEL_NAME} KERNEL_NAME_UPPER)
+        target_compile_definitions(mmseqs-framework PUBLIC 
+            "DPU_KERNEL_${KERNEL_NAME_UPPER}=\"${KERNEL_BIN}\"")
+    endforeach()
+endif()
 
 if (NOT FRAMEWORK_ONLY)
     include(MMseqsSetupDerivedTarget)
@@ -281,6 +318,37 @@ if (NOT FRAMEWORK_ONLY)
     add_executable(mmseqs${EXE_SUFFIX} ${mmseqs_source_files})
     mmseqs_setup_derived_target(mmseqs${EXE_SUFFIX})
     target_link_libraries(mmseqs${EXE_SUFFIX} version)
+    
+    # If DPU SDK flags were cached at project top-level, forward them to the
+    # final executable so the linker sees -L and -l entries (libdpu etc.).
+    if(HAVE_DPU)
+        # Prefer linking the convenient interface target DPU::sdk which
+        # encapsulates include dirs and link libraries created by the
+        # FindUPMEM module. Fall back to older behavior when it's not present.
+        if(TARGET DPU::sdk)
+            target_link_libraries(mmseqs${EXE_SUFFIX} DPU::sdk)
+            message(STATUS "[DPU] Linked mmseqs executable with DPU::sdk")
+        else()
+            # Older fallback: try to link individual imported targets, or
+            # finally raw linker flags from pkg-config.
+            set(DPU_IMPORTED_USED 0)
+            string(REGEX MATCHALL "-l[^ ]+" DPU_LIB_NAME_FLAGS "${DPU_LDFLAGS_CACHED}")
+            foreach(LIB_FLAG ${DPU_LIB_NAME_FLAGS})
+                string(REGEX REPLACE "-l" "" LIB_NAME "${LIB_FLAG}")
+                if(TARGET DPU::${LIB_NAME})
+                    target_link_libraries(mmseqs${EXE_SUFFIX} DPU::${LIB_NAME})
+                    set(DPU_IMPORTED_USED 1)
+                endif()
+            endforeach()
+            if(NOT DPU_IMPORTED_USED)
+                separate_arguments(DPU_LDFLAGS_LIST UNIX_COMMAND "${DPU_LDFLAGS_CACHED}")
+                target_link_libraries(mmseqs${EXE_SUFFIX} ${DPU_LDFLAGS_LIST})
+                message(STATUS "[DPU] Linked mmseqs executable with: ${DPU_LDFLAGS_LIST}")
+            else()
+                message(STATUS "[DPU] Linked mmseqs executable with imported DPU targets")
+            endif()
+        endif()
+    endif()
     install(TARGETS mmseqs${EXE_SUFFIX} DESTINATION bin)
 
     if (HAVE_TESTS)

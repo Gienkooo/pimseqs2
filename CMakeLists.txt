@@ -301,7 +301,15 @@ if (ENABLE_CUDA)
     add_subdirectory(lib/libmarv/src EXCLUDE_FROM_ALL)
 endif ()
 
+option(ENABLE_DPU "Enable UPMEM DPU support" OFF)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindUPMEM.cmake)
+find_upmem_dpu()
+
 add_subdirectory(lib/alp)
+if (ENABLE_DPU)
+    # add_subdirectory(lib/dpu)
+endif()
 add_subdirectory(lib/ksw2)
 add_subdirectory(data)
 add_subdirectory(src)
