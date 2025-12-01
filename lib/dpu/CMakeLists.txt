@@ -5,8 +5,12 @@ if(NOT HAVE_DPU)
     return()
 endif()
 
-# Auto-find DPU compiler
-find_program(DPU_COMPILER dpu-upmem-dpurte-clang)
+# Use DPU compiler found by FindUPMEM.cmake, or find it if not already set
+if(NOT UPMEM_DPU_COMPILER)
+    find_program(DPU_COMPILER dpu-upmem-dpurte-clang)
+else()
+    set(DPU_COMPILER "${UPMEM_DPU_COMPILER}")
+endif()
 
 if(NOT DPU_COMPILER)
     message(WARNING "[DPU-Kernels] dpu-upmem-dpurte-clang not found - skipping kernels")
@@ -83,8 +87,9 @@ foreach(KERNEL_SRC ${KERNEL_SOURCES})
         COMMAND ${DPU_COMPILER} -O2 -g 
                 -DNR_TASKLETS=1
                 ${DPU_INCLUDE_FLAGS}
+                -I${CMAKE_CURRENT_SOURCE_DIR}/shared
                 -o ${KERNEL_BIN} ${KERNEL_SRC}
-        DEPENDS ${KERNEL_SRC}
+        DEPENDS ${KERNEL_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/shared/DpuSharedTypes.h
         COMMENT "[DPU] Compiling kernel: ${KERNEL_NAME}"
         VERBATIM
     )
