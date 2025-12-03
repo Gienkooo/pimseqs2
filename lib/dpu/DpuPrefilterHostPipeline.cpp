@@ -73,6 +73,7 @@ static std::vector<KmerEntry> buildQueryKmerHashTableWithSimilar(
     std::vector<KmerEntry> table(table_size, {0, 0, 0});
     uint32_t mask = table_size - 1;
     totalKmersInserted = 0;
+    size_t totalKmersAttempted = 0;
     
     int windowSize = (spacedPattern && patternSpan > 0) ? patternSpan : k;
     if (query.size() < (size_t)windowSize) return table;
@@ -92,11 +93,12 @@ static std::vector<KmerEntry> buildQueryKmerHashTableWithSimilar(
         }
         
         std::pair<size_t*, size_t> kmerList = kmerGen->generateKmerList(kmer);
+        totalKmersAttempted += kmerList.second;
         
         for (size_t i = 0; i < kmerList.second; i++) {
             uint32_t kmerVal = (uint32_t)kmerList.first[i];
             uint32_t idx = kmerVal & mask;
-            for (int p = 0; p < 8; p++) {
+            for (int p = 0; p < 256; p++) {
                 uint32_t slot = (idx + p) & mask;
                 if (table[slot].kmer == 0) {
                     table[slot].kmer = kmerVal;
@@ -111,6 +113,13 @@ static std::vector<KmerEntry> buildQueryKmerHashTableWithSimilar(
             }
         }
     }
+    
+    if (totalKmersInserted < totalKmersAttempted) {
+        Debug(Debug::WARNING) << "[DPU] Hash table collision/full: inserted " << totalKmersInserted 
+                              << " of " << totalKmersAttempted << " kmers (" 
+                              << (totalKmersAttempted - totalKmersInserted) << " dropped)\n";
+    }
+    
     return table;
 }
 
@@ -180,7 +189,7 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
         }
     }
     
-    const uint32_t HASH_TABLE_SIZE = 262144;  // 256K entries for similar k-mers
+    const uint32_t HASH_TABLE_SIZE = 2097152;  // 2M entries for similar k-mers
     
     uint64_t totalCells = 0;
     uint64_t totalHits = 0;

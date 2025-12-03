@@ -8,8 +8,8 @@
 
 #include "DpuSharedTypes.h"
 
-#define MAX_TARGET_WRAM_LEN 2048
-#define MAX_DIAG_COUNTERS 512
+#define MAX_TARGET_WRAM_LEN 4096
+#define MAX_DIAG_COUNTERS 4096
 
 #ifndef NR_TASKLETS
 #define NR_TASKLETS 1
@@ -21,8 +21,7 @@ BARRIER_INIT(my_barrier, NR_TASKLETS);
 
 typedef struct {
     uint16_t diagonal;
-    uint8_t count;
-    uint8_t valid;
+    uint16_t count;
 } DiagCounter;
 
 int main() {
@@ -76,7 +75,6 @@ int main() {
         mram_read((__mram_ptr void*)seq_addr, task_target_seq, aligned_len);
 
         for (int d = 0; d < MAX_DIAG_COUNTERS; d++) {
-            diag_counters[d].valid = 0;
             diag_counters[d].count = 0;
         }
         int num_diag_slots_used = 0;
@@ -109,7 +107,7 @@ int main() {
             
             uint32_t hash_idx = target_kmer & hash_mask;
             
-            for (int probe = 0; probe < 8; probe++) {
+            for (int probe = 0; probe < 512; probe++) {
                 uint32_t slot = (hash_idx + probe) & hash_mask;
                 uintptr_t entry_addr = hash_table_addr + slot * sizeof(KmerEntry);
                 
@@ -123,37 +121,36 @@ int main() {
                     
                     int found_slot = -1;
                     for (int d = 0; d < num_diag_slots_used; d++) {
-                        if (diag_counters[d].valid && diag_counters[d].diagonal == diag) {
+                        if (diag_counters[d].count > 0 && diag_counters[d].diagonal == diag) {
                             found_slot = d;
                             break;
                         }
                     }
                     
                     if (found_slot >= 0) {
-                        if (diag_counters[found_slot].count < 255) {
+                        if (diag_counters[found_slot].count < 65535) {
                             diag_counters[found_slot].count++;
                         }
                     } else if (num_diag_slots_used < MAX_DIAG_COUNTERS) {
                         diag_counters[num_diag_slots_used].diagonal = diag;
                         diag_counters[num_diag_slots_used].count = 1;
-                        diag_counters[num_diag_slots_used].valid = 1;
                         num_diag_slots_used++;
                     }
                 }
             }
         }
         
-        uint8_t best_count = 0;
+        uint16_t best_count = 0;
         uint16_t best_diag = 0;
         for (int d = 0; d < num_diag_slots_used; d++) {
-            if (diag_counters[d].valid && diag_counters[d].count > best_count) {
+            if (diag_counters[d].count > best_count) {
                 best_count = diag_counters[d].count;
                 best_diag = diag_counters[d].diagonal;
             }
         }
         
         if (best_count >= 2) {
-            h.score = best_count;
+            h.score = (int16_t)best_count;
             h.diagonal = (int16_t)best_diag;
         }
         

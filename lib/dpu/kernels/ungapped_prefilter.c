@@ -10,8 +10,8 @@
 #include "DpuSharedTypes.h"
 
 #define KERNEL_AA_SLOTS 21
-#define MAX_TARGET_WRAM_LEN 2048
-#define MAX_QUERY_LEN_FOR_DIAG 2048
+#define MAX_TARGET_WRAM_LEN 4096
+#define MAX_QUERY_LEN_FOR_DIAG 4096
 
 #ifndef NR_TASKLETS
 #define NR_TASKLETS 4

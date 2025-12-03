@@ -20,10 +20,22 @@ typedef enum { DOWN, RIGHT } Direction;
 #define QUERY_CHUNK_SIZE 512
 #define GAP_OPEN 11
 #define GAP_EXTEND 1
-#define W 32
+#define W 256
 #define NEG_INF -32768
 #define MAX_SCORE 32767
 #define X_DROP 2137
+
+typedef struct {
+    int16_t ppv[W];
+    int16_t pv[W];
+    int16_t fv[W];
+    int16_t ev[W];
+    int16_t cv[W];
+    int16_t uv[W];
+    int16_t lv[W];
+    int8_t scv[W];
+    int16_t cv_subvec[W];
+} GappedScoreScratch;
 
 __dma_aligned BatchDescriptor g_bd;
 BARRIER_INIT(my_barrier, NR_TASKLETS);
@@ -111,10 +123,16 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
                                  uint32_t q_len, uintptr_t pssm_mram_base,
                                  int32_t best_diag_idx_ungapped,
                                  int16_t *out_score, uint16_t *out_q_end,
-                                 uint16_t *out_t_end) {
+                                 uint16_t *out_t_end,
+                                 GappedScoreScratch *scratch) {
     const int16_t Gi = GAP_OPEN;
     const int16_t Ge = GAP_EXTEND;
-    int16_t ppv[W], pv[W], fv[W], ev[W], cv[W];
+    int16_t *ppv = scratch->ppv;
+    int16_t *pv = scratch->pv;
+    int16_t *fv = scratch->fv;
+    int16_t *ev = scratch->ev;
+    int16_t *cv = scratch->cv;
+    
     for (uint16_t k = 0; k < W; ++k) { ppv[k] = fv[k] = ev[k] = NEG_INF; pv[k] = 0; }
     
     ppv[(W >> 1) + 1] = 0; pv[W >> 1] = -6; pv[(W >> 1) + 1] = -6;
@@ -137,7 +155,8 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
         if (i <= (W >> 1)) direction = (prev_direction == DOWN) ? RIGHT : DOWN;
         else direction = (pv[W - 1] > pv[0]) ? DOWN : RIGHT;
         
-        int16_t uv[W], lv[W];
+        int16_t *uv = scratch->uv;
+        int16_t *lv = scratch->lv;
         if (direction == DOWN) {
             j++;
             memcpy(uv, pv, W * sizeof(int16_t));
@@ -170,9 +189,9 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
         if (update_len > 0) {
             uint32_t v_a_start = max(i - min3(i, (W >> 1) - 1, B_LEN - j) - 1, 0);
             uint32_t v_b_start = j - min3(j, (W >> 1) + 1, A_LEN - i + 1);
-            int8_t scv[W];
+            int8_t *scv = scratch->scv;
             calc(pssm_mram_base, v_a_start, &target_seq[v_b_start], update_len, scv);
-            int16_t cv_subvec[W];
+            int16_t *cv_subvec = scratch->cv_subvec;
             for (uint32_t k = 0; k < update_len; k++) {
                 uint32_t idx = ppv_start + k;
                 int16_t considered_cv_elem = sat_add(ppv[idx], (int16_t)scv[k]);
@@ -216,7 +235,8 @@ int main() {
     uint8_t *task_target_seq = (uint8_t *)mem_alloc(MAX_TARGET_WRAM_LEN);
     uint32_t diag_buf_size = (QUERY_CHUNK_SIZE + MAX_TARGET_WRAM_LEN) * sizeof(int16_t);
     int16_t *task_diag_buf = (int16_t *)mem_alloc(diag_buf_size);
-    if (!task_target_seq || !task_diag_buf) {
+    GappedScoreScratch *scratch = (GappedScoreScratch *)mem_alloc(sizeof(GappedScoreScratch));
+    if (!task_target_seq || !task_diag_buf || !scratch) {
         return 0;
     }
 
@@ -258,7 +278,12 @@ int main() {
             uint16_t gapped_q_end = 0, gapped_t_end = 0;
             compute_gapped_score(task_target_seq, meta.target_len, query_len, 
                                 mram_base + g_bd.pssm_data_offset, best_diag, 
-                                &gapped_score, &gapped_q_end, &gapped_t_end);
+                                &gapped_score, &gapped_q_end, &gapped_t_end, scratch);
+            
+            if (gapped_score < min_score_threshold) {
+                gapped_score = 0;
+            }
+
             h.score = gapped_score;
             h.q_end = gapped_q_end;
             h.t_end = gapped_t_end;

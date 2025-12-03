@@ -1,0 +1,1 @@
+sudo apt update && sudo apt install -y python3-pip && python3 -m pip install --upgrade pip setuptools wheel && python3 -m pip install pandas
