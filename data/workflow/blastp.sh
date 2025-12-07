@@ -64,7 +64,13 @@ while [ "$STEP" -lt "$STEPS" ]; do
           $RUNNER "$MMSEQS" ungappedprefilter "$INPUT" "$TARGET" "$TMP_PATH/pref_$STEP" $UNGAPPEDPREFILTER_PAR \
               || fail "Ungapped prefilter died"
       elif [ "$PREFMODE" = "UNGAPPED_AND_GAPPED" ]; then
-          :
+          # For DPU/CPU: run gapped prefilter to generate prefilter hits
+          # For GPU: skip prefilter step, GPU will output alignments directly
+          if [ "$DPU" = "1" ] || [ "$GPU" != "1" ]; then
+              # shellcheck disable=SC2086
+              $RUNNER "$MMSEQS" ungappedprefilter "$INPUT" "$TARGET" "$TMP_PATH/pref_$STEP" $UNGAPPEDPREFILTER_PAR \
+                  || fail "Gapped prefilter died"
+          fi
       else
           # shellcheck disable=SC2086
           $RUNNER "$MMSEQS" prefilter "$INPUT" "$TARGET" "$TMP_PATH/pref_$STEP" $PREFILTER_PAR -s "$SENS" \
@@ -75,8 +81,8 @@ while [ "$STEP" -lt "$STEPS" ]; do
     # 2. alignment module
     if [ "$STEPS" -eq 1 ]; then
         if notExists "$3.dbtype"; then
-            if [ "$PREFMODE" = "UNGAPPED_AND_GAPPED" ]; then
-              # The GPU based ungapped prefilter als generate alignments
+            if [ "$PREFMODE" = "UNGAPPED_AND_GAPPED" ] && [ "$GPU" = "1" ] && [ "$DPU" != "1" ]; then
+              # The GPU based ungapped prefilter also generates alignments directly
               # shellcheck disable=SC2086
               $RUNNER "$MMSEQS" ungappedprefilter "$INPUT" "$TARGET" "$3" $UNGAPPEDPREFILTER_PAR  \
                   || fail "Alignment died"

@@ -6,6 +6,9 @@
 #include "QueryMatcher.h"
 #include "QueryMatcherTaxonomyHook.h"
 #include "SubstitutionMatrix.h"
+#include "KmerGenerator.h"
+#include "Indexer.h"
+#include "ExtendedSubstitutionMatrix.h"
 #include "Alignment.h"
 #include <cstring>
 #include <unistd.h>
@@ -16,17 +19,20 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <chrono>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace mmseqs::dpu {
 
 DpuPrefilterHostPipeline::DpuPrefilterHostPipeline(uint32_t num_dpus)
     : dpu_comm_(num_dpus) {
-    fprintf(stderr, "[DPU HOST] Initialized DPU pipeline with %u DPUs\n", num_dpus);
+    Debug(Debug::INFO) << "[DPU] Initialized pipeline with " << num_dpus << " DPUs\n";
 }
 
-DpuPrefilterHostPipeline::~DpuPrefilterHostPipeline() {
-    fprintf(stderr, "[DPU HOST] Shutting down DPU pipeline\n");
-}
+DpuPrefilterHostPipeline::~DpuPrefilterHostPipeline() {}
 
 void DpuPrefilterHostPipeline::runPrefilterOnDpu(
     Parameters& par, BaseMatrix* subMat, int8_t* tinySubMat,
@@ -35,130 +41,210 @@ void DpuPrefilterHostPipeline::runPrefilterOnDpu(
     EvalueComputation* evaluer, QueryMatcherTaxonomyHook* taxonomyHook,
     int alignmentMode) {
 
-    fprintf(stderr, "[DPU HOST] Dispatch: par.prefMode=%d alignmentMode=%d\n", par.prefMode, alignmentMode);
+    Debug(Debug::INFO) << "[DPU] Dispatch: prefMode=" << par.prefMode << " alignMode=" << alignmentMode << "\n";
 
-    if (par.prefMode == Parameters::PREF_MODE_KMER) {
-        // Mode 0: K-mer Prefilter
-        runDpuKmerBatch(par, subMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
-    }
-    else if (par.prefMode == Parameters::PREF_MODE_UNGAPPED) {
-        // Mode 1: Ungapped Alignment
-        runDpuUngappedBatch(par, subMat, tinySubMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
-    } 
-    else if (par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) {
-        // Mode 2: Gapped Alignment
+    if (alignmentMode == 1 || par.prefMode == Parameters::PREF_MODE_EXHAUSTIVE || 
+        par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) {
         runDpuGappedBatch(par, subMat, tinySubMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
-    } 
-    else {
-        fprintf(stderr, "[DPU HOST] WARNING: Requested prefilter mode %d is not implemented on DPU. Falling back to CPU or skipping.\n", par.prefMode);
+    } else if (par.prefMode == Parameters::PREF_MODE_UNGAPPED) {
+        runDpuUngappedBatch(par, subMat, tinySubMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
+    } else if (par.prefMode == Parameters::PREF_MODE_KMER) {
+        if (alignmentMode == 0 && tinySubMat != NULL) {
+            runDpuUngappedBatch(par, subMat, tinySubMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
+        } else {
+            runDpuKmerBatch(par, subMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
+        }
+    } else {
+        Debug(Debug::WARNING) << "[DPU] Mode " << par.prefMode << " not supported, falling back to ungapped\n";
+        runDpuUngappedBatch(par, subMat, tinySubMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
     }
 }
 
-static std::vector<KmerEntry> buildKmerIndex(
-    const std::vector<std::vector<uint8_t>>& queries,
-    uint32_t size,
-    int k)
+static std::vector<KmerEntry> buildQueryKmerHashTableWithSimilar(
+    const std::vector<uint8_t>& query,
+    uint32_t table_size,
+    int k,
+    KmerGenerator* kmerGen,
+    Indexer* indexer,
+    size_t& totalKmersInserted,
+    const uint8_t* spacedPattern = nullptr,
+    int patternSpan = 0)
 {
-    std::vector<KmerEntry> table(size, {0,0,0});
-    uint32_t mask = size - 1;
+    std::vector<KmerEntry> table(table_size, {0, 0, 0});
+    uint32_t mask = table_size - 1;
+    totalKmersInserted = 0;
+    size_t totalKmersAttempted = 0;
     
-    for (size_t qId = 0; qId < queries.size(); ++qId) {
-        const auto& seq = queries[qId];
-        if (seq.size() < (size_t)k) continue;
+    int windowSize = (spacedPattern && patternSpan > 0) ? patternSpan : k;
+    if (query.size() < (size_t)windowSize) return table;
 
-        uint32_t kmer = 0;
-        for (int i=0; i<k-1; i++) kmer = (kmer << 5) | (seq[i] & 0x1F);
-
-        for (int i=k-1; i<seq.size(); i++) {
-            kmer = ((kmer << 5) | (seq[i] & 0x1F)) & 0x3FFFFFFF;
-            
-            // Simple Hash Insert
-            uint32_t idx = kmer & mask;
-            for (int p=0; p<4; p++) {
-                uint32_t curr = (idx + p) & mask;
-                if (table[curr].kmer == 0 && table[curr].query_id == 0) {
-                    table[curr] = {kmer, (uint16_t)qId, (uint16_t)i};
+    unsigned char kmerBuf[32];
+    
+    for (size_t pos = 0; pos <= query.size() - windowSize; pos++) {
+        const unsigned char* kmer;
+        
+        if (spacedPattern && patternSpan > 0) {
+            for (int j = 0; j < k; j++) {
+                kmerBuf[j] = query[pos + spacedPattern[j]];
+            }
+            kmer = kmerBuf;
+        } else {
+            kmer = query.data() + pos;
+        }
+        
+        std::pair<size_t*, size_t> kmerList = kmerGen->generateKmerList(kmer);
+        totalKmersAttempted += kmerList.second;
+        
+        for (size_t i = 0; i < kmerList.second; i++) {
+            uint32_t kmerVal = (uint32_t)kmerList.first[i];
+            uint32_t idx = kmerVal & mask;
+            for (int p = 0; p < 256; p++) {
+                uint32_t slot = (idx + p) & mask;
+                if (table[slot].kmer == 0) {
+                    table[slot].kmer = kmerVal;
+                    table[slot].query_id = 0;
+                    table[slot].query_pos = (uint16_t)pos;
+                    totalKmersInserted++;
+                    break;
+                }
+                if (table[slot].kmer == kmerVal) {
                     break;
                 }
             }
         }
     }
+    
+    if (totalKmersInserted < totalKmersAttempted) {
+        Debug(Debug::WARNING) << "[DPU] Hash table collision/full: inserted " << totalKmersInserted 
+                              << " of " << totalKmersAttempted << " kmers (" 
+                              << (totalKmersAttempted - totalKmersInserted) << " dropped)\n";
+    }
+    
     return table;
 }
-
-// Forward declaration for verification helper defined later
-static int16_t verifyScoreOnHost(const std::vector<uint8_t>& target_seq, const std::vector<int8_t>& pssm, uint32_t q_len);
 
 void DpuPrefilterHostPipeline::runDpuKmerBatch(
     Parameters& par, BaseMatrix* subMat, DBReader<unsigned int>* qdbr,
     DBReader<unsigned int>* tdbr, EvalueComputation* evaluer,
     QueryMatcherTaxonomyHook* taxonomyHook, bool sameDB, DBWriter& resultWriter) {
     
-    fprintf(stderr, "[DPU HOST] DPU K-mer batch processing.\n");
+    Debug(Debug::INFO) << "[DPU] K-mer prefilter: " << qdbr->getSize() << " queries, " << tdbr->getSize() << " targets\n";
     
     const uint32_t num_dpus = dpu_comm_.getNumDPUsActive();
-    if (num_dpus == 0) return;
+    if (num_dpus == 0) {
+        Debug(Debug::ERROR) << "[DPU] No active DPUs available\n";
+        return;
+    }
 
-        // Choose kernel path relative to repo root when available (build area),
-        // otherwise fallback to in-tree installed path. Print chosen path for debugging.
-        const char* kPathKmer = "lib/mmseqs/dpu/kmer_prefilter";
-        if (access("build/lib/dpu/kernels/kmer_prefilter", F_OK) != -1) {
-            kPathKmer = "build/lib/dpu/kernels/kmer_prefilter";
-        }
-        fprintf(stderr, "[DPU HOST] Loading DPU kernel (kmer): %s\n", kPathKmer);
-        dpu_comm_.loadKernel(kPathKmer);
+    const char* kPathKmer = "lib/mmseqs/dpu/kmer_prefilter";
+    if (access("build/lib/dpu/kernels/kmer_prefilter", F_OK) != -1) {
+        kPathKmer = "build/lib/dpu/kernels/kmer_prefilter";
+    }
+    dpu_comm_.loadKernel(kPathKmer);
 
-    uint32_t totalQueries = qdbr->getSize();
-    // Batch queries (per-DPU broadcast)
-    const uint32_t Q_BATCH_SIZE = 128;
-
-    for (size_t qStart = 0; qStart < totalQueries; qStart += Q_BATCH_SIZE) {
-        size_t qEnd = std::min(qStart + Q_BATCH_SIZE, (size_t)totalQueries);
+    int ksize = par.kmerSize;
+    if (ksize <= 0) ksize = 6;
+    
+    int kmerThr = par.kmerScore.values.sequence();
+    if (kmerThr == INT_MAX) {
+        kmerThr = 112;
+    }
+    
+    int alphabetSize = subMat->alphabetSize;
+    KmerGenerator* kmerGen = new KmerGenerator(ksize, alphabetSize, (short)kmerThr);
+    Indexer* indexer = new Indexer(alphabetSize, ksize);
+    
+    ScoreMatrix extMatTwo = ExtendedSubstitutionMatrix::calcScoreMatrix(*subMat, 2);
+    ScoreMatrix extMatThree = ExtendedSubstitutionMatrix::calcScoreMatrix(*subMat, 3);
+    kmerGen->setDivideStrategy(&extMatThree, &extMatTwo);
+    
+    bool useSpacedKmers = (par.spacedKmer != 0);
+    uint8_t spacedPattern[16] = {0};
+    int patternSpan = ksize;
+    
+    if (useSpacedKmers) {
+        const int8_t* rawPattern = nullptr;
+        int rawPatternLen = 0;
         
-        // 1. Prepare query batch and k-mer index
-        std::vector<std::vector<uint8_t>> query_batch;
-        std::vector<uint32_t> query_keys;
-        std::vector<uint32_t> query_lens;
-
-        for (size_t q = qStart; q < qEnd; ++q) {
-            size_t len = qdbr->getSeqLen(q);
-            const char* seq = qdbr->getData(q, 0);
-            
-            std::vector<uint8_t> encoded(len);
-            for(size_t i=0; i<len; i++) {
-                // Convert to Index (same as ungapped fix)
-                unsigned char aa = static_cast<unsigned char>(seq[i]);
-                encoded[i] = (subMat->aa2num) ? subMat->aa2num[aa] : 20;
-                if (encoded[i] >= 21) encoded[i] = 20;
+        switch (ksize) {
+            case 6:  rawPattern = spaced_seed_6;  rawPatternLen = sizeof(spaced_seed_6);  break;
+            case 7:  rawPattern = spaced_seed_7;  rawPatternLen = sizeof(spaced_seed_7);  break;
+            case 8:  rawPattern = spaced_seed_8;  rawPatternLen = sizeof(spaced_seed_8);  break;
+            case 9:  rawPattern = spaced_seed_9;  rawPatternLen = sizeof(spaced_seed_9);  break;
+            case 10: rawPattern = spaced_seed_10; rawPatternLen = sizeof(spaced_seed_10); break;
+            default: useSpacedKmers = false; break;
+        }
+        
+        if (rawPattern && rawPatternLen > 0) {
+            int patternIdx = 0;
+            for (int i = 0; i < rawPatternLen && patternIdx < ksize; i++) {
+                if (rawPattern[i]) {
+                    spacedPattern[patternIdx++] = (uint8_t)i;
+                }
             }
-            query_batch.push_back(encoded);
-            query_keys.push_back(qdbr->getDbKey(q));
-            query_lens.push_back(len);
+            patternSpan = rawPatternLen;
+            Debug(Debug::INFO) << "[DPU] Spaced k-mers: k=" << ksize << " span=" << patternSpan << "\n";
+        } else {
+            useSpacedKmers = false;
+        }
+    }
+    
+    const uint32_t HASH_TABLE_SIZE = 2097152;  // 2M entries for similar k-mers
+    
+    uint64_t totalCells = 0;
+    uint64_t totalHits = 0;
+    uint64_t totalSimilarKmers = 0;
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
+    uint64_t targetTotalLen = 0;
+    for (size_t t = 0; t < tdbr->getSize(); ++t) {
+        targetTotalLen += tdbr->getSeqLen(t);
+    }
+    
+    uint32_t maxQueryLen = 0;
+
+    for (size_t qId = 0; qId < qdbr->getSize(); ++qId) {
+        // SIMULATOR: Reload kernel to reset WRAM state between queries
+        dpu_comm_.loadKernel(kPathKmer);
+        
+        uint32_t queryKey = qdbr->getDbKey(qId);
+        uint32_t queryLen = qdbr->getSeqLen(qId);
+        const char* querySeq = qdbr->getData(qId, 0);
+        
+        if (queryLen > maxQueryLen) maxQueryLen = queryLen;
+        totalCells += (uint64_t)queryLen * targetTotalLen;
+
+        std::vector<uint8_t> encodedQuery(queryLen);
+        for (size_t i = 0; i < queryLen; i++) {
+            unsigned char aa = static_cast<unsigned char>(querySeq[i]);
+            encodedQuery[i] = (subMat->aa2num) ? subMat->aa2num[aa] : 20;
+            if (encodedQuery[i] >= 21) encodedQuery[i] = 20;
         }
 
-        // Build hash table (power-of-two size)
-        uint32_t table_size = 32768;
-        int ksize = par.kmerSize;
-        if (ksize <= 0) ksize = 6;
-        std::vector<KmerEntry> index = buildKmerIndex(query_batch, table_size, ksize);
+        size_t kmersInserted = 0;
+        std::vector<KmerEntry> hashTable = buildQueryKmerHashTableWithSimilar(
+            encodedQuery, HASH_TABLE_SIZE, ksize, kmerGen, indexer, kmersInserted,
+            useSpacedKmers ? spacedPattern : nullptr, patternSpan);
+        totalSimilarKmers += kmersInserted;
 
-        // 2. Split targets among DPUs
+        Debug(Debug::INFO) << "[DPU] Kmer query " << (qId + 1) << "/" << qdbr->getSize()
+                           << " (len=" << queryLen << ", kmers=" << kmersInserted << ")\n";
+
+        // Split targets among DPUs
         uint32_t totalTargets = tdbr->getSize();
         uint32_t targetsPerDpu = (totalTargets + num_dpus - 1) / num_dpus;
-        
         std::vector<uint32_t> res_offsets(num_dpus), res_sizes(num_dpus);
 
-        // Precompute global offsets for BD and Hash Table so we can broadcast the
-        // static hash table once and then scatter per-DPU descriptors and targets.
+        // MRAM layout: [BatchDescriptor][HashTable][TargetMeta][TargetData][Results]
         uint32_t bd_aligned = DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor));
-        uint32_t table_off_global = bd_aligned;
-        uint32_t table_size_aligned = DpuCommunicationManager::alignToMram(index.size() * sizeof(KmerEntry));
+        uint32_t hash_off = bd_aligned;
+        uint32_t hash_size_aligned = DpuCommunicationManager::alignToMram(hashTable.size() * sizeof(KmerEntry));
 
-        // Broadcast the hash table once (padded to aligned size)
+        // Broadcast hash table
         {
-            std::vector<uint8_t> index_buf(table_size_aligned, 0);
-            memcpy(index_buf.data(), index.data(), index.size() * sizeof(KmerEntry));
-            dpu_comm_.broadcastData(index_buf.data(), index_buf.size(), table_off_global);
+            std::vector<uint8_t> hash_buf(hash_size_aligned, 0);
+            memcpy(hash_buf.data(), hashTable.data(), hashTable.size() * sizeof(KmerEntry));
+            dpu_comm_.broadcastData(hash_buf.data(), hash_buf.size(), hash_off);
         }
 
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
@@ -170,10 +256,8 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
             std::vector<TargetMetadata> tmeta;
             assembleTargetBatch(tdbr, start_t, count_t, packed_targets, tmeta, subMat);
 
-            // Offsets (BD at 0, table at table_off_global)
-            uint32_t off = DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor));
-            uint32_t table_off = table_off_global;
-            off = table_off + table_size_aligned;
+            // Compute offsets
+            uint32_t off = hash_off + hash_size_aligned;
             uint32_t t_meta_off = off; off += DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata));
             uint32_t t_data_off = off; off += DpuCommunicationManager::alignToMram(packed_targets.size());
             uint32_t res_off = off;
@@ -183,23 +267,24 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
             res_offsets[dpu_idx] = res_off;
             res_sizes[dpu_idx] = res_size;
 
-            // Descriptor (per-DPU) and scatter to that DPU only
             BatchDescriptor bd;
             memset(&bd, 0, sizeof(bd));
-            bd.num_queries = query_batch.size();
+            bd.num_queries = 1;
             bd.num_targets = count_t;
-            bd.query_len = (query_lens.empty()) ? 0 : query_lens[0];
-            bd.pssm_data_offset = table_off;
-            bd.pssm_total_size = index.size() * sizeof(KmerEntry); // Pass size in bytes
+            bd.query_len = queryLen;
+            bd.pssm_data_offset = hash_off;
+            bd.pssm_total_size = HASH_TABLE_SIZE;
             bd.kmer_size = ksize;
             bd.targets_metadata_offset = t_meta_off;
             bd.targets_data_offset = t_data_off;
             bd.results_offset = res_off;
+            memcpy(bd.spaced_pattern, spacedPattern, sizeof(bd.spaced_pattern));
+            bd.spaced_pattern_span = (uint8_t)patternSpan;
+            bd.use_spaced_kmers = useSpacedKmers ? 1 : 0;
 
-            // Scatter per-DPU descriptor (do NOT broadcast the per-DPU descriptor)
-            dpu_comm_.scatterDataToDPU(dpu_idx, &bd, sizeof(bd), 0);
+            dpu_comm_.scatterDataToDPU(dpu_idx, &bd, bd_aligned, 0);
 
-            // Scatter Targets
+            // Scatter targets
             if (count_t > 0) {
                 std::vector<uint8_t> meta_buf(DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata)), 0);
                 memcpy(meta_buf.data(), tmeta.data(), tmeta.size() * sizeof(TargetMetadata));
@@ -212,12 +297,8 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
         }
 
         dpu_comm_.executeKernels();
-        // Read and print any DPU-side log output (kernel printf)
-        dpu_comm_.readAndPrintLog();
-        std::string resultBuffer;
 
-        // 3. Gather results per local query id
-        std::vector<std::vector<hit_t>> queryResults(query_batch.size());
+        std::vector<hit_t> hits;
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
             if (res_sizes[dpu_idx] == 0) continue;
             std::vector<Hit> results(res_sizes[dpu_idx] / sizeof(Hit));
@@ -225,21 +306,18 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
 
             for (const auto& hit : results) {
                 if (hit.score <= 0) continue;
-                uint32_t local_q = hit.query_id;
-                if (local_q >= query_batch.size()) continue; // guard
+                totalHits++;
 
                 hit_t shortHit;
                 shortHit.seqId = tdbr->getDbKey(hit.target_id);
                 shortHit.prefScore = hit.score;
                 shortHit.diagonal = hit.diagonal;
-                queryResults[local_q].push_back(shortHit);
+                hits.push_back(shortHit);
             }
         }
 
-        // 4. Post-process per-query: sort, limit, write
-        for (size_t local_q = 0; local_q < queryResults.size(); ++local_q) {
-            auto &hits = queryResults[local_q];
-            if (hits.empty()) continue;
+        // Sort, limit, write
+        if (!hits.empty()) {
             std::sort(hits.begin(), hits.end(), hit_t::compareHitsByScoreAndId);
             size_t keep = std::min(hits.size(), (size_t)par.maxResListLen);
             std::string resultBuffer;
@@ -248,10 +326,20 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
                 size_t len = QueryMatcher::prefilterHitToBuffer(outbuf, hits[i]);
                 resultBuffer.append(outbuf, len);
             }
-            uint32_t outQueryKey = query_keys[local_q];
-            resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), outQueryKey, 0);
+            resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
         }
     }
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    double seconds = std::chrono::duration<double>(endTime - startTime).count();
+    double gcups = (double)totalCells / seconds / 1e9;
+    
+    Debug(Debug::INFO) << "[DPU] Kmer complete: " << gcups << " GCUPS, " << totalHits << " hits in " << seconds << "s\n";
+    
+    ExtendedSubstitutionMatrix::freeScoreMatrix(extMatTwo);
+    ExtendedSubstitutionMatrix::freeScoreMatrix(extMatThree);
+    delete kmerGen;
+    delete indexer;
 }
 
 void DpuPrefilterHostPipeline::runDpuGappedBatch(
@@ -260,33 +348,88 @@ void DpuPrefilterHostPipeline::runDpuGappedBatch(
     EvalueComputation* evaluer, QueryMatcherTaxonomyHook* taxonomyHook,
     bool sameDB, DBWriter& resultWriter) {
     
-    fprintf(stderr, "[DPU HOST] DPU Ungapped+Gapped batch processing (PREF_MODE_UNGAPPED_AND_GAPPED).\n");
+    Debug(Debug::INFO) << "[DPU] Gapped batch: " << qdbr->getSize() << " queries, " << tdbr->getSize() << " targets\n";
 
     const uint32_t num_dpus = dpu_comm_.getNumDPUsActive();
-    if (num_dpus == 0) return;
+    if (num_dpus == 0) {
+        Debug(Debug::ERROR) << "[DPU] No active DPUs available\n";
+        return;
+    }
 
-    // 1. Load the Gapped Kernel
-    // Ensure this kernel is compiled and available at this path
     const char* kPath = "lib/mmseqs/dpu/gapped_prefilter";
     if (access("build/lib/dpu/kernels/gapped_prefilter", F_OK) != -1) {
         kPath = "build/lib/dpu/kernels/gapped_prefilter";
     }
-    fprintf(stderr, "[DPU HOST] Loading DPU kernel (gapped): %s\n", kPath);
     dpu_comm_.loadKernel(kPath);
 
-    // 2. Pre-allocate Composition Bias Buffer
     std::vector<float> compositionBias;
     if (par.compBiasCorrection) {
         compositionBias.resize(qdbr->getMaxSeqLen() + 1, 0.0f);
     }
 
-    // 3. Iterate Over Queries
+    uint32_t batch_flags = (par.prefMode == Parameters::PREF_MODE_EXHAUSTIVE) ? 1 : 0;
+    
+    uint64_t totalCells = 0;
+    uint64_t totalHits = 0;
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
+    uint64_t targetTotalLen = 0;
+    for (size_t t = 0; t < tdbr->getSize(); ++t) {
+        targetTotalLen += tdbr->getSeqLen(t);
+    }
+    
+    // Karlin-Altschul parameters for BLOSUM62 with gap penalties (11, 1)
+    const double K = 0.041;
+    const double lambda = 0.267;
+    const double n = static_cast<double>(targetTotalLen);
+    const double targetEvalue = par.evalThr > 0.0 ? par.evalThr : 0.001;
+    const int16_t MIN_SCORE_FLOOR = 15;
+    
+    uint32_t totalTargets = tdbr->getSize();
+    uint32_t targetsPerDpu = (totalTargets + num_dpus - 1) / num_dpus;
+    
+    // Pre-assemble target data for each DPU (optimization: targets don't change per query)
+    std::vector<std::vector<uint8_t>> perDpuTargetData(num_dpus);
+    std::vector<std::vector<TargetMetadata>> perDpuTargetMeta(num_dpus);
+    std::vector<uint32_t> perDpuTargetCount(num_dpus);
+    
+    #pragma omp parallel for schedule(dynamic) if(num_dpus > 1)
+    for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+        uint32_t start_t = dpu_idx * targetsPerDpu;
+        uint32_t count_t = (start_t >= totalTargets) ? 0 : std::min(targetsPerDpu, totalTargets - start_t);
+        perDpuTargetCount[dpu_idx] = count_t;
+        
+        if (count_t > 0) {
+            assembleTargetBatch(tdbr, start_t, count_t, perDpuTargetData[dpu_idx], 
+                              perDpuTargetMeta[dpu_idx], subMat);
+        }
+    }
+
     for (size_t qId = 0; qId < qdbr->getSize(); ++qId) {
+        // SIMULATOR ONLY: Reload kernel to reset DPU WRAM state (diag buffers, etc.)
+        // On real hardware, WRAM is zeroed on boot, but simulator preserves state between launches.
+        // TODO: Remove this reload when running on real UPMEM hardware for better performance.
+        dpu_comm_.loadKernel(kPath);
+        
         uint32_t queryKey = qdbr->getDbKey(qId);
         uint32_t queryLen = qdbr->getSeqLen(qId);
         const char* querySeq = qdbr->getData(qId, 0);
+        
+        totalCells += (uint64_t)queryLen * targetTotalLen;
 
-        // Build PSSM with Bias Correction
+        // Dynamic threshold: S >= (ln(K * m * n) - ln(E)) / lambda
+        double m = static_cast<double>(queryLen);
+        // TODO: apply log arthmetic to move constants out of this loop
+        int16_t minScoreThreshold = static_cast<int16_t>((std::log(K * m * n) - std::log(targetEvalue)) / lambda);
+        if (minScoreThreshold < MIN_SCORE_FLOOR) {
+            minScoreThreshold = MIN_SCORE_FLOOR;
+        }   
+        
+        if (qId == 0) {
+            Debug(Debug::INFO) << "[DPU] Karlin-Altschul: K=" << K << " lambda=" << lambda 
+                               << " dbSize=" << n << " E=" << targetEvalue << "\n";
+        }
+
         std::vector<int8_t> pssm = buildPSSMFromSequence(
             querySeq, queryLen, subMat, 
             par.compBiasCorrection, par.compBiasCorrectionScale, compositionBias
@@ -298,167 +441,117 @@ void DpuPrefilterHostPipeline::runDpuGappedBatch(
         qmeta.pssm_offset_in_batch = 0;
         qmeta.padding = 0;
 
-        uint32_t queries_meta_size = static_cast<uint32_t>(sizeof(QueryMetadata));
-        uint32_t pssm_size = static_cast<uint32_t>(pssm.size());
-
-        uint32_t totalTargets = tdbr->getSize();
-        uint32_t targetsPerDpu = (totalTargets + num_dpus - 1) / num_dpus;
-
+        uint32_t queries_meta_size = sizeof(QueryMetadata);
         std::vector<uint32_t> res_offsets(num_dpus), res_sizes(num_dpus);
 
-        // Compute global offsets for QueryMetadata and PSSM (BD at 0)
+        // MRAM layout: [BD][QueryMeta][PSSM][TargetMeta][TargetData][Results]
         uint32_t bd_aligned = DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor));
         uint32_t q_meta_off_global = bd_aligned;
-        uint32_t q_meta_size_aligned = DpuCommunicationManager::alignToMram(queries_meta_size);
-        uint32_t pssm_off_global = q_meta_off_global + q_meta_size_aligned;
+        uint32_t pssm_off_global = q_meta_off_global + DpuCommunicationManager::alignToMram(queries_meta_size);
         uint32_t pssm_size_aligned = DpuCommunicationManager::alignToMram(pssm.size());
 
-        // Broadcast QueryMeta + PSSM once
+        // Broadcast query data to all DPUs
         {
-            std::vector<uint8_t> common(q_meta_size_aligned + pssm_size_aligned, 0);
+            std::vector<uint8_t> common(DpuCommunicationManager::alignToMram(queries_meta_size) + pssm_size_aligned, 0);
             memcpy(common.data(), &qmeta, sizeof(qmeta));
-            memcpy(common.data() + q_meta_size_aligned, pssm.data(), pssm.size());
+            memcpy(common.data() + DpuCommunicationManager::alignToMram(queries_meta_size), pssm.data(), pssm.size());
             dpu_comm_.broadcastData(common.data(), common.size(), q_meta_off_global);
         }
 
-        // 4. Prepare Batches for DPUs
+        Debug(Debug::INFO) << "[DPU] Query " << (qId + 1) << "/" << qdbr->getSize()
+                           << " (len=" << queryLen << ", minScore=" << minScoreThreshold << ")\n";
+
+        std::vector<BatchDescriptor> perDpuBD(num_dpus);
+        std::vector<uint32_t> perDpuTMetaOff(num_dpus);
+        std::vector<uint32_t> perDpuTDataOff(num_dpus);
+        
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
-            uint32_t start_t = dpu_idx * targetsPerDpu;
-            uint32_t count_t = (start_t >= totalTargets) ? 0 : std::min(targetsPerDpu, totalTargets - start_t);
+            uint32_t count_t = perDpuTargetCount[dpu_idx];
+            const auto& packed_targets = perDpuTargetData[dpu_idx];
+            const auto& tmeta = perDpuTargetMeta[dpu_idx];
 
-            std::vector<uint8_t> packed_targets;
-            std::vector<TargetMetadata> tmeta;
-            
-            // Reuse the assembled target batch logic (uses encoded sequences)
-            assembleTargetBatch(tdbr, start_t, count_t, packed_targets, tmeta, subMat);
-
-            // Calculate MRAM Offsets (Aligned) using global qmeta/pssm offsets
-            uint32_t off = DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor));
-            uint32_t q_meta_off = q_meta_off_global;
-            uint32_t pssm_off = pssm_off_global;
-            off = pssm_off + pssm_size_aligned;
-            uint32_t t_meta_off = off; off += DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata));
-            uint32_t t_data_off = off; off += DpuCommunicationManager::alignToMram(packed_targets.size());
-
+            uint32_t off = pssm_off_global + pssm_size_aligned;
+            uint32_t t_meta_off = off; 
+            off += DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata));
+            uint32_t t_data_off = off; 
+            off += DpuCommunicationManager::alignToMram(packed_targets.size());
             uint32_t res_off = off; 
-            // Allocate space for GappedHit results
-            uint32_t res_size = tmeta.size() * sizeof(GappedHit);
-            off += DpuCommunicationManager::alignToMram(res_size);
+            uint32_t res_size = DpuCommunicationManager::alignToMram(count_t * sizeof(GappedHit));
 
             res_offsets[dpu_idx] = res_off;
             res_sizes[dpu_idx] = res_size;
+            perDpuTMetaOff[dpu_idx] = t_meta_off;
+            perDpuTDataOff[dpu_idx] = t_data_off;
 
-            // Batch Descriptor (per-DPU) and scatter only to this DPU
-            BatchDescriptor bd = {0, 1, count_t, queryLen, q_meta_off, pssm_off, t_meta_off, t_data_off, res_off, (uint32_t)pssm.size(), 0, (uint32_t)packed_targets.size(), res_size};
-            dpu_comm_.scatterDataToDPU(dpu_idx, &bd, sizeof(bd), 0);
+            memset(&perDpuBD[dpu_idx], 0, sizeof(BatchDescriptor));
+            perDpuBD[dpu_idx].num_queries = 1;
+            perDpuBD[dpu_idx].num_targets = count_t;
+            perDpuBD[dpu_idx].query_len = queryLen;
+            perDpuBD[dpu_idx].queries_metadata_offset = q_meta_off_global;
+            perDpuBD[dpu_idx].pssm_data_offset = pssm_off_global;
+            perDpuBD[dpu_idx].targets_metadata_offset = t_meta_off;
+            perDpuBD[dpu_idx].targets_data_offset = t_data_off;
+            perDpuBD[dpu_idx].results_offset = res_off;
+            perDpuBD[dpu_idx].pssm_total_size = (uint32_t)pssm.size();
+            perDpuBD[dpu_idx].targets_total_size = (uint32_t)packed_targets.size();
+            perDpuBD[dpu_idx].results_buffer_size = res_size;
+            perDpuBD[dpu_idx].flags = batch_flags;
+            perDpuBD[dpu_idx].min_score = minScoreThreshold;
+            perDpuBD[dpu_idx].min_score_padding = 0;
+        }
 
-            // Scatter: Target Meta + Target Data
+        // Transfer data to all DPUs
+        for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+            dpu_comm_.scatterDataToDPU(dpu_idx, &perDpuBD[dpu_idx], 
+                                       DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor)), 0);
+            
+            uint32_t count_t = perDpuTargetCount[dpu_idx];
             if (count_t > 0) {
+                const auto& tmeta = perDpuTargetMeta[dpu_idx];
+                const auto& packed_targets = perDpuTargetData[dpu_idx];
+                
                 std::vector<uint8_t> meta_buf(DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata)), 0);
                 memcpy(meta_buf.data(), tmeta.data(), tmeta.size() * sizeof(TargetMetadata));
-                dpu_comm_.scatterDataToDPU(dpu_idx, meta_buf.data(), meta_buf.size(), t_meta_off);
+                dpu_comm_.scatterDataToDPU(dpu_idx, meta_buf.data(), meta_buf.size(), perDpuTMetaOff[dpu_idx]);
 
                 std::vector<uint8_t> data_buf(DpuCommunicationManager::alignToMram(packed_targets.size()), 0);
                 memcpy(data_buf.data(), packed_targets.data(), packed_targets.size());
-                dpu_comm_.scatterDataToDPU(dpu_idx, data_buf.data(), data_buf.size(), t_data_off);
+                dpu_comm_.scatterDataToDPU(dpu_idx, data_buf.data(), data_buf.size(), perDpuTDataOff[dpu_idx]);
             }
         }
 
-        // 5. Execute Gapped Kernel
         dpu_comm_.executeKernels();
-        // Read and print any DPU-side log output (kernel printf)
-        dpu_comm_.readAndPrintLog();
 
-        // 6. Gather and Process Results
-        std::string resultBuffer; // buffer for this query (gapped results)
+        // Gather results
+        std::string resultBuffer; 
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
             if (res_sizes[dpu_idx] == 0) continue;
-            
-            // Retrieve GappedHit structures
             std::vector<GappedHit> results(res_sizes[dpu_idx] / sizeof(GappedHit));
             dpu_comm_.gatherDataFromDPU(dpu_idx, results.data(), res_sizes[dpu_idx], res_offsets[dpu_idx]);
 
             for (const auto& hit : results) {
-                // Filter low scores (Gapped threshold check should ideally happen on DPU too)
                 if (hit.score <= par.minDiagScoreThr) continue;
+                totalHits++;
 
-                // Taxonomy Filter
-                if (taxonomyHook != NULL) {
-                    TaxID currTax = taxonomyHook->taxonomyMapping->lookup(hit.target_id);
-                    if (taxonomyHook->expression[0]->isAncestor(currTax) == false) continue;
-                }
-
-                // Construct Full Alignment Result
-                Matcher::result_t res;
-                res.dbKey = tdbr->getDbKey(hit.target_id);
-                res.score = evaluer->computeBitScore(hit.score); // Convert raw score to bitscore
-                res.eval = evaluer->computeEvalue(hit.score, queryLen);
-                
-                // Coordinates returned by DPU (0-indexed)
-                res.qEndPos = hit.q_end;
-                res.dbEndPos = hit.t_end;
-                
-                // Lengths
-                res.qLen = queryLen;
-                res.dbLen = tdbr->getSeqLen(hit.target_id);
-
-                // Coverage (Simplified, as DPU assumes local alignment ending at q_end/t_end)
-                // Ideally, DPU returns start positions too, but for prefiltering, this is often sufficient
-                res.qcov = SmithWaterman::computeCov(0, res.qEndPos, res.qLen); 
-                res.dbcov = SmithWaterman::computeCov(0, res.dbEndPos, res.dbLen);
-
-                // Filter by E-value and Coverage
-                if (!Alignment::checkCriteria(res, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr)) {
-                    continue;
-                }
-
-                // Write Result
-                char buffer[4096];
-                // false = no backtrace string (DPU doesn't compute full CIGAR yet)
-                size_t len = Matcher::resultToBuffer(buffer, res, false);
-                resultBuffer.append(buffer, len);
+                if (par.prefMode == Parameters::PREF_MODE_EXHAUSTIVE || par.prefMode == Parameters::PREF_MODE_UNGAPPED_AND_GAPPED) {
+                    hit_t shortHit;
+                    shortHit.seqId = tdbr->getDbKey(hit.target_id);
+                    shortHit.prefScore = hit.score;
+                    shortHit.diagonal = (int16_t)(hit.t_end - hit.q_end);
+                    char buffer[256];
+                    size_t len = QueryMatcher::prefilterHitToBuffer(buffer, shortHit);
+                    resultBuffer.append(buffer, len);
+                } 
             }
         }
-        // write once per query (even if empty)
         resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
     }
-}
-
-// === CPU VERIFICATION FUNCTION ===
-int16_t verifyScoreOnHost(
-    const std::vector<uint8_t>& target_seq,
-    const std::vector<int8_t>& pssm,
-    uint32_t q_len) {
     
-    if (target_seq.empty()) return 0;
-    uint32_t t_len = target_seq.size();
+    auto endTime = std::chrono::high_resolution_clock::now();
+    double elapsedSec = std::chrono::duration<double>(endTime - startTime).count();
+    double gcups = (double)totalCells / elapsedSec / 1e9;
     
-    // Replicate DPU Diagonal Logic
-    std::vector<int16_t> diag_buffer(q_len + t_len, 0);
-    int16_t max_score = 0;
-    const int KERNEL_AA_SLOTS = 21;
-
-    for (uint32_t q = 0; q < q_len; ++q) {
-        // PSSM Row
-        const int8_t* pssm_row = &pssm[q * KERNEL_AA_SLOTS];
-        
-        for (uint32_t t = 0; t < t_len; ++t) {
-            uint8_t aa = target_seq[t];
-            if (aa >= KERNEL_AA_SLOTS) aa = 20; // Clamp
-
-            int8_t score = pssm_row[aa];
-            int32_t diag_idx = (int32_t)t - (int32_t)q + (int32_t)(q_len - 1);
-            
-            if (diag_idx >= 0 && diag_idx < diag_buffer.size()) {
-                int16_t prev = diag_buffer[diag_idx];
-                int16_t curr = prev + score;
-                if (curr < 0) curr = 0;
-                diag_buffer[diag_idx] = curr;
-                if (curr > max_score) max_score = curr;
-            }
-        }
-    }
-    return max_score;
+    Debug(Debug::INFO) << "[DPU] Gapped complete: " << gcups << " GCUPS, " << totalHits << " hits in " << elapsedSec << "s\n";
 }
 
 void DpuPrefilterHostPipeline::runDpuUngappedBatch(
@@ -467,10 +560,19 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
     EvalueComputation* evaluer, QueryMatcherTaxonomyHook* taxonomyHook,
     bool sameDB, DBWriter& resultWriter) {
     
-    fprintf(stderr, "[DPU HOST] DPU ungapped batch processing.\n");
+    Debug(Debug::INFO) << "[DPU] Ungapped batch: " << qdbr->getSize() << " queries, " << tdbr->getSize() << " targets\n";
 
     const uint32_t num_dpus = dpu_comm_.getNumDPUsActive();
-    if (num_dpus == 0) return;
+    if (num_dpus == 0) {
+        Debug(Debug::ERROR) << "[DPU] No active DPUs available\n";
+        return;
+    }
+
+    const char* kPath = "lib/mmseqs/dpu/ungapped_prefilter";
+    if (access("build/lib/dpu/kernels/ungapped_prefilter", F_OK) != -1) {
+        kPath = "build/lib/dpu/kernels/ungapped_prefilter";
+    }
+    dpu_comm_.loadKernel(kPath);
 
     std::vector<float> compositionBias;
     if (par.compBiasCorrection) {
@@ -478,6 +580,11 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
     }
 
     for (size_t qId = 0; qId < qdbr->getSize(); ++qId) {
+        // SIMULATOR ONLY: Reload kernel to reset DPU WRAM state (diag buffers, etc.)
+        // On real hardware, WRAM is zeroed on boot, but simulator preserves state between launches.
+        // TODO: Remove this reload when running on real UPMEM hardware for better performance.
+        dpu_comm_.loadKernel(kPath);
+        
         uint32_t queryKey = qdbr->getDbKey(qId);
         uint32_t queryLen = qdbr->getSeqLen(qId);
         const char* querySeq = qdbr->getData(qId, 0);
@@ -487,27 +594,19 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
             par.compBiasCorrection, par.compBiasCorrectionScale, compositionBias
         );
 
-        // Load Kernel
-        const char* kPath = "lib/mmseqs/dpu/ungapped_prefilter";
-        if (access("build/lib/dpu/kernels/ungapped_prefilter", F_OK) != -1) {
-            kPath = "build/lib/dpu/kernels/ungapped_prefilter";
-        }
-        fprintf(stderr, "[DPU HOST] Loading DPU kernel (ungapped): %s\n", kPath);
-        dpu_comm_.loadKernel(kPath);
-
         uint32_t totalTargets = tdbr->getSize();
         uint32_t targetsPerDpu = (totalTargets + num_dpus - 1) / num_dpus;
 
         std::vector<uint32_t> res_offsets(num_dpus), res_sizes(num_dpus);
 
-        // Compute global offsets for QueryMetadata and PSSM (BD at 0)
+        // MRAM layout: [BD][QueryMeta][PSSM][TargetMeta][TargetData][Results]
         uint32_t bd_aligned = DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor));
         uint32_t q_meta_off_global = bd_aligned;
         uint32_t q_meta_size_aligned = DpuCommunicationManager::alignToMram(sizeof(QueryMetadata));
         uint32_t pssm_off_global = q_meta_off_global + q_meta_size_aligned;
         uint32_t pssm_size_aligned = DpuCommunicationManager::alignToMram(pssm.size());
 
-        // Prepare and broadcast QueryMeta + PSSM once for all DPUs
+        // Broadcast query data
         QueryMetadata qm = {queryKey, queryLen, 0, 0};
         {
             std::vector<uint8_t> common(q_meta_size_aligned + pssm_size_aligned, 0);
@@ -524,33 +623,32 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
             std::vector<TargetMetadata> tmeta;
             assembleTargetBatch(tdbr, start_t, count_t, packed_targets, tmeta, subMat);
 
-            // Optional host-side verification for the first target
-            if (dpu_idx == 0 && !packed_targets.empty() && count_t > 0) {
-                uint32_t len = tmeta[0].target_len;
-                std::vector<uint8_t> first_tgt(packed_targets.begin(), packed_targets.begin() + len);
-                int16_t host_score = verifyScoreOnHost(first_tgt, pssm, queryLen);
-                fprintf(stderr, "[DPU HOST][VERIFY] Q=%u T=%u Length=%u HostScore=%d\n", queryKey, tdbr->getDbKey(tmeta[0].target_id), len, host_score);
-            }
-
-            // Calculate Offsets (using global offsets for qmeta and pssm)
-            uint32_t off = DpuCommunicationManager::alignToMram(sizeof(BatchDescriptor));
-            uint32_t q_meta_off = q_meta_off_global;
-            uint32_t pssm_off = pssm_off_global;
-            off = pssm_off + pssm_size_aligned;
+            uint32_t off = pssm_off_global + pssm_size_aligned;
             uint32_t t_meta_off = off; off += DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata));
             uint32_t t_data_off = off; off += DpuCommunicationManager::alignToMram(packed_targets.size());
-            uint32_t res_off = off; 
+            uint32_t res_off = off;
             uint32_t res_size = tmeta.size() * sizeof(Hit);
             off += DpuCommunicationManager::alignToMram(res_size);
 
             res_offsets[dpu_idx] = res_off;
             res_sizes[dpu_idx] = res_size;
 
-            // Prepare per-DPU Descriptor and scatter it only to that DPU
-            BatchDescriptor bd = {0, 1, count_t, queryLen, q_meta_off, pssm_off, t_meta_off, t_data_off, res_off, (uint32_t)pssm.size(), 0, (uint32_t)packed_targets.size(), res_size};
-            dpu_comm_.scatterDataToDPU(dpu_idx, &bd, sizeof(bd), 0);
+            BatchDescriptor bd;
+            memset(&bd, 0, sizeof(bd));
+            bd.num_queries = 1;
+            bd.num_targets = count_t;
+            bd.query_len = queryLen;
+            bd.queries_metadata_offset = q_meta_off_global;
+            bd.pssm_data_offset = pssm_off_global;
+            bd.targets_metadata_offset = t_meta_off;
+            bd.targets_data_offset = t_data_off;
+            bd.results_offset = res_off;
+            bd.pssm_total_size = (uint32_t)pssm.size();
+            bd.targets_total_size = (uint32_t)packed_targets.size();
+            bd.results_buffer_size = res_size;
+            dpu_comm_.scatterDataToDPU(dpu_idx, &bd, DpuCommunicationManager::alignToMram(sizeof(bd)), 0);
 
-            // Scatter
+            // Scatter targets
             if (count_t > 0) {
                 std::vector<uint8_t> meta_buf(DpuCommunicationManager::alignToMram(tmeta.size() * sizeof(TargetMetadata)), 0);
                 memcpy(meta_buf.data(), tmeta.data(), tmeta.size() * sizeof(TargetMetadata));
@@ -563,10 +661,7 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
         }
 
         dpu_comm_.executeKernels();
-        // Read and print any DPU-side log output (kernel printf)
-        dpu_comm_.readAndPrintLog();
 
-        // Gather & buffer results for this single query (queryKey)
         std::vector<hit_t> queryResults;
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
             if (res_sizes[dpu_idx] == 0) continue;
@@ -577,26 +672,6 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
                 if (hit.score <= par.minDiagScoreThr) continue;
                 if (taxonomyHook && !taxonomyHook->expression[0]->isAncestor(taxonomyHook->taxonomyMapping->lookup(hit.target_id))) continue;
 
-                // CPU verification: re-encode the target sequence and recompute ungapped score
-                // uint32_t tLen = tdbr->getSeqLen(hit.target_id);
-                // const char* tSeq = tdbr->getData(hit.target_id, 0);
-                // std::vector<uint8_t> enc_t;
-                // enc_t.reserve(tLen);
-                // for (uint32_t ii = 0; ii < tLen; ++ii) {
-                //     unsigned char aa = static_cast<unsigned char>(tSeq[ii]);
-                //     if (aa >= 'a' && aa <= 'z') aa -= 32;
-                //     int num_aa = subMat->aa2num ? subMat->aa2num[aa] : 20;
-                //     if (num_aa >= 21) num_aa = 20;
-                //     enc_t.push_back((uint8_t)num_aa);
-                // }
-
-                // int16_t host_score = verifyScoreOnHost(enc_t, pssm, queryLen);
-
-                // // Log both DPU and CPU scores for comparison
-                // Debug(Debug::INFO) << "[VERIFY] Q=" << queryKey << " T=" << tdbr->getDbKey(hit.target_id)
-                //                    << " DpuScore=" << hit.score << " CpuScore=" << host_score
-                //                    << " Diag=" << hit.diagonal << "\n";
-
                 hit_t shortHit;
                 shortHit.seqId = tdbr->getDbKey(hit.target_id);
                 shortHit.prefScore = hit.score;
@@ -605,7 +680,6 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
             }
         }
 
-        // Sort, limit, and buffer results per-query, then write once (even if empty)
         if (!queryResults.empty()) {
             std::sort(queryResults.begin(), queryResults.end(), hit_t::compareHitsByScoreAndId);
         }
@@ -682,8 +756,7 @@ void DpuPrefilterHostPipeline::assembleTargetBatch(
         
         for (size_t j = 0; j < seq_len; j++) {
             unsigned char aa = static_cast<unsigned char>(seq[j]);
-            // Apply soft-masking normalization like Sequence::mapSequence
-            // Only convert lowercase to uppercase; avoid turning all chars into '!'
+            // Normalize lowercase to uppercase
             if (aa >= 'a' && aa <= 'z') aa = aa - 32;
             int num_aa = subMat->aa2num ? subMat->aa2num[aa] : 20;
             if (num_aa >= 21) num_aa = 20;

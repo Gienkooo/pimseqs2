@@ -32,8 +32,20 @@ class DpuCommunicationManager {
   void gatherDataFromDPU(uint32_t dpu_id, void* host_buffer,
                          uint32_t size_bytes, uint32_t dpu_mram_offset);
 
+  // Bulk parallel operations - more efficient than per-DPU scatter/gather
+  // Each vector element corresponds to one DPU's data
+  void scatterDataParallel(const std::vector<std::vector<uint8_t>>& per_dpu_data,
+                           uint32_t dpu_mram_offset);
+  
+  void gatherDataParallel(std::vector<std::vector<uint8_t>>& per_dpu_buffers,
+                          uint32_t size_per_dpu, uint32_t dpu_mram_offset);
+
   void loadKernel(const char* kernel_binary_path);
   void executeKernels(); 
+  void executeKernelsAsync();  // Non-blocking launch
+  void waitForKernels();       // Wait for async execution to complete
+  bool isExecutionComplete();  // Check if async execution finished (non-blocking)
+  bool isAsyncInProgress() const { return async_in_progress_; }
 
   static constexpr uint32_t MRAM_SIZE = 64 * 1024 * 1024;  // 64 MB
   static constexpr uint32_t WRAM_SIZE = 64 * 1024;         // 64 KB
@@ -45,11 +57,15 @@ class DpuCommunicationManager {
 
   void readAndPrintLog();
 
+  // Access to raw DPU set for advanced operations
+  struct dpu_set_t& getDpuSet() { return dpu_set_; }
+
  private:
   struct dpu_set_t dpu_set_;
   struct dpu_set_t rank_;
   uint32_t num_dpus_available_;
   uint32_t num_dpus_active_;
+  bool async_in_progress_ = false;
 
   void checkStatus(dpu_error_t status, const char* context);
 };
