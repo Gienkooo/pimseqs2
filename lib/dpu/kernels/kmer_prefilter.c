@@ -43,6 +43,10 @@ int main() {
     uint32_t ksize = g_bd.kmer_size;
     if (ksize == 0) ksize = 6;
     
+    // Get threshold from host (default to 2 if not set)
+    int16_t min_score_thr = g_bd.min_score;
+    if (min_score_thr < 2) min_score_thr = 2;
+    
     uint32_t hash_table_size = g_bd.pssm_total_size;
     if (hash_table_size == 0) hash_table_size = 1;
     uint32_t hash_mask = hash_table_size - 1;
@@ -140,6 +144,7 @@ int main() {
             }
         }
         
+        // Find best diagonal with count >= threshold
         uint16_t best_count = 0;
         uint16_t best_diag = 0;
         for (int d = 0; d < num_diag_slots_used; d++) {
@@ -149,7 +154,8 @@ int main() {
             }
         }
         
-        if (best_count >= 2) {
+        // Only report hit if count meets threshold
+        if (best_count >= (uint16_t)min_score_thr) {
             h.score = (int16_t)best_count;
             h.diagonal = (int16_t)best_diag;
         }

@@ -278,6 +278,7 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
             bd.targets_metadata_offset = t_meta_off;
             bd.targets_data_offset = t_data_off;
             bd.results_offset = res_off;
+            bd.min_score = (int16_t)par.minDiagScoreThr;  // K-mer hit count threshold
             memcpy(bd.spaced_pattern, spacedPattern, sizeof(bd.spaced_pattern));
             bd.spaced_pattern_span = (uint8_t)patternSpan;
             bd.use_spaced_kmers = useSpacedKmers ? 1 : 0;
@@ -305,7 +306,8 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
             dpu_comm_.gatherDataFromDPU(dpu_idx, results.data(), res_sizes[dpu_idx], res_offsets[dpu_idx]);
 
             for (const auto& hit : results) {
-                if (hit.score <= 0) continue;
+                // Filter by minDiagScoreThr (k-mer hit count threshold)
+                if (hit.score < par.minDiagScoreThr) continue;
                 totalHits++;
 
                 hit_t shortHit;
@@ -718,6 +720,8 @@ std::vector<int8_t> DpuPrefilterHostPipeline::buildPSSMFromSequence(
     for (uint32_t i = 0; i < seq_len; ++i) {
         short bias = 0;
         if (compBiasCorrection) {
+            // Direct rounding to match CPU's ungappedprefilter.cpp behavior
+            // Note: UngappedAlignment::createProfile (k-mer path) divides by 4, but we match ungappedprefilter.cpp
             float val = compositionBias[i];
             bias = static_cast<short>((val < 0.0f) ? (val - 0.5f) : (val + 0.5f));
         }

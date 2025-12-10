@@ -20,13 +20,15 @@ rm -f "${CPU_DB}"* "${DPU_DB}"* "${CPU_RES}" "${DPU_RES}"
 
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="${E_VALUE:-1000}"
-log "Using E-value threshold: $E_VALUE"
+# Max results per query (default high to not truncate results during validation)
+MAX_SEQS="${MAX_SEQS:-10000}"
+log "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS"
 
 # Run CPU
 log "Running Gapped (Exhaustive) Search on CPU..."
 # Using 'search' with exhaustive mode to mimic gapped prefilter behavior (SW alignment)
 "$MMSEQS_BIN" search "$QUERY_DB" "$TARGET_DB" "$CPU_DB" "$TMP_DIR" \
-    --exhaustive-search 1 --threads $(nproc) -v 3 -e "$E_VALUE" --comp-bias-corr 0 \
+    --exhaustive-search 1 --threads $(nproc) -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" --comp-bias-corr 0 \
     > "$OUT_DIR/gapped_cpu.log" 2>&1
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     cat "$OUT_DIR/gapped_cpu.log"
@@ -36,8 +38,9 @@ fi
 # Run DPU
 log "Running Gapped Prefilter on DPU..."
 # Use ungappedprefilter with --prefilter-mode 2 (PREF_MODE_EXHAUSTIVE) to trigger gapped kernel
+# Match CPU: disable composition bias correction
 "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
-    --dpu 1 --prefilter-mode 2 -v 3 -e "$E_VALUE" 2>&1 | tee "$OUT_DIR/gapped_dpu.log"
+    --dpu 1 --prefilter-mode 2 -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" --comp-bias-corr 0 2>&1 | tee "$OUT_DIR/gapped_dpu.log"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     error "DPU run failed"
 fi

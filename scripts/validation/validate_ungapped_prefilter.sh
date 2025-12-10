@@ -17,18 +17,20 @@ DPU_DB="$OUT_DIR/ungapped_dpu_db"
 
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="${E_VALUE:-1000}"
-log "Using E-value threshold: $E_VALUE"
+# Max results per query (default high to not truncate results during validation)
+MAX_SEQS="${MAX_SEQS:-10000}"
+log "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS"
 
 # Run CPU
 log "Running Ungapped Prefilter on CPU..."
-"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$CPU_DB" --threads $(nproc) -v 3 -e "$E_VALUE" 2>&1 | tee "$OUT_DIR/ungapped_cpu.log"
+"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$CPU_DB" --threads $(nproc) -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" 2>&1 | tee "$OUT_DIR/ungapped_cpu.log"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     error "CPU run failed"
 fi
 
 # Run DPU
 log "Running Ungapped Prefilter on DPU..."
-"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" --dpu 1 -v 3 -e "$E_VALUE" 2>&1 | tee "$OUT_DIR/ungapped_dpu.log"
+"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" --dpu 1 -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" 2>&1 | tee "$OUT_DIR/ungapped_dpu.log"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     error "DPU run failed"
 fi
