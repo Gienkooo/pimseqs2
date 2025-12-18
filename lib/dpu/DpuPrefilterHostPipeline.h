@@ -1,7 +1,10 @@
 #pragma once
 
-#include "DpuStructures.h"
+#include "shared/DpuSharedTypes.h"
 #include "DpuCommunicationManager.h"
+#include "DpuWorkflow.h"
+#include "DpuKernelManager.h"
+
 #include "DBReader.h"
 #include "DBWriter.h"
 #include "BaseMatrix.h"
@@ -36,6 +39,8 @@ class DpuPrefilterHostPipeline {
 
  private:
   DpuCommunicationManager dpu_comm_;
+  DpuWorkflow workflow_;
+  DpuKernelManager kernel_mgr_; 
   
   void runDpuKmerBatch(
       Parameters& par,
@@ -69,17 +74,30 @@ class DpuPrefilterHostPipeline {
       bool sameDB,
       DBWriter& resultWriter);
 
+  void runDpuUngappedGappedBatch(
+      Parameters& par,
+      BaseMatrix* subMat,
+      int8_t* tinySubMat,
+      DBReader<unsigned int>* qdbr,
+      DBReader<unsigned int>* tdbr,
+      EvalueComputation* evaluer,
+      QueryMatcherTaxonomyHook* taxonomyHook,
+      bool sameDB,
+      DBWriter& resultWriter);
+
   std::vector<int8_t> buildPSSMFromSequence(
       const char* sequence, uint32_t seq_len, BaseMatrix* subMat,
       bool compBiasCorrection, float compBiasCorrectionScale, std::vector<float>& compositionBias);
   
-  void assembleTargetBatch(
-      DBReader<unsigned int>* tdbr, uint32_t start, uint32_t count,
+  void assembleTargetBatchByIndices(
+      DBReader<unsigned int>* tdbr,
+      const std::vector<uint32_t>& target_indices,
       std::vector<uint8_t>& packed_sequences,
       std::vector<TargetMetadata>& metadata,
       BaseMatrix* subMat);
   
-  std::vector<Hit> collectResults(uint32_t dpu_id, uint32_t num_hits);
+  std::vector<std::vector<uint32_t>> buildLoadBalancedDistribution(
+      DBReader<unsigned int>* tdbr, uint32_t num_dpus);
 };
 
 }  // namespace mmseqs::dpu

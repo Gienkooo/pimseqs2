@@ -20,7 +20,7 @@ foreach(KSRC IN LISTS KERNEL_SRCS)
 
     add_custom_command(
         OUTPUT ${KBIN}
-        COMMAND ${UPMEM_DPU_COMPILER} -O2 -DNR_TASKLETS=4 ${DPU_INCLUDE_FLAGS} -I${UPMEM_INCLUDE_DIRS}
+        COMMAND ${UPMEM_DPU_COMPILER} -O2 -DNR_TASKLETS=16 ${DPU_INCLUDE_FLAGS} -I${UPMEM_INCLUDE_DIRS}
                 -o ${KBIN} ${KSRC}
         DEPENDS ${KSRC}
         COMMENT "[DPU] Compiling kernel: ${KNAME}"

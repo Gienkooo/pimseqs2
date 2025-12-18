@@ -24,11 +24,28 @@ E_VALUE="${E_VALUE:-1000}"
 MAX_SEQS="${MAX_SEQS:-10000}"
 log "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS"
 
+# To isolate and test ONLY the gapped alignment stage, we follow this workflow:
+# 1. Generate a prefilter database of candidate pairs on the CPU.
+# 2. Run gapped alignment on CPU using those candidates as input (ground truth).
+# 3. Run gapped prefilter on DPU using the exact same candidates as input.
+# This provides a true apples-to-apples comparison of the SW implementations.
+
+CANDIDATE_DB="$OUT_DIR/candidate_db"
+rm -f "${CANDIDATE_DB}"*
+
+log "1. Generating candidate pairs with CPU prefilter..."
+"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$CANDIDATE_DB" \
+    --threads $(nproc) --prefilter-mode 2 --dpu 0 -v 3 \
+    > "$OUT_DIR/candidate_gen.log" 2>&1
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    cat "$OUT_DIR/candidate_gen.log"
+    error "Candidate generation failed"
+fi
+
 # Run CPU
-log "Running Gapped (Exhaustive) Search on CPU..."
-# Using 'search' with exhaustive mode to mimic gapped prefilter behavior (SW alignment)
-"$MMSEQS_BIN" search "$QUERY_DB" "$TARGET_DB" "$CPU_DB" "$TMP_DIR" \
-    --exhaustive-search 1 --threads $(nproc) -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" --comp-bias-corr 0 \
+log "2. Running Gapped Alignment on CPU with candidate pairs..."
+"$MMSEQS_BIN" align "$QUERY_DB" "$TARGET_DB" "$CANDIDATE_DB" "$CPU_DB" \
+    --threads $(nproc) -v 3 -e "$E_VALUE" --comp-bias-corr 0 \
     > "$OUT_DIR/gapped_cpu.log" 2>&1
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     cat "$OUT_DIR/gapped_cpu.log"
@@ -36,9 +53,9 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
 fi
 
 # Run DPU
-log "Running Gapped Prefilter on DPU..."
-# Use ungappedprefilter with --prefilter-mode 2 (PREF_MODE_EXHAUSTIVE) to trigger gapped kernel
-# Match CPU: disable composition bias correction
+log "3. Running Gapped Prefilter on DPU with candidate pairs..."
+# We use the CANDIDATE_DB as the third argument to the DPU runner.
+# The host pipeline will read this and feed only those pairs to the DPU.
 "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
     --dpu 1 --prefilter-mode 2 -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" --comp-bias-corr 0 2>&1 | tee "$OUT_DIR/gapped_dpu.log"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
@@ -47,9 +64,8 @@ fi
 
 # Convert results to TSV for comparison
 log "Converting results..."
-# CPU: search produces Alignment DB, use convertalis
-"$MMSEQS_BIN" convertalis "$QUERY_DB" "$TARGET_DB" "$CPU_DB" "$CPU_RES" \
-    --format-output query,target,raw > /dev/null 2>&1
+# CPU: align produces Alignment DB, use createtsv
+"$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$CPU_DB" "$CPU_RES" > /dev/null 2>&1
 
 # DPU: prefilter produces Prefilter DB, use createtsv
 "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$DPU_DB" "$DPU_RES" > /dev/null 2>&1

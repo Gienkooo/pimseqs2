@@ -96,7 +96,6 @@ foreach(KERNEL_SRC ${KERNEL_SOURCES})
     
     add_custom_target("dpu_kernel_${KERNEL_NAME}" ALL DEPENDS ${KERNEL_BIN})
     
-    # --- FIX: Add dependency here inside the loop ---
     if(TARGET mmseqs_dpu)
         add_dependencies(mmseqs_dpu "dpu_kernel_${KERNEL_NAME}")
     endif()

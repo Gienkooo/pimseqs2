@@ -50,12 +50,12 @@ prepare_dbs() {
     
     if [ ! -f "${QUERY_DB}.dbtype" ]; then
         log "Creating query database..."
-        "$MMSEQS_BIN" createdb "$QUERY_FASTA" "$QUERY_DB" > /dev/null || error "Failed to create query DB"
+        "$MMSEQS_BIN" createdb "$QUERY_FASTA" "$QUERY_DB" --mask 0 > /dev/null || error "Failed to create query DB"
     fi
 
     if [ ! -f "${TARGET_DB}.dbtype" ]; then
         log "Creating target database..."
-        "$MMSEQS_BIN" createdb "$TARGET_FASTA" "$TARGET_DB" > /dev/null || error "Failed to create target DB"
+        "$MMSEQS_BIN" createdb "$TARGET_FASTA" "$TARGET_DB" --mask 0 > /dev/null || error "Failed to create target DB"
     fi
 }
 

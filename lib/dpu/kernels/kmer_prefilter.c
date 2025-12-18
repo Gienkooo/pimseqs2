@@ -4,9 +4,10 @@
 #include <stdint.h>
 #include <defs.h>
 #include <barrier.h>
+#include <mutex.h>
 #include <stdio.h>
 
-#include "DpuSharedTypes.h"
+#include "dpu_common.h"
 
 #define MAX_TARGET_WRAM_LEN 4096
 #define MAX_DIAG_COUNTERS 4096
@@ -15,9 +16,13 @@
 #define NR_TASKLETS 1
 #endif
 
-__dma_aligned BatchDescriptor g_bd;
+__dma_aligned KmerBatchDescriptor g_bd;
 BARRIER_INIT(my_barrier, NR_TASKLETS);
-#define MRAM_ALIGN_SIZE(x) (((x) + 7) & ~7U)
+MUTEX_INIT(hit_mutex);
+
+/* Hit counter - written to MRAM after results for host to read */
+__host uint32_t g_hit_count;
+__host uint32_t g_hit_write_offset;
 
 typedef struct {
     uint16_t diagonal;
@@ -29,9 +34,14 @@ int main() {
     uintptr_t mram_base = (uintptr_t)__sys_used_mram_end;
 
     if (tasklet_id == 0) {
-        mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(BatchDescriptor)));
+        mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(KmerBatchDescriptor)));
+        g_hit_count = 0;
+        g_hit_write_offset = 8; // Standardized: start writing hits after 8-byte count header
     }
     barrier_wait(&my_barrier);
+
+    /* DYNAMIC TASKLET CHECK: exit immediately if this tasklet is not active */
+    if (!is_tasklet_active(g_bd.header.num_active_tasklets)) return 0;
 
     uint8_t* task_target_seq = (uint8_t*)mem_alloc(MAX_TARGET_WRAM_LEN);
     DiagCounter* diag_counters = (DiagCounter*)mem_alloc(MAX_DIAG_COUNTERS * sizeof(DiagCounter));
@@ -47,33 +57,23 @@ int main() {
     int16_t min_score_thr = g_bd.min_score;
     if (min_score_thr < 2) min_score_thr = 2;
     
-    uint32_t hash_table_size = g_bd.pssm_total_size;
+    uint32_t hash_table_size = g_bd.header.pssm_total_size;
     if (hash_table_size == 0) hash_table_size = 1;
     uint32_t hash_mask = hash_table_size - 1;
-    uintptr_t hash_table_addr = mram_base + g_bd.pssm_data_offset;
+    uintptr_t hash_table_addr = mram_base + g_bd.header.pssm_data_offset;
+    uintptr_t results_base = mram_base + g_bd.header.results_offset;
 
-    const uint32_t ALPHA_SIZE = 21;
     
-    for (uint32_t i = tasklet_id; i < g_bd.num_targets; i += NR_TASKLETS) {
+    for (uint32_t i = tasklet_id; i < g_bd.header.num_targets; i += NR_TASKLETS) {
         TargetMetadata meta;
-        mram_read((__mram_ptr void*)(mram_base + g_bd.targets_metadata_offset + i*sizeof(TargetMetadata)), 
+        mram_read((__mram_ptr void*)(mram_base + g_bd.header.targets_metadata_offset + i*sizeof(TargetMetadata)), 
                   &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
-
-        Hit h;
-        h.target_id = meta.target_id;
-        h.query_id = 0;
-        h.score = 0;
-        h.diagonal = 0;
-        h.pad1 = 0;
-        h.pad2 = 0;
-        uintptr_t res_addr = mram_base + g_bd.results_offset + (i * sizeof(Hit));
         
         if (meta.target_len < ksize || meta.target_len > MAX_TARGET_WRAM_LEN) {
-            mram_write(&h, (__mram_ptr void*)res_addr, MRAM_ALIGN_SIZE(sizeof(Hit)));
             continue;
         }
 
-        uintptr_t seq_addr = mram_base + g_bd.targets_data_offset + meta.offset_in_data;
+        uintptr_t seq_addr = mram_base + g_bd.header.targets_data_offset + meta.offset_in_data;
         uint32_t aligned_len = MRAM_ALIGN_SIZE(meta.target_len);
         if (aligned_len > MAX_TARGET_WRAM_LEN) aligned_len = MAX_TARGET_WRAM_LEN;
         mram_read((__mram_ptr void*)seq_addr, task_target_seq, aligned_len);
@@ -154,14 +154,34 @@ int main() {
             }
         }
         
-        // Only report hit if count meets threshold
+        // Only write hit if count meets threshold
         if (best_count >= (uint16_t)min_score_thr) {
+            mutex_lock(hit_mutex);
+            uint32_t offset = g_hit_write_offset;
+            g_hit_write_offset += MRAM_ALIGN_SIZE(sizeof(Hit));
+            g_hit_count++;
+            mutex_unlock(hit_mutex);
+
+            Hit h;
+            h.target_id = meta.target_id;
+            h.query_id = 0;
             h.score = (int16_t)best_count;
             h.diagonal = (int16_t)best_diag;
+            h.pad1 = 0;
+            h.pad2 = 0;
+            mram_write(&h, (__mram_ptr void*)(results_base + offset), MRAM_ALIGN_SIZE(sizeof(Hit)));
         }
-        
-        mram_write(&h, (__mram_ptr void*)res_addr, MRAM_ALIGN_SIZE(sizeof(Hit)));
     }
     
+    /* Write hit count to MRAM after all results */
+    barrier_wait(&my_barrier);
+    if (tasklet_id == 0) {
+        __dma_aligned uint32_t count_buf[2];
+        count_buf[0] = g_hit_count;
+        count_buf[1] = 0;
+        /* Write count at offset 0 of results buffer */
+        mram_write(count_buf, (__mram_ptr void*)results_base, 8);
+    }
+
     return 0;
 }

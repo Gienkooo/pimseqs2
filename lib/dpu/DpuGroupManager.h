@@ -16,12 +16,7 @@ extern "C" {
 
 namespace mmseqs::dpu {
 
-/**
- * DpuGroupManager - Manages multiple independent DPU groups for pipelined execution.
- *
- * Each group wraps one or more DPUs (dpu_set_t) to support independent scatter/launch
- * and gather operations. Use this to pipeline work over multiple DPU groups.
- */
+/* DpuGroupManager: manage multiple DPU groups for pipelined execution. */
 class DpuGroupManager {
 public:
     // Status of each DPU group
@@ -41,10 +36,7 @@ public:
         // Additional user data can be added here
     };
 
-    /**
-     * @param num_groups Number of independent DPU groups to create
-     * @param dpus_per_group Number of DPUs in each group (0 = auto)
-     */
+    // Create manager with num_groups and optional dpus_per_group (0 = auto).
     explicit DpuGroupManager(uint32_t num_groups, uint32_t dpus_per_group = 0);
     ~DpuGroupManager();
     

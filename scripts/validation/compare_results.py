@@ -2,70 +2,114 @@ import sys
 import os
 import pandas as pd
 
+
 def load_results(filepath):
-    """Loads results from a TSV file (query, target, score)."""
+    """Loads results from a TSV file.
+
+    Handles both headered and headerless TSVs. The loader will try to
+    interpret columns named `query`, `target`, `score` (case-insensitive).
+    If headers are missing, it will treat the first three columns as
+    query, target, score. Additional columns such as `q_len`/`t_len` are
+    preserved when present.
+    """
     try:
-        # Read first 3 columns: query, target, score
-        df = pd.read_csv(filepath, sep='\t', header=None, usecols=[0, 1, 2], names=['query', 'target', 'score'])
+        # First try: file has a header with named columns
+        df = pd.read_csv(filepath, sep='\t', header=0)
+        cols_lower = [c.lower() for c in df.columns]
+        if 'query' in cols_lower and 'target' in cols_lower and 'score' in cols_lower:
+            # normalize column names to lower-case
+            df.columns = cols_lower
+            return df
+
+        # Fallback: no usable header -> read without header and assign defaults
+        df = pd.read_csv(filepath, sep='\t', header=None)
+        # Build sensible default column names for first columns
+        colnames = []
+        for i in range(df.shape[1]):
+            if i == 0:
+                colnames.append('query')
+            elif i == 1:
+                colnames.append('target')
+            elif i == 2:
+                colnames.append('score')
+            elif i == 3:
+                colnames.append('q_len')
+            elif i == 4:
+                colnames.append('t_len')
+            else:
+                colnames.append(f'col{i}')
+        df.columns = colnames
         return df
     except Exception as e:
         print(f"Error loading {filepath}: {e}")
         sys.exit(1)
 
-def compare(cpu_file, dpu_file, label):
+def compare(file_a, file_b, label):
     print(f"--- Comparison Report: {label} ---")
-    cpu_df = load_results(cpu_file)
-    dpu_df = load_results(dpu_file)
+    a_df = load_results(file_a)
+    b_df = load_results(file_b)
 
-    print(f"CPU hits: {len(cpu_df)}")
-    print(f"DPU hits: {len(dpu_df)}")
+    name_a = os.path.basename(file_a)
+    name_b = os.path.basename(file_b)
 
-    # Create sets of (query, target) pairs
-    cpu_pairs = set(zip(cpu_df['query'], cpu_df['target']))
-    dpu_pairs = set(zip(dpu_df['query'], dpu_df['target']))
+    print(f"File A ({name_a}) hits: {len(a_df)}")
+    print(f"File B ({name_b}) hits: {len(b_df)}")
 
-    intersection = cpu_pairs.intersection(dpu_pairs)
-    cpu_only = cpu_pairs - dpu_pairs
-    dpu_only = dpu_pairs - cpu_pairs
+    # Create sets of (query, target) pairs. Ensure string types for consistency
+    a_pairs = set(zip(a_df['query'].astype(str), a_df['target'].astype(str)))
+    b_pairs = set(zip(b_df['query'].astype(str), b_df['target'].astype(str)))
+
+    intersection = a_pairs.intersection(b_pairs)
+    a_only = a_pairs - b_pairs
+    b_only = b_pairs - a_pairs
 
     print(f"Intersection: {len(intersection)}")
-    print(f"CPU only: {len(cpu_only)}")
-    print(f"DPU only: {len(dpu_only)}")
+    print(f"A only: {len(a_only)}")
+    print(f"B only: {len(b_only)}")
 
-    if len(cpu_pairs) > 0:
-        recall = len(intersection) / len(cpu_pairs)
-        print(f"Recall (DPU vs CPU): {recall:.4f}")
-    
-    if len(dpu_pairs) > 0:
-        precision = len(intersection) / len(dpu_pairs)
-        print(f"Precision (DPU vs CPU): {precision:.4f}")
+    if len(a_pairs) > 0:
+        recall = len(intersection) / len(a_pairs)
+        print(f"Recall (B vs A): {recall:.4f}")
 
-    iou = len(intersection) / len(cpu_pairs.union(dpu_pairs)) if len(cpu_pairs.union(dpu_pairs)) > 0 else 0
+    if len(b_pairs) > 0:
+        precision = len(intersection) / len(b_pairs)
+        print(f"Precision (B vs A): {precision:.4f}")
+
+    union_size = len(a_pairs.union(b_pairs))
+    iou = len(intersection) / union_size if union_size > 0 else 0
     print(f"IoU: {iou:.4f}")
 
     # Compare scores for intersection
     if len(intersection) > 0:
         # Merge on query and target
-        merged = pd.merge(cpu_df, dpu_df, on=['query', 'target'], suffixes=('_cpu', '_dpu'))
-        
-        # Calculate score difference
-        merged['diff'] = merged['score_cpu'] - merged['score_dpu']
-        
-        print(f"Score correlation: {merged['score_cpu'].corr(merged['score_dpu']):.4f}")
-        print(f"Max score diff: {merged['diff'].abs().max()}")
+        merged = pd.merge(a_df, b_df, on=['query', 'target'], suffixes=('_a', '_b'))
+
+        # Attempt to coerce score columns to numeric
+        merged['score_a'] = pd.to_numeric(merged['score_a'], errors='coerce')
+        merged['score_b'] = pd.to_numeric(merged['score_b'], errors='coerce')
+
+        merged['diff'] = merged['score_a'] - merged['score_b']
+
+        corr = merged['score_a'].corr(merged['score_b'])
+        print(f"Score correlation: {corr:.4f}" if pd.notna(corr) else "Score correlation: NA")
+        print(f"Max score diff: {merged['diff'].abs().max()}" )
         print(f"Mean score diff: {merged['diff'].abs().mean():.4f}")
-        
-        # Check for significant differences
-        significant_diff = merged[merged['diff'].abs() > 1.0] # Tolerance of 1 bit/score
+
+        # Check for significant differences and show largest diffs first
+        significant_diff = merged[merged['diff'].abs() > 1.0]  # Tolerance of 1 bit/score
         if not significant_diff.empty:
+            significant_diff = significant_diff.reindex(significant_diff['diff'].abs().sort_values(ascending=False).index)
             print(f"WARNING: {len(significant_diff)} hits have score difference > 1.0")
-            print(significant_diff.head())
-    
+            cols = ['query', 'target', 'score_a', 'score_b', 'diff']
+            if 'q_len' in significant_diff.columns and 't_len' in significant_diff.columns:
+                cols = ['query', 'target', 'q_len', 't_len', 'score_a', 'score_b', 'diff']
+            print(significant_diff[cols].head())
+
     print("-----------------------------------")
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print("Usage: python compare_results.py <cpu_tsv> <dpu_tsv> <label>")
+        print("Usage: python compare_results.py <fileA_tsv> <fileB_tsv> <label>")
         sys.exit(1)
-    
+
     compare(sys.argv[1], sys.argv[2], sys.argv[3])
