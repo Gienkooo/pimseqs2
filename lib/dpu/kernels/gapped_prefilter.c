@@ -21,9 +21,15 @@ typedef enum { DOWN, RIGHT } Direction;
 #define GAP_OPEN 11
 #define GAP_EXTEND 1
 #define W 256
+//      size of cache rotating
+#define R 64
 #define NEG_INF -32768
 #define MAX_SCORE 32767
 #define X_DROP 2137
+
+#ifndef PSSM_CACHE_SIZE
+#define PSSM_CACHE_SIZE ((W + R) * KERNEL_AA_SLOTS + 16)
+#endif
 
 typedef struct {
     int16_t ppv[W];
@@ -35,6 +41,9 @@ typedef struct {
     int16_t lv[W];
     int8_t scv[W];
     int16_t cv_subvec[W];
+    int8_t pssm_cache[PSSM_CACHE_SIZE];
+    uintptr_t cache_mram_start;
+    uintptr_t cache_mram_end;
 } GappedScoreScratch;
 
 __dma_aligned BatchDescriptor g_bd;
@@ -101,10 +110,48 @@ static void compute_ungapped_diagonal_chunked(
     *out_best_diag_idx = global_best_diag;
 }
 
+static void calc_cache(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8_t *target_subseq, uint16_t len, int8_t *result, GappedScoreScratch *scratch) {
+    uintptr_t needed_mram_start = pssm_mram_base + (v_a_start * KERNEL_AA_SLOTS);
+    uintptr_t needed_mram_end = needed_mram_start + (len * KERNEL_AA_SLOTS);
+
+    if (needed_mram_start < scratch->cache_mram_start || needed_mram_end > scratch->cache_mram_end) {
+        uintptr_t aligned_start = needed_mram_start & ~7U;
+        uint32_t cache_size = sizeof(scratch->pssm_cache) & ~7U;
+        uint32_t bytes_to_keep = 0;
+
+        if (aligned_start >= scratch->cache_mram_start && aligned_start < scratch->cache_mram_end) {
+            uint32_t offset = aligned_start - scratch->cache_mram_start;
+            bytes_to_keep = scratch->cache_mram_end - aligned_start;
+            memmove(scratch->pssm_cache, (uint8_t *)scratch->pssm_cache + offset, bytes_to_keep);
+        }
+
+        scratch->cache_mram_start = aligned_start;
+        uintptr_t load_addr = aligned_start + bytes_to_keep;
+        uint32_t bytes_to_load = cache_size - bytes_to_keep;
+        uint8_t *load_ptr = (uint8_t *)scratch->pssm_cache + bytes_to_keep;
+        uint32_t loaded = 0;
+        while (loaded < bytes_to_load) {
+            uint32_t chunk = bytes_to_load - loaded;
+            if (chunk > 2048) chunk = 2048;
+            mram_read((__mram_ptr void *)(load_addr + loaded), &load_ptr[loaded], chunk);
+            loaded += chunk;
+        }
+        scratch->cache_mram_end = load_addr + loaded;
+    }
+
+    for (uint16_t k = 0; k < len; k++) {
+        uintptr_t row_addr = pssm_mram_base + ((v_a_start + k) * KERNEL_AA_SLOTS);
+        uint32_t offset = row_addr - scratch->cache_mram_start;
+        uint8_t aa = target_subseq[k];
+        if (aa >= KERNEL_AA_SLOTS) aa = 20;
+        result[k] = scratch->pssm_cache[offset + aa];
+    }
+}
+
 static void calc(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8_t *target_subseq, uint16_t len, int8_t *result) {
     __dma_aligned int8_t temp_read_buf[32];
     for (uint16_t k = 0; k < len; k++) {
-        uintptr_t row_addr = pssm_mram_base + (v_a_start * KERNEL_AA_SLOTS);
+        uintptr_t row_addr = pssm_mram_base + ((v_a_start + k) * KERNEL_AA_SLOTS);
         uintptr_t aligned_addr = row_addr & ~7U;
         uint32_t offset = row_addr & 7U;
         mram_read((__mram_ptr void *)aligned_addr, temp_read_buf, 32);
@@ -135,7 +182,9 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
     
     for (uint16_t k = 0; k < W; ++k) { ppv[k] = fv[k] = ev[k] = NEG_INF; pv[k] = 0; }
     
-    ppv[(W >> 1) + 1] = 0; pv[W >> 1] = -6; pv[(W >> 1) + 1] = -6;
+    ppv[(W >> 1) + 1] = 0; 
+    pv[W >> 1] = -GAP_OPEN - GAP_EXTEND; 
+    pv[(W >> 1) + 1] = -GAP_OPEN - GAP_EXTEND;
     int16_t center_max = pv[W >> 1];
     Direction direction = DOWN;
     uint16_t max_score_in_band_idx = 0;
@@ -190,7 +239,7 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
             uint32_t v_a_start = max(i - min3(i, (W >> 1) - 1, B_LEN - j) - 1, 0);
             uint32_t v_b_start = j - min3(j, (W >> 1) + 1, A_LEN - i + 1);
             int8_t *scv = scratch->scv;
-            calc(pssm_mram_base, v_a_start, &target_seq[v_b_start], update_len, scv);
+            calc_cache(pssm_mram_base, v_a_start, &target_seq[v_b_start], update_len, scv, scratch);
             int16_t *cv_subvec = scratch->cv_subvec;
             for (uint32_t k = 0; k < update_len; k++) {
                 uint32_t idx = ppv_start + k;
@@ -239,6 +288,8 @@ int main() {
     if (!task_target_seq || !task_diag_buf || !scratch) {
         return 0;
     }
+    scratch->cache_mram_start = 0;
+    scratch->cache_mram_end = 0;
 
     bool force_gapped = (g_bd.flags & 1);
     int16_t min_score_threshold = g_bd.min_score;
