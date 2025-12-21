@@ -297,6 +297,7 @@ void DpuPrefilterHostPipeline::runDpuKmerBatch(
         }
 
         dpu_comm_.executeKernels();
+        dpu_comm_.readAndPrintLog();
 
         std::vector<hit_t> hits;
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
@@ -521,6 +522,7 @@ void DpuPrefilterHostPipeline::runDpuGappedBatch(
         }
 
         dpu_comm_.executeKernels();
+        dpu_comm_.readAndPrintLog();
 
         // Gather results
         std::string resultBuffer; 
@@ -661,6 +663,7 @@ void DpuPrefilterHostPipeline::runDpuUngappedBatch(
         }
 
         dpu_comm_.executeKernels();
+        dpu_comm_.readAndPrintLog();
 
         std::vector<hit_t> queryResults;
         for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
