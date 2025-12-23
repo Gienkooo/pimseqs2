@@ -183,8 +183,8 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
     for (uint16_t k = 0; k < W; ++k) { ppv[k] = fv[k] = ev[k] = NEG_INF; pv[k] = 0; }
     
     ppv[(W >> 1) + 1] = 0; 
-    pv[W >> 1] = -GAP_OPEN - GAP_EXTEND; 
-    pv[(W >> 1) + 1] = -GAP_OPEN - GAP_EXTEND;
+    pv[W >> 1] = 0; 
+    pv[(W >> 1) + 1] = 0;
     int16_t center_max = pv[W >> 1];
     Direction direction = DOWN;
     uint16_t max_score_in_band_idx = 0;
@@ -256,8 +256,8 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
             memcpy(&cv[ppv_start], cv_subvec, (ppv_end - ppv_start) * sizeof(int16_t));
         }
         
-        if (j <= (W >> 1)) cv[(W >> 1) - j] = -Gi - (i + j) * Ge;
-        if ((W >> 1) + i < W) cv[(W >> 1) + i] = -Gi - (i + j) * Ge;
+        if (j <= (W >> 1)) cv[(W >> 1) - j] = 0;
+        if ((W >> 1) + i < W) cv[(W >> 1) + i] = 0;
         
         memcpy(ppv, pv, W * sizeof(int16_t));
         memcpy(pv, cv, W * sizeof(int16_t));
