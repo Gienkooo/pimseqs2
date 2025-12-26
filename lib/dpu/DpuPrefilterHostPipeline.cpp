@@ -1,4 +1,5 @@
 #include "DpuPrefilterHostPipeline.h"
+#include "measure_config.h"
 #include "Debug.h"
 #include "Sequence.h"
 #include "StripedSmithWaterman.h"
@@ -20,6 +21,9 @@
 #include <cstdio>
 #include <string>
 #include <chrono>
+#include <iostream>
+#include <fstream>
+#include <iomanip>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -368,6 +372,9 @@ void DpuPrefilterHostPipeline::runDpuGappedBatch(
     }
 
     uint32_t batch_flags = (par.prefMode == Parameters::PREF_MODE_EXHAUSTIVE) ? 1 : 0;
+    #ifdef BENCHMARKING
+        batch_flags = 1;
+    #endif
     
     uint64_t totalCells = 0;
     uint64_t totalHits = 0;
@@ -520,7 +527,18 @@ void DpuPrefilterHostPipeline::runDpuGappedBatch(
             }
         }
 
+        #ifdef BENCHMARKING
+        auto kernel_start = std::chrono::high_resolution_clock::now();
+        #endif
+
         dpu_comm_.executeKernels();
+
+        #ifdef BENCHMARKING
+        auto kernel_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> kernel_ms = kernel_end - kernel_start;
+        std::cout << "ZMIERZYŁEM" << std::endl;
+        std::cout << kernel_ms.count() << std::endl;
+        #endif
 
         // Gather results
         std::string resultBuffer; 
@@ -530,6 +548,13 @@ void DpuPrefilterHostPipeline::runDpuGappedBatch(
             dpu_comm_.gatherDataFromDPU(dpu_idx, results.data(), res_sizes[dpu_idx], res_offsets[dpu_idx]);
 
             for (const auto& hit : results) {
+                #ifdef BENCHMARKING
+                // std::ofstream outfile("/home/tomasz/pimseqs2/gapped_measurements.out", std::ios_base::app);
+                std::cout << queryLen << ";" << 256 << ";" << MEASURE_R << ";" 
+                << std::fixed << std::setprecision(6) << kernel_ms.count() << ";" << queryKey << ";" << hit.score << std::endl;
+                // outfile.close();
+                #endif
+
                 if (hit.score <= par.minDiagScoreThr) continue;
                 totalHits++;
 

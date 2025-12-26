@@ -22,13 +22,16 @@ typedef enum { DOWN, RIGHT } Direction;
 #define GAP_EXTEND 1
 #define W 256
 //      size of cache rotating
-#define R 64
+#ifndef MEASURE_R
+#define MEASURE_R 64
+#endif
 #define NEG_INF -32768
 #define MAX_SCORE 32767
 #define X_DROP 2137
+// #define X_DROP 40
 
 #ifndef PSSM_CACHE_SIZE
-#define PSSM_CACHE_SIZE ((W + R) * KERNEL_AA_SLOTS + 16)
+#define PSSM_CACHE_SIZE ((W + MEASURE_R) * KERNEL_AA_SLOTS + 16)
 #endif
 
 typedef struct {
@@ -318,9 +321,11 @@ int main() {
         
         int16_t ungapped_score = 0;
         int32_t best_diag = 0;
+        #ifndef BENCHMARKING
         compute_ungapped_diagonal_chunked(task_target_seq, meta.target_len, query_len, 
-                                          mram_base + g_bd.pssm_data_offset, task_diag_buf, 
-                                          &ungapped_score, &best_diag);
+            mram_base + g_bd.pssm_data_offset, task_diag_buf, 
+            &ungapped_score, &best_diag);
+        #endif
 
         if (ungapped_score >= min_score_threshold || force_gapped) { 
             // TODO this approach requires some margin for ungapped to catch all 
