@@ -355,6 +355,10 @@ void runFilterOnDpu(
     if (numDpus <= 0) {
         Debug(Debug::WARNING) << "DPU count <= 0 (" << numDpus << ") - defaulting to 8 DPUs to avoid allocation error\n";
         numDpus = 8;
+        #ifdef BENCHMARKING
+        numDpus = 1;
+        par.dpuNumDpus = 1;
+        #endif
     }
     mmseqs::dpu::DpuPrefilterHostPipeline pipeline(numDpus);
     pipeline.runPrefilterOnDpu(par, subMat, tinySubMat, qdbr, tdbr, 
