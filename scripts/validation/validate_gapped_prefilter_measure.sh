@@ -56,7 +56,8 @@ for R_VAL in 0 4 8 16 32 48 64 96 128; do
     # Use ungappedprefilter with --prefilter-mode 2 (PREF_MODE_EXHAUSTIVE) to trigger gapped kernel
     echo "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
         --dpu 1 --prefilter-mode 2 -v 3 -e "$E_VALUE" --comp-bias-corr 0 2>&1 | tee "$OUT_DIR/gapped_dpu.log"
-    "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
+    # dpu-profiling dpu-statistics -- "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
+    dpu-profiling dpu-sections -- "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
         --dpu 1 --prefilter-mode 2 -v 3 -e "$E_VALUE" --comp-bias-corr 0 2>&1 | tee "$OUT_DIR/gapped_dpu.log"
     if [ "${PIPESTATUS[0]}" -ne 0 ]; then
         error "DPU run failed"

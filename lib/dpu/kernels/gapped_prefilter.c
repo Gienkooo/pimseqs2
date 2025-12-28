@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <profiling.h>
 
 #include "DpuSharedTypes.h"
 
@@ -33,6 +34,13 @@ typedef enum { DOWN, RIGHT } Direction;
 #ifndef PSSM_CACHE_SIZE
 #define PSSM_CACHE_SIZE ((W + MEASURE_R) * KERNEL_AA_SLOTS + 16)
 #endif
+
+PROFILING_INIT(s_calc);
+PROFILING_INIT(s_gapped_init);
+PROFILING_INIT(s_gapped_loop);
+PROFILING_INIT(s_main_init);
+PROFILING_INIT(s_tskl_init);
+PROFILING_INIT(s_tskl_swg);
 
 typedef struct {
     int16_t ppv[W];
@@ -114,6 +122,7 @@ static void compute_ungapped_diagonal_chunked(
 }
 
 static void calc_cache(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8_t *target_subseq, uint16_t len, int8_t *result, GappedScoreScratch *scratch) {
+    profiling_start(&s_calc);
     uintptr_t needed_mram_start = pssm_mram_base + (v_a_start * KERNEL_AA_SLOTS);
     uintptr_t needed_mram_end = needed_mram_start + (len * KERNEL_AA_SLOTS);
 
@@ -149,6 +158,7 @@ static void calc_cache(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8
         if (aa >= KERNEL_AA_SLOTS) aa = 20;
         result[k] = scratch->pssm_cache[offset + aa];
     }
+    profiling_stop(&s_calc);
 }
 
 static void calc(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8_t *target_subseq, uint16_t len, int8_t *result) {
@@ -175,6 +185,8 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
                                  int16_t *out_score, uint16_t *out_q_end,
                                  uint16_t *out_t_end,
                                  GappedScoreScratch *scratch) {
+
+    profiling_start(&s_gapped_init);                              
     const int16_t Gi = GAP_OPEN;
     const int16_t Ge = GAP_EXTEND;
     int16_t *ppv = scratch->ppv;
@@ -199,7 +211,9 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
     uint32_t i = 1, j = 0;
     uint32_t A_LEN = q_len;
     uint32_t B_LEN = t_len;
+    profiling_stop(&s_gapped_init);
 
+    profiling_start(&s_gapped_loop);
     while ((i < A_LEN && j <= B_LEN) || (i <= A_LEN && j < B_LEN)) {
         if (pv[W >> 1] < center_max - X_DROP) break;
         Direction prev_direction = direction;
@@ -267,6 +281,7 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
         center_max = max(center_max, pv[W >> 1]);
         iteration++;
     }
+    profiling_stop(&s_gapped_loop);
     
     __dma_aligned uint32_t best_coords[2];
     to_cartesian_coords(max_score_in_band_idx, max_score_center, best_coords);
@@ -276,6 +291,7 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
 }
 
 int main() {
+    profiling_start(&s_main_init);
     uint32_t tasklet_id = me();
     uintptr_t mram_base = (uintptr_t)__sys_used_mram_end;
     
@@ -297,8 +313,10 @@ int main() {
     bool force_gapped = (g_bd.flags & 1);
     int16_t min_score_threshold = g_bd.min_score;
     uint32_t query_len = g_bd.query_len;
+    profiling_stop(&s_main_init);
 
     for (uint32_t i = tasklet_id; i < g_bd.num_targets; i += NR_TASKLETS) {
+        profiling_start(&s_tskl_init);
         __dma_aligned TargetMetadata meta;
         uintptr_t meta_addr = mram_base + g_bd.targets_metadata_offset + (i * sizeof(TargetMetadata));
         mram_read((__mram_ptr void *)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
@@ -318,6 +336,7 @@ int main() {
         uint32_t aligned_len = (meta.target_len + 7) & ~7U;
         if (aligned_len > MAX_TARGET_WRAM_LEN) aligned_len = MAX_TARGET_WRAM_LEN;
         mram_read((__mram_ptr void *)seq_addr, task_target_seq, aligned_len);
+        profiling_stop(&s_tskl_init);
         
         int16_t ungapped_score = 0;
         int32_t best_diag = 0;
@@ -330,6 +349,7 @@ int main() {
         if (ungapped_score >= min_score_threshold || force_gapped) { 
             // TODO this approach requires some margin for ungapped to catch all 
             // the hits min_score_threshold is calculated based on evalue, but ungapped alignment tends to produce lower scores than gapped
+            profiling_start(&s_tskl_swg);
             int16_t gapped_score = 0;
             uint16_t gapped_q_end = 0, gapped_t_end = 0;
             compute_gapped_score(task_target_seq, meta.target_len, query_len, 
@@ -343,6 +363,7 @@ int main() {
             h.score = gapped_score;
             h.q_end = gapped_q_end;
             h.t_end = gapped_t_end;
+            profiling_stop(&s_tskl_swg);
         }
         mram_write(&h, (__mram_ptr void *)res_addr, MRAM_ALIGN_SIZE(sizeof(GappedHit)));
     }
