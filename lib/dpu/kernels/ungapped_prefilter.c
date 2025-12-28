@@ -20,12 +20,17 @@
 
 __dma_aligned UngappedBatchDescriptor g_bd;
 
-__dma_aligned PROFILING_INIT(s_ungapped_loop);
+__dma_aligned PROFILING_INIT(s_ungapped_init);
 __dma_aligned PROFILING_INIT(s_ungapped_pssm_read);
 __dma_aligned PROFILING_INIT(s_ungapped_main_mem_read);
 __dma_aligned PROFILING_INIT(s_ungapped_main_mem_write);
 __dma_aligned PROFILING_INIT(s_ungapped_start_read);
 __dma_aligned PROFILING_INIT(s_ungapped_end_write);
+__dma_aligned PROFILING_INIT(s_ungapped_target_loop);
+__dma_aligned PROFILING_INIT(s_ungapped_target_loop_target_read);
+__dma_aligned PROFILING_INIT(s_ungapped_target_loop_curr_calc);
+__dma_aligned PROFILING_INIT(s_ungapped_target_loop_updating);
+
 
 BARRIER_INIT(my_barrier, NR_TASKLETS);
 MUTEX_INIT(hit_mutex);
@@ -41,13 +46,15 @@ static void compute_ungapped_diagonal_with_diag(
     int16_t global_max_score = 0;
     int32_t global_best_diag = 0;
     
+    profiling_start(&s_ungapped_init);
+
     // Total diagonals = t_len + q_len - 1. We size buffer for t_len + q_len.
     uint32_t num_diags = t_len + q_len;
     for (uint32_t i = 0; i < num_diags; ++i) diag_buffer[i] = 0;
     
     __dma_aligned int8_t temp_read_buf[32];
     
-    profiling_start(&s_ungapped_loop);
+    profiling_stop(&s_ungapped_init);
 
     for (uint32_t q_start = 0; q_start < q_len; q_start += CHUNK_SIZE) {
         uint32_t chunk_end = q_start + CHUNK_SIZE;
@@ -67,28 +74,39 @@ static void compute_ungapped_diagonal_with_diag(
             
             profiling_stop(&s_ungapped_pssm_read);
 
+            profiling_start(&s_ungapped_target_loop);
+
             for (uint32_t t = 0; t < t_len; ++t) {
+                profiling_start(&s_ungapped_target_loop_target_read);
                 uint8_t aa = target_seq[t];
                 if (aa >= ALPHA_SIZE) aa = 20;
                 
                 // Diagonal Index: t - q + (q_len - 1)
                 int32_t diag_idx = (int32_t)t - (int32_t)q + (int32_t)(q_len - 1);
+                profiling_stop(&s_ungapped_target_loop_target_read);
                 
                 if (diag_idx >= 0 && diag_idx < (int32_t)num_diags) {
+
+                    profiling_start(&s_ungapped_target_loop_curr_calc);
+                    
                     int16_t curr = diag_buffer[diag_idx] + pssm_vals[aa];
                     if (curr < 0) curr = 0;
                     diag_buffer[diag_idx] = curr;
+
+                    profiling_stop(&s_ungapped_target_loop_curr_calc);
                     
+                    profiling_start(&s_ungapped_target_loop_updating);
                     if (curr > global_max_score) {
                         global_max_score = curr;
                         global_best_diag = diag_idx;
                     }
+                    profiling_stop(&s_ungapped_target_loop_updating);
                 }
             }
+            profiling_stop(&s_ungapped_target_loop);
+
         }
     }
-
-    profiling_stop(&s_ungapped_loop);
 
     *out_score = global_max_score;
     /* diagonal index encoding: t - q + (q_len - 1) */
