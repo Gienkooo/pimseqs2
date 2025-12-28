@@ -84,7 +84,7 @@ foreach(KERNEL_SRC ${KERNEL_SOURCES})
     
     add_custom_command(
         OUTPUT ${KERNEL_BIN}
-        COMMAND ${DPU_COMPILER} -O2 -g 
+        COMMAND ${DPU_COMPILER} -O2 -g -pg
                 -DNR_TASKLETS=1
                 ${DPU_INCLUDE_FLAGS}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/shared

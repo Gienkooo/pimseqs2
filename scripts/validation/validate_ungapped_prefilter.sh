@@ -32,7 +32,7 @@ fi
 
 # Run DPU
 log "Running Ungapped Prefilter on DPU..."
-"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" --prefilter-mode 1 --comp-bias-corr 0 --dpu 1 -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" --min-ungapped-score "$MIN_UNGAPPED" 2>&1 | tee "$OUT_DIR/ungapped_dpu.log"
+dpu-profiling dpu-sections -- "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" --prefilter-mode 1 --comp-bias-corr 0 --dpu 1 -v 3 -e "$E_VALUE" --max-seqs "$MAX_SEQS" --min-ungapped-score "$MIN_UNGAPPED" 2>&1 | tee "$OUT_DIR/ungapped_dpu.log"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     error "DPU run failed"
 fi

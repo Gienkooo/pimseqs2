@@ -3,6 +3,7 @@
 #include <defs.h>
 #include <mram.h>
 #include <mutex.h>
+#include <profiling.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -18,6 +19,14 @@
 #define CHUNK_SIZE 512
 
 __dma_aligned UngappedBatchDescriptor g_bd;
+
+__dma_aligned PROFILING_INIT(s_ungapped_loop);
+__dma_aligned PROFILING_INIT(s_ungapped_pssm_read);
+__dma_aligned PROFILING_INIT(s_ungapped_main_mem_read);
+__dma_aligned PROFILING_INIT(s_ungapped_main_mem_write);
+__dma_aligned PROFILING_INIT(s_ungapped_start_read);
+__dma_aligned PROFILING_INIT(s_ungapped_end_write);
+
 BARRIER_INIT(my_barrier, NR_TASKLETS);
 MUTEX_INIT(hit_mutex);
 
@@ -38,6 +47,8 @@ static void compute_ungapped_diagonal_with_diag(
     
     __dma_aligned int8_t temp_read_buf[32];
     
+    profiling_start(&s_ungapped_loop);
+
     for (uint32_t q_start = 0; q_start < q_len; q_start += CHUNK_SIZE) {
         uint32_t chunk_end = q_start + CHUNK_SIZE;
         if (chunk_end > q_len) chunk_end = q_len;
@@ -45,12 +56,17 @@ static void compute_ungapped_diagonal_with_diag(
         for (uint32_t q = q_start; q < chunk_end; ++q) {
             // Calculate PSSM address: pssm_base + (q * 21)
             // Using shifts for x21: (q<<4) + (q<<2) + q
+
+            profiling_start(&s_ungapped_pssm_read);
+
             uint32_t q_x_21 = (q << 4) + (q << 2) + q;
             uintptr_t row_addr = pssm_mram_base + q_x_21;
             
             mram_read((__mram_ptr void *)(row_addr & ~7U), temp_read_buf, 32);
             int8_t *pssm_vals = &temp_read_buf[row_addr & 7U];
             
+            profiling_stop(&s_ungapped_pssm_read);
+
             for (uint32_t t = 0; t < t_len; ++t) {
                 uint8_t aa = target_seq[t];
                 if (aa >= ALPHA_SIZE) aa = 20;
@@ -71,6 +87,9 @@ static void compute_ungapped_diagonal_with_diag(
             }
         }
     }
+
+    profiling_stop(&s_ungapped_loop);
+
     *out_score = global_max_score;
     /* diagonal index encoding: t - q + (q_len - 1) */
     *out_diag = (int16_t)global_best_diag; 
@@ -80,12 +99,16 @@ int main() {
     uint32_t tasklet_id = me();
     uintptr_t mram_base = (uintptr_t)__sys_used_mram_end;
     
+    profiling_start(&s_ungapped_start_read);
+
     if (tasklet_id == 0) {
         mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(UngappedBatchDescriptor)));
         g_hit_count = 0;
         // Hit write offset usually starts after the counter (first 8 bytes)
         g_hit_write_offset = 8; 
     }
+    profiling_stop(&s_ungapped_start_read);
+
     barrier_wait(&my_barrier);
 
     /* DYNAMIC TASKLET CHECK: exit immediately if this tasklet is not active */
@@ -107,6 +130,8 @@ int main() {
     uintptr_t results_base = mram_base + g_bd.header.results_offset;
     
     for (uint32_t t = tasklet_id; t < g_bd.header.num_targets; t += NR_TASKLETS) {
+        profiling_start(&s_ungapped_main_mem_read);
+
         __dma_aligned TargetMetadata meta;
         uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
         mram_read((__mram_ptr void*)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
@@ -115,6 +140,8 @@ int main() {
         
         uintptr_t seq_addr = mram_base + g_bd.header.targets_data_offset + meta.offset_in_data;
         mram_read((__mram_ptr void*)seq_addr, task_target_seq, MRAM_ALIGN_SIZE(meta.target_len));
+
+        profiling_stop(&s_ungapped_main_mem_read);
         
         int16_t score = 0;
         int16_t diagonal = 0;
@@ -123,6 +150,8 @@ int main() {
             task_target_seq, meta.target_len, query_len, pssm_base, 
             diag_buffer, &score, &diagonal
         );
+
+        profiling_start(&s_ungapped_main_mem_write);
         
         if (score >= min_score) {
             __dma_aligned Hit hit;
@@ -143,15 +172,21 @@ int main() {
             // but Hit is 16 bytes, so straightforward increment is fine.
             mram_write(&hit, (__mram_ptr void*)(results_base + offset), sizeof(Hit));
         }
+        profiling_stop(&s_ungapped_main_mem_write);
     }
     
     barrier_wait(&my_barrier);
+
+    profiling_start(&s_ungapped_end_write);
+
     if (tasklet_id == 0) {
         __dma_aligned uint32_t count_buf[2];
         count_buf[0] = g_hit_count;
         count_buf[1] = 0;
         mram_write(count_buf, (__mram_ptr void*)results_base, 8);
     }
+    profiling_stop(&s_ungapped_end_write);
+
     
     return 0;
 }

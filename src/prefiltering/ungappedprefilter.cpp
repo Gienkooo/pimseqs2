@@ -351,7 +351,7 @@ void runFilterOnDpu(
     QueryMatcherTaxonomyHook* taxonomyHook,
     int alignmentMode) {
   
-    int numDpus = par.dpuNumDpus;
+    int numDpus = 1;
     if (numDpus <= 0) {
         Debug(Debug::WARNING) << "DPU count <= 0 (" << numDpus << ") - defaulting to 8 DPUs to avoid allocation error\n";
         numDpus = 8;
