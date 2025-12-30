@@ -35,7 +35,12 @@ class DpuPrefilterHostPipeline {
       DBWriter& resultWriter,
       EvalueComputation* evaluer,
       QueryMatcherTaxonomyHook* taxonomyHook,
-      int alignmentMode);
+      int alignmentMode,
+      int kmerThr,
+      ScoreMatrix* extMatTwo,
+      ScoreMatrix* extMatThree,
+      const std::string& spacedPatternStr,
+      bool takeOnlyBestKmer);
 
  private:
   DpuCommunicationManager dpu_comm_;
@@ -50,7 +55,12 @@ class DpuPrefilterHostPipeline {
       EvalueComputation* evaluer,
       QueryMatcherTaxonomyHook* taxonomyHook,
       bool sameDB,
-      DBWriter& resultWriter);
+      DBWriter& resultWriter,
+      int kmerThr,
+      ScoreMatrix* extMatTwo,
+      ScoreMatrix* extMatThree,
+      const std::string& spacedPatternStr,
+      bool takeOnlyBestKmer);
   
   void runDpuUngappedBatch(
       Parameters& par,

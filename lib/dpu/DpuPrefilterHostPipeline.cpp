@@ -1,6 +1,17 @@
 #include "DpuPrefilterHostPipeline.h"
+
+// Standard Libraries
+#include <cstring>
+#include <unistd.h>
+#include <limits.h>
+#include <cmath>
+#include <algorithm>
+#include <string>
+#include <chrono>
+#include <memory>
+
+// MMseqs2
 #include "Debug.h"
-#include "Sequence.h"
 #include "StripedSmithWaterman.h"
 #include "Matcher.h"
 #include "QueryMatcher.h"
@@ -8,21 +19,25 @@
 #include "SubstitutionMatrix.h"
 #include "KmerGenerator.h"
 #include "Indexer.h"
-#include "ExtendedSubstitutionMatrix.h"
 #include "Alignment.h"
-#include "DpuKernelManager.h"
 
-#include <cstring>
-#include <unistd.h>
-#include <limits.h>
-#include <cmath>
-#include <algorithm>
-#include <cstdio>
-#include <string>
-#include <chrono>
+// DPU Specific
+#include "DpuIndexBuilder.h"
+#include "DpuDbSplitter.h"
+#include "DpuQueryPacketGenerator.h"
+#include "DpuKernelManager.h"
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+// comment out to disable DPU debug logs
+// #define DPU_DEBUG_MODE
+
+#ifdef DPU_DEBUG_MODE
+  #define DPU_DEBUG_LOG Debug(Debug::INFO)
+#else
+  #define DPU_DEBUG_LOG if (false) Debug(Debug::INFO)
 #endif
 
 namespace mmseqs::dpu
@@ -30,76 +45,6 @@ namespace mmseqs::dpu
 
     // Forward declaration for tasklet calculation helper (defined in HELPERS section)
     static inline uint8_t calculateActiveTasklets(uint32_t wram_per_tasklet_bytes);
-
-    // ============================================================================
-    // HELPER: Build Kmer Hash Table (Copied from original logic)
-    // ============================================================================
-    static std::vector<KmerEntry> buildQueryKmerHashTableWithSimilar(
-        const std::vector<uint8_t> &query,
-        uint32_t table_size,
-        int k,
-        KmerGenerator *kmerGen,
-        Indexer *indexer,
-        size_t &totalKmersInserted,
-        const uint8_t *spacedPattern = nullptr,
-        int patternSpan = 0)
-    {
-        std::vector<KmerEntry> table(table_size, {0, 0, 0});
-        uint32_t mask = table_size - 1;
-        totalKmersInserted = 0;
-        size_t totalKmersAttempted = 0;
-
-        int windowSize = (spacedPattern && patternSpan > 0) ? patternSpan : k;
-        if (query.size() < (size_t)windowSize)
-            return table;
-
-        unsigned char kmerBuf[32];
-
-        for (size_t pos = 0; pos <= query.size() - windowSize; pos++)
-        {
-            const unsigned char *kmer;
-
-            if (spacedPattern && patternSpan > 0)
-            {
-                for (int j = 0; j < k; j++)
-                {
-                    kmerBuf[j] = query[pos + spacedPattern[j]];
-                }
-                kmer = kmerBuf;
-            }
-            else
-            {
-                kmer = query.data() + pos;
-            }
-
-            std::pair<size_t *, size_t> kmerList = kmerGen->generateKmerList(kmer);
-            totalKmersAttempted += kmerList.second;
-
-            for (size_t i = 0; i < kmerList.second; i++)
-            {
-                uint32_t kmerVal = (uint32_t)kmerList.first[i];
-                uint32_t idx = kmerVal & mask;
-                for (int p = 0; p < 256; p++)
-                {
-                    uint32_t slot = (idx + p) & mask;
-                    if (table[slot].kmer == 0)
-                    {
-                        table[slot].kmer = kmerVal;
-                        table[slot].query_id = 0;
-                        table[slot].query_pos = (uint16_t)pos;
-                        totalKmersInserted++;
-                        break;
-                    }
-                    if (table[slot].kmer == kmerVal)
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-
-        return table;
-    }
 
     // ============================================================================
     // PIPELINE IMPLEMENTATION
@@ -118,7 +63,9 @@ namespace mmseqs::dpu
         DBReader<unsigned int> *qdbr, DBReader<unsigned int> *tdbr,
         SequenceLookup *sequenceLookup, bool sameDB, DBWriter &resultWriter,
         EvalueComputation *evaluer, QueryMatcherTaxonomyHook *taxonomyHook,
-        int alignmentMode)
+        int alignmentMode,
+        int kmerThr, ScoreMatrix *extMatTwo, ScoreMatrix *extMatThree,
+        const std::string &spacedPatternStr, bool takeOnlyBestKmer) 
     {
 
         Debug(Debug::INFO) << "[DPU] Dispatch: prefMode=" << par.prefMode << " alignMode=" << alignmentMode << "\n";
@@ -137,7 +84,8 @@ namespace mmseqs::dpu
         }
         else if (par.prefMode == Parameters::PREF_MODE_KMER)
         {
-            runDpuKmerBatch(par, subMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
+            runDpuKmerBatch(par, subMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter,
+                            kmerThr, extMatTwo, extMatThree, spacedPatternStr, takeOnlyBestKmer);
         }
         else
         {
@@ -149,195 +97,569 @@ namespace mmseqs::dpu
     // ============================================================================
     // 1. KMER BATCH
     // ============================================================================
+
     void DpuPrefilterHostPipeline::runDpuKmerBatch(
-        Parameters &par, BaseMatrix *subMat,
-        DBReader<unsigned int> *qdbr, DBReader<unsigned int> *tdbr,
-        EvalueComputation *evaluer, QueryMatcherTaxonomyHook *taxonomyHook,
-        bool sameDB, DBWriter &resultWriter)
-    {
-
-        Debug(Debug::INFO) << "[DPU] K-mer prefilter: " << qdbr->getSize() << " queries, " << tdbr->getSize() << " targets\n";
-
+        Parameters &par, BaseMatrix *subMat, DBReader<unsigned int> *qdbr,
+        DBReader<unsigned int> *tdbr, EvalueComputation *evaluer,
+        QueryMatcherTaxonomyHook *taxonomyHook, bool sameDB, DBWriter &resultWriter,
+        int kmerThr, ScoreMatrix *extMatTwo, ScoreMatrix *extMatThree,
+        const std::string &spacedPatternStr, bool takeOnlyBestKmer) {
+        
         const uint32_t num_dpus = dpu_comm_.getNumDPUsActive();
-        if (num_dpus == 0)
+        if (num_dpus == 0) {
+            Debug(Debug::ERROR) << "[CPU] No active CPUs available\n";
             return;
+        }
 
-        // --- Kmer Generator Setup ---
+        DPU_DEBUG_LOG << "loading kernel\n";
+        kernel_mgr_.loadKernel(DpuKernelManager::KernelType::KMER);
+        DPU_DEBUG_LOG << " done\n";
+
+        // Setup parameters
         int ksize = par.kmerSize;
-        if (ksize <= 0)
-            ksize = 6;
-
-        int kmerThr = par.kmerScore.values.sequence();
-        if (kmerThr == INT_MAX)
-            kmerThr = 112;
 
         int alphabetSize = subMat->alphabetSize;
-        KmerGenerator *kmerGen = new KmerGenerator(ksize, alphabetSize, (short)kmerThr);
-        Indexer *indexer = new Indexer(alphabetSize, ksize);
-
-        ScoreMatrix extMatTwo = ExtendedSubstitutionMatrix::calcScoreMatrix(*subMat, 2);
-        ScoreMatrix extMatThree = ExtendedSubstitutionMatrix::calcScoreMatrix(*subMat, 3);
-        kmerGen->setDivideStrategy(&extMatThree, &extMatTwo);
-
+        // Pass reduced alphabet size for Amino Acids (21 -> 20) to Gnerator to match upstream matrices
+        std::unique_ptr<KmerGenerator> kmerGen = std::make_unique<KmerGenerator>(ksize, alphabetSize - 1, (short)kmerThr);
+        std::unique_ptr<Indexer> indexer = std::make_unique<Indexer>(alphabetSize, ksize);
+        
+        // Setup divide strategy for similar k-mer generation
+        if (extMatTwo && extMatThree) {
+            kmerGen->setDivideStrategy(extMatThree, extMatTwo);
+        } else if (!takeOnlyBestKmer && Parameters::isEqualDbtype(qdbr->getDbtype(), Parameters::DBTYPE_AMINO_ACIDS)) {
+            Debug(Debug::ERROR) << "[DPU] Similar k-mers requested but matrices missing\n";
+            EXIT(EXIT_FAILURE);
+        }
+        
+        // Spaced k-mers (if enabled)
         bool useSpacedKmers = (par.spacedKmer != 0);
         uint8_t spacedPattern[16] = {0};
         int patternSpan = ksize;
-
-        if (useSpacedKmers)
-        {
-            const int8_t *rawPattern = nullptr;
-            int rawPatternLen = 0;
-
-            switch (ksize)
-            {
-            case 6:
-                rawPattern = spaced_seed_6;
-                rawPatternLen = 6;
-                break;
-            case 7:
-                rawPattern = spaced_seed_7;
-                rawPatternLen = 7;
-                break;
-            case 8:
-                rawPattern = spaced_seed_8;
-                rawPatternLen = 8;
-                break;
-            case 9:
-                rawPattern = spaced_seed_9;
-                rawPatternLen = 9;
-                break;
-            case 10:
-                rawPattern = spaced_seed_10;
-                rawPatternLen = 10;
-                break;
-            default:
-                useSpacedKmers = false;
-                break;
-            }
-
-            if (rawPattern && rawPatternLen > 0)
-            {
+        
+        if (useSpacedKmers) {
+            // Use the passed pattern string directly
+            if (!spacedPatternStr.empty()) {
+                int pSpan = static_cast<int>(spacedPatternStr.length());
                 int patternIdx = 0;
-                for (int i = 0; i < rawPatternLen && patternIdx < ksize; i++)
-                {
-                    if (rawPattern[i])
-                        spacedPattern[patternIdx++] = (uint8_t)i;
+                for (int i = 0; i < pSpan && patternIdx < ksize; ++i) {
+                    if (spacedPatternStr[i] == '1') {
+                        if (patternIdx < (int)sizeof(spacedPattern)) {
+                            spacedPattern[patternIdx++] = static_cast<uint8_t>(i);
+                        }
+                    }
                 }
-                patternSpan = rawPatternLen;
-            }
-            else
-            {
+                // If we didn't collect any positions, disable spaced k-mers
+                if (patternIdx == 0) {
+                    useSpacedKmers = false;
+                } else {
+                    patternSpan = pSpan;
+                }
+            } else {
+                // No pattern available
                 useSpacedKmers = false;
             }
         }
+        
+        auto startTime = std::chrono::high_resolution_clock::now();
+        uint64_t totalHits = 0;
+        uint64_t totalPacketsSent = 0;
+        uint64_t totalDoubleHits = 0;  
 
-        const uint32_t HASH_TABLE_SIZE = 2097152;
+        // === PRE-CALCULATE STATIC MRAM OFFSETS ===
+        // These offsets are constant for all DPUs and all waves because the "Fixed Region" sizes are compile-time constants.
+        const uint32_t DESC_SIZE_ALIGNED = DpuCommunicationManager::alignToMram(sizeof(KmerBatchDescriptor));
+        const uint32_t RESULTS_HEADER_OFF = DESC_SIZE_ALIGNED;
+        const uint32_t CHECKPOINT_OFF = RESULTS_HEADER_OFF + DpuCommunicationManager::alignToMram(sizeof(KmerResultHeader));
+        const uint32_t HINTS_OFF = CHECKPOINT_OFF + DpuCommunicationManager::alignToMram(sizeof(KmerCheckpoint));
+        
+        // Hint table is fixed size (HINT_TABLE_SIZE + 1)
+        const uint32_t HINT_BYTES_ALIGNED = DpuCommunicationManager::alignToMram((HINT_TABLE_SIZE + 1) * sizeof(uint32_t));
+        const uint32_t STATE_TABLE_OFF = HINTS_OFF + HINT_BYTES_ALIGNED;
+        const uint32_t QUERY_PACKETS_OFF = STATE_TABLE_OFF + DpuCommunicationManager::alignToMram(MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
+        
+        // The Variable Region (Keys, Offsets, Entries) always starts here
+        const uint32_t VARIABLE_INDEX_START_OFF = QUERY_PACKETS_OFF + KMER_QUERY_BUFFER_SIZE;
 
-        auto perDpuTargetIndices = buildLoadBalancedDistribution(tdbr, num_dpus);
-        std::vector<std::vector<uint8_t>> perDpuTargetData(num_dpus);
-        std::vector<std::vector<TargetMetadata>> perDpuTargetMeta(num_dpus);
-
-#pragma omp parallel for schedule(dynamic)
-        for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx)
-        {
-            if (!perDpuTargetIndices[dpu_idx].empty())
-            {
-                assembleTargetBatchByIndices(tdbr, perDpuTargetIndices[dpu_idx],
-                                             perDpuTargetData[dpu_idx],
-                                             perDpuTargetMeta[dpu_idx], subMat);
-            }
+        // Per-query statistics for final summary
+        std::vector<uint64_t> perQueryPackets;
+        std::vector<uint64_t> perQueryDoubleHits;
+        
+        auto splits = DpuDbSplitter::splitDatabase(tdbr, num_dpus, MAX_DPU_INDEX_SIZE, MAX_DPU_SEQS);
+        
+        if (splits.empty()) {
+            Debug(Debug::ERROR) << "[CPU] Database splitting failed\n";
+            return;
         }
+        
+        size_t num_waves = splits.size() / num_dpus;
+        if (splits.size() % num_dpus != 0) num_waves++;
+        
+        for (size_t wave_idx = 0; wave_idx < num_waves; ++wave_idx) {
+            size_t wave_start = wave_idx * num_dpus;
+            size_t wave_end = std::min(wave_start + num_dpus, splits.size());
+            size_t wave_size = wave_end - wave_start;
+            
+            DPU_DEBUG_LOG << "\n[CPU] ========== Wave " << (wave_idx + 1) << "/" << num_waves << " ========== \n";
+            DPU_DEBUG_LOG << "[CPU] Processing chunks " << wave_start << " to "  << (wave_end - 1) << "\n";
+            
+            // Build indices for all chunks in the wave 
+            std::vector<DpuIndexBuffer> wave_indices(wave_size);
+            
+            #pragma omp parallel for
+            for (size_t w = 0; w < wave_size; ++w) {
+                size_t chunk_idx = wave_start + w;
+                wave_indices[w] = DpuIndexBuilder::build(
+                    tdbr, splits[chunk_idx], ksize, subMat,
+                    useSpacedKmers, spacedPattern, patternSpan
+                );
+            }
+            
+            // Transfer indices to DPUs
+            // Prepare parallel transfer buffers (one per DPU slot in the wave)
+            // Must be sized to num_dpus for scatterDataParallel, even if some slots are empty
+            std::vector<std::vector<uint8_t>> wave_hints(num_dpus);
+            std::vector<std::vector<uint8_t>> wave_index_buffers(num_dpus);
 
-        for (size_t qId = 0; qId < qdbr->getSize(); ++qId)
-        {
-            kernel_mgr_.loadKernel(DpuKernelManager::KernelType::KMER);
+            for (size_t w = 0; w < wave_size; ++w) {
+                uint32_t dpu_id = static_cast<uint32_t>(w);
+                const auto& index = wave_indices[w];
 
-            uint32_t queryKey = qdbr->getDbKey(qId);
-            uint32_t queryLen = qdbr->getSeqLen(qId);
-            const char *querySeq = qdbr->getData(qId, 0);
+                if (index.keys.empty()) {
+                    Debug(Debug::WARNING) << "[CPU] Chunk " << (wave_start + w) << " has empty index, skipping\n";
+                    continue;
+                }
+                
+                // Check total size using pre-calculated base offset
+                uint32_t keys_size = DpuCommunicationManager::alignToMram(index.keys.size() * sizeof(uint32_t));
+                uint32_t offsets_size = DpuCommunicationManager::alignToMram(index.offsets.size() * sizeof(uint32_t));
+                uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+                
+                uint32_t variable_structures_end = VARIABLE_INDEX_START_OFF + keys_size + offsets_size + entries_size;
+                uint32_t fixed_structures_end = VARIABLE_INDEX_START_OFF;
+                DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " Memory Layout:\n";
+                DPU_DEBUG_LOG << "  Fixed region: " << (fixed_structures_end / 1024) << " KB\n";
+                DPU_DEBUG_LOG << "    Descriptor:    offset 0x0\n";
+                DPU_DEBUG_LOG << "    Result Header: offset " << RESULTS_HEADER_OFF << " (STATIC)\n";
+                DPU_DEBUG_LOG << "    Checkpoint:    offset " << CHECKPOINT_OFF << " (STATIC)\n";
+                DPU_DEBUG_LOG << "    Hints:         offset " << HINTS_OFF << " (STATIC)\n";
+                DPU_DEBUG_LOG << "    State Table:   offset " << STATE_TABLE_OFF << " (STATIC)\n";
+                DPU_DEBUG_LOG << "    Query Buffer:  offset " << QUERY_PACKETS_OFF << " (STATIC, 1MB)\n";
+                DPU_DEBUG_LOG << "  Variable region: " << ((variable_structures_end - fixed_structures_end) / 1024) << " KB\n";
+                DPU_DEBUG_LOG << "    Index Keys:    " << index.keys.size() << " entries\n";
+                DPU_DEBUG_LOG << "    Index Offsets: " << index.offsets.size() << " entries\n";
+                DPU_DEBUG_LOG << "    Index Entries: " << index.entries.size() << " entries\n";
 
-            std::vector<uint8_t> encodedQuery(queryLen);
-            for (size_t i = 0; i < queryLen; i++)
-            {
-                unsigned char aa = static_cast<unsigned char>(querySeq[i]);
-                encodedQuery[i] = (subMat->aa2num) ? subMat->aa2num[aa] : 20;
-                if (encodedQuery[i] >= 21)
-                    encodedQuery[i] = 20;
+                // === OUTPUT BUFFER: Uses remaining MRAM ===
+                uint32_t results_off = variable_structures_end;
+                
+                // MRAM Safety Check: Ensure everything fits in 64MB
+                uint32_t required_for_buffers = KMER_MIN_OUTPUT_BUFFER_SIZE;
+                if (variable_structures_end + required_for_buffers > DPU_MRAM_TOTAL_SIZE) {
+                    Debug(Debug::ERROR) << "[CPU] ERROR: DPU " << dpu_id << " MRAM overflow!\n";
+                    Debug(Debug::ERROR) << "  Fixed structures: " << fixed_structures_end << " bytes (" 
+                                        << (fixed_structures_end / 1024) << " KB)\n";
+                    Debug(Debug::ERROR) << "  Variable index: " << (variable_structures_end - fixed_structures_end) 
+                                        << " bytes (" << ((variable_structures_end - fixed_structures_end) / 1024) << " KB)\n";
+                    Debug(Debug::ERROR) << "  Min output buffer: " << required_for_buffers << " bytes\n";
+                    Debug(Debug::ERROR) << "  Total required: " << (variable_structures_end + required_for_buffers) << " bytes\n";
+                    Debug(Debug::ERROR) << "  MRAM available: " << DPU_MRAM_TOTAL_SIZE << " bytes\n";
+                    Debug(Debug::ERROR) << "  SOLUTION: Reduce MAX_DPU_SEQS or database chunk size\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                
+                // Build hint buffer for this DPU
+                wave_hints[w].resize(HINT_BYTES_ALIGNED);
+                memcpy(wave_hints[w].data(), index.hints.data(), index.hints.size() * sizeof(uint32_t));
+
+                // Build merged index buffer (keys | offsets | entries) in variable region
+                uint32_t keys_size_bytes = index.keys.size() * sizeof(uint32_t);
+                uint32_t offsets_size_bytes = index.offsets.size() * sizeof(uint32_t);
+                uint32_t entries_size_bytes = index.entries.size() * sizeof(KmerCompactIndexEntry);
+
+                uint32_t total_index_size =
+                    DpuCommunicationManager::alignToMram(keys_size_bytes) +
+                    DpuCommunicationManager::alignToMram(offsets_size_bytes) +
+                    DpuCommunicationManager::alignToMram(entries_size_bytes);
+
+                wave_index_buffers[w].resize(total_index_size);
+                uint8_t* ptr = wave_index_buffers[w].data();
+
+                // Copy Keys
+                if (keys_size_bytes > 0) memcpy(ptr, index.keys.data(), keys_size_bytes);
+                ptr += DpuCommunicationManager::alignToMram(keys_size_bytes);
+
+                // Copy Offsets
+                if (offsets_size_bytes > 0) memcpy(ptr, index.offsets.data(), offsets_size_bytes);
+                ptr += DpuCommunicationManager::alignToMram(offsets_size_bytes);
+
+                // Copy Entries
+                if (entries_size_bytes > 0) memcpy(ptr, index.entries.data(), entries_size_bytes);
+
+                DPU_DEBUG_LOG << "[CPU " << dpu_id << "] Prepared index: " << index.keys.size() << " keys, " << index.entries.size() << " entries (" << (index.getTotalBytes() / 1024) << " KB)\n";
             }
 
-            size_t kmersInserted = 0;
-            std::vector<KmerEntry> hashTable = buildQueryKmerHashTableWithSimilar(
-                encodedQuery, HASH_TABLE_SIZE, ksize, kmerGen, indexer, kmersInserted,
-                useSpacedKmers ? spacedPattern : nullptr, patternSpan);
-
-            uint32_t common_size = hashTable.size() * sizeof(KmerEntry);
-            uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(KmerBatchDescriptor));
-            workflow_.broadcastCommon(hashTable.data(), common_size, bd_size);
-
-            std::vector<DpuWorkflow::MramLayout> layouts(num_dpus);
-            for (uint32_t d = 0; d < num_dpus; ++d)
             {
-                layouts[d] = workflow_.calculateLayout(
-                    sizeof(KmerBatchDescriptor), common_size, perDpuTargetMeta[d].size(), perDpuTargetData[d].size(), sizeof(Hit));
+                // Transfer Hints (Fixed Region) in one pass
+                dpu_comm_.scatterDataParallel(wave_hints, HINTS_OFF);
 
-                KmerBatchDescriptor bd = {};
-                bd.header.num_queries = 1;
-                bd.header.num_targets = perDpuTargetMeta[d].size();
-                bd.header.query_len = queryLen;
-                bd.header.pssm_data_offset = layouts[d].common_data_offset; 
-                bd.header.pssm_total_size = HASH_TABLE_SIZE;
-                bd.header.targets_metadata_offset = layouts[d].target_meta_offset;
-                bd.header.targets_data_offset = layouts[d].target_data_offset;
-                bd.header.results_offset = layouts[d].results_offset;
-                bd.header.results_buffer_size = layouts[d].results_capacity;
+                // Transfer merged Index Data (Variable Region) in one pass
+                dpu_comm_.scatterDataParallel(wave_index_buffers, VARIABLE_INDEX_START_OFF);
 
-                bd.kmer_size = ksize;
-                bd.min_score = (int16_t)par.minDiagScoreThr;
-                bd.use_spaced_kmers = useSpacedKmers ? 1 : 0;
-                bd.spaced_pattern_span = (uint8_t)patternSpan;
-                memcpy(bd.spaced_pattern, spacedPattern, sizeof(bd.spaced_pattern));
-
-                // Dynamic tasklets: conservatively estimate ~20KB WRAM per tasklet for KMER
-                bd.header.num_active_tasklets = calculateActiveTasklets(20000);
-
-                workflow_.scatterBatch(d, bd, perDpuTargetMeta[d], perDpuTargetData[d], layouts[d]);
-            }
-
-            dpu_comm_.executeKernels();
-
-            std::vector<hit_t> hits;
-            for (uint32_t d = 0; d < num_dpus; ++d)
-            {
-                std::vector<Hit> dpuHits = workflow_.gatherResults<Hit>(d, layouts[d].results_offset);
-                for (const auto &hit : dpuHits)
-                {
-                    hit_t shortHit;
-                    shortHit.seqId = tdbr->getDbKey(hit.target_id);
-                    shortHit.prefScore = hit.score;
-                    shortHit.diagonal = hit.diagonal;
-                    hits.push_back(shortHit);
+                // Log which DPUs received indices
+                for (size_t w = 0; w < wave_size; ++w) {
+                    if (!wave_index_buffers[w].empty()) {
+                        DPU_DEBUG_LOG << "[CPU " << w << "] Loaded index (parallel) size=" << (wave_index_buffers[w].size() / 1024) << " KB, hints=" << (wave_hints[w].size() / 1024) << " KB\n";
+                    }
                 }
             }
-
-            if (!hits.empty())
-            {
-                std::sort(hits.begin(), hits.end(), hit_t::compareHitsByScoreAndId);
-                size_t keep = std::min(hits.size(), (size_t)par.maxResListLen);
-                std::string resultBuffer;
-                for (size_t i = 0; i < keep; ++i)
-                {
-                    char outbuf[256];
-                    size_t len = QueryMatcher::prefilterHitToBuffer(outbuf, hits[i]);
-                    resultBuffer.append(outbuf, len);
+            
+            // === QUERY LOOP: Process each query with streaming ===
+            std::vector<hit_t> raw_hits;
+            std::string resultBuffer;
+            for (size_t q = 0; q < qdbr->getSize(); ++q) {
+                uint32_t queryKey = qdbr->getDbKey(q);
+                uint32_t queryLen = qdbr->getSeqLen(q);
+                const char* querySeq = qdbr->getData(q, 0);
+                
+                DPU_DEBUG_LOG << "[CPU] Generating packets for Query " << q << "...\n";
+                
+                // Encode query sequence
+                std::vector<uint8_t> encoded(queryLen);
+                for (size_t i = 0; i < queryLen; ++i) {
+                    unsigned char aa = static_cast<unsigned char>(querySeq[i]);
+                    encoded[i] = (subMat->aa2num) ? subMat->aa2num[aa] : 20;
+                    if (encoded[i] >= 21) encoded[i] = 20;
                 }
-                resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
-            }
-        }
+                
+                // Generate packets using KmerGenerator (expands to similar k-mers)
+                // If takeOnlyBestKmer=true, only exact k-mers are used (no expansion)
+                // Prepare composition bias vector if enabled
+                std::vector<float> compositionBiasVec;
+                if (par.compBiasCorrection) {
+                    compositionBiasVec.resize(queryLen);
+                    SubstitutionMatrix::calcLocalAaBiasCorrection(subMat, encoded.data(), (int)queryLen, compositionBiasVec.data(), par.compBiasCorrectionScale);
+                }
 
-        ExtendedSubstitutionMatrix::freeScoreMatrix(extMatTwo);
-        ExtendedSubstitutionMatrix::freeScoreMatrix(extMatThree);
-        delete kmerGen;
-        delete indexer;
+                std::vector<KmerQueryPacket> packets = DpuQueryPacketGenerator::generate(
+                    encoded, ksize, kmerGen.get(), indexer.get(),
+                    useSpacedKmers, spacedPattern, patternSpan, takeOnlyBestKmer,
+                    compositionBiasVec.empty() ? nullptr : compositionBiasVec.data(),
+                    kmerThr
+                );
+                
+                if (packets.empty()) {
+                    Debug(Debug::WARNING) << "[CPU] Query " << q << " has no packets, skipping\n";
+                    continue;
+                }
+        
+                totalPacketsSent += packets.size();
+                
+                // Calculate batch size 
+                uint32_t packets_per_batch = KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket);
+                
+                // Per-DPU result accumulation
+                std::vector<std::vector<KmerDoubleHit>> per_dpu_accumulated_results(num_dpus);
+                
+                // Count consecutive double hits for this query
+                uint64_t query_double_hits = 0;
+                
+                // BATCH LOOP: Process query in multiple batches
+                uint32_t global_packet_offset = 0;
+                int total_iterations = 0;
+                
+                while (global_packet_offset < packets.size()) {
+                    uint32_t remaining_packets = packets.size() - global_packet_offset;
+                    uint32_t batch_packet_count = std::min(remaining_packets, packets_per_batch);
+                    bool is_last_batch = (global_packet_offset + batch_packet_count >= packets.size());
+                    
+                    // Prepare Descriptors for Parallel Scatter
+                    std::vector<std::vector<uint8_t>> descriptor_buffers(num_dpus);
+                    
+                    // Broadcast State Reset (Identical for all DPUs)
+                    // Only needed for first batch
+                    if (global_packet_offset == 0) {
+                        std::vector<uint8_t> reset_state(DpuCommunicationManager::alignToMram(MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)), 0xFF);
+                        dpu_comm_.broadcastData(reset_state.data(), reset_state.size(), STATE_TABLE_OFF);
+                    }
+                    
+                    // Broadcast Query Packets (Identical for all DPUs)
+                    uint32_t packets_size = batch_packet_count * sizeof(KmerQueryPacket);
+                    const KmerQueryPacket* batch_ptr = packets.data() + global_packet_offset;
+                    dpu_comm_.broadcastData(batch_ptr, packets_size, QUERY_PACKETS_OFF);
+                    
+                    // Broadcast Checkpoint Reset (Identical)
+                    KmerCheckpoint zero_checkpoint = {0, 0, 0, 0};
+                    dpu_comm_.broadcastData(&zero_checkpoint, sizeof(KmerCheckpoint), CHECKPOINT_OFF);
+                    
+                    // Prepare all DPUs for this batch
+                    for (uint32_t dpu_id = 0; dpu_id < num_dpus; ++dpu_id) {
+                        // Handle idle DPUs or empty indices by sending a zeroed descriptor
+                        if (dpu_id >= wave_size || wave_indices[dpu_id].keys.empty()) {
+                            KmerBatchDescriptor empty_desc;
+                            memset(&empty_desc, 0, sizeof(empty_desc));
+                            // Set valid offsets so kernel writes 0-hit result to correct place
+                            empty_desc.results_header_offset = RESULTS_HEADER_OFF; 
+                            empty_desc.checkpoint_offset = CHECKPOINT_OFF;
+
+                            descriptor_buffers[dpu_id].resize(DESC_SIZE_ALIGNED);
+                            memcpy(descriptor_buffers[dpu_id].data(), &empty_desc, sizeof(empty_desc));
+                            continue;
+                        }
+
+                        const auto& index = wave_indices[dpu_id];
+                        const auto& chunk = splits[wave_start + dpu_id];
+                        
+                        // ===== VALIDATE INDEX STRUCTURE =====
+                        // Critical: These sizes must match DPU expectations or offsets will be wrong
+                        DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " Index validation:\n";
+                        DPU_DEBUG_LOG << "  hints.size() = " << index.hints.size() << " (expected: " << (HINT_TABLE_SIZE + 1) << ")\n";
+                        DPU_DEBUG_LOG << "  keys.size() = " << index.keys.size() << "\n";
+                        DPU_DEBUG_LOG << "  offsets.size() = " << index.offsets.size() << " (expected: keys.size() + 1 = " << (index.keys.size() + 1) << ")\n";
+                        DPU_DEBUG_LOG << "  entries.size() = " << index.entries.size() << "\n";
+                        
+                        // ASSERT: hints array must be exactly HINT_TABLE_SIZE + 1
+                        if (index.hints.size() != HINT_TABLE_SIZE + 1) {
+                            Debug(Debug::ERROR) << "[CPU] CRITICAL: hints.size() mismatch! DPU expects " 
+                                            << (HINT_TABLE_SIZE + 1) << " but got " << index.hints.size() << "\n";
+                            Debug(Debug::ERROR) << "  This will cause MRAM offset corruption and hangs!\n";
+                            // FATAL: DpuIndexBuilder violated the hint table invariant. 
+                            // Skipping would result in silent data loss (ignored database chunk).
+                            EXIT(EXIT_FAILURE); 
+                        }
+                        
+                        // ASSERT: offsets array must be keys.size() + 1 (sentinel)
+                        if (index.offsets.size() != index.keys.size() + 1) {
+                            Debug(Debug::ERROR) << "[CPU] CRITICAL: offsets.size() mismatch! Expected " 
+                                            << (index.keys.size() + 1) << " but got " << index.offsets.size() << "\n";
+                            // FATAL: DpuIndexBuilder violated the offset array invariant.
+                            // Skipping would result in silent data loss.
+                            EXIT(EXIT_FAILURE); 
+                        }
+                        
+                        // Use precomputed static offsets for fixed regions
+                        uint32_t keys_off = VARIABLE_INDEX_START_OFF;
+                        uint32_t offsets_off = keys_off + DpuCommunicationManager::alignToMram(index.keys.size() * sizeof(uint32_t));
+                        uint32_t entries_off = offsets_off + DpuCommunicationManager::alignToMram(index.offsets.size() * sizeof(uint32_t));
+                        uint32_t results_off = entries_off + DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+                        
+                        // Calculate output buffer size: use remaining MRAM after fixed structures
+                        uint32_t remaining_mram = DPU_MRAM_TOTAL_SIZE - results_off;
+                        uint32_t results_size = std::max((uint32_t)KMER_MIN_OUTPUT_BUFFER_SIZE, remaining_mram);
+                        results_size = DpuCommunicationManager::alignToMram(results_size);
+                        
+                        // Final MRAM safety check
+                        if (results_off + results_size > DPU_MRAM_TOTAL_SIZE) {
+                            Debug(Debug::ERROR) << "[CPU] ERROR: DPU " << dpu_id << " output buffer overflow!\n";
+                            Debug(Debug::ERROR) << "  Results offset: " << results_off << " bytes\n";
+                            Debug(Debug::ERROR) << "  Results size: " << results_size << " bytes\n";
+                            Debug(Debug::ERROR) << "  Total: " << (results_off + results_size) << " bytes\n";
+                            Debug(Debug::ERROR) << "  MRAM size: " << DPU_MRAM_TOTAL_SIZE << " bytes\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+
+                        // Setup descriptor for this batch
+                        KmerBatchDescriptor desc;
+                        memset(&desc, 0, sizeof(desc));
+                        desc.num_query_packets = batch_packet_count; // Packets in this batch
+                        desc.num_targets = static_cast<uint32_t>(chunk.size());
+                        desc.num_index_keys = static_cast<uint32_t>(index.keys.size());
+                        desc.num_index_entries = static_cast<uint32_t>(index.entries.size());
+                        desc.hint_table_offset = HINTS_OFF;
+                        desc.query_packets_offset = QUERY_PACKETS_OFF;
+                        desc.index_keys_offset = keys_off;
+                        desc.index_offsets_offset = offsets_off;
+                        desc.index_entries_offset = entries_off;
+                        desc.state_table_offset = STATE_TABLE_OFF;
+                        desc.checkpoint_offset = CHECKPOINT_OFF;
+                        desc.results_header_offset = RESULTS_HEADER_OFF;
+                        desc.results_offset = results_off;
+                        desc.results_buffer_size = results_size;
+                        desc.packet_start_idx = 0; // Always 0 in test mode (using offsets instead)
+                        desc.reserved1 = 0;
+                        
+                        // Buffer valid descriptor
+                        descriptor_buffers[dpu_id].resize(DESC_SIZE_ALIGNED);
+                        memcpy(descriptor_buffers[dpu_id].data(), &desc, sizeof(desc));
+                    }
+
+                    dpu_comm_.scatterDataParallel(descriptor_buffers, 0);
+                    
+                    // OVERFLOW RESOLUTION LOOP: Handle output buffer overflow
+                    bool all_dpus_complete = false;
+                    int overflow_iterations = 0;
+                    
+                    while (!all_dpus_complete) {
+                        overflow_iterations++;
+                        // Launch all DPUs together
+                        dpu_comm_.executeKernels();
+                        
+    #ifdef DPU_DEBUG_MODE
+                        // Read kernel logs for this iteration
+                        dpu_comm_.readAndPrintLog();
+    #endif
+                        
+                        all_dpus_complete = true; // Assume complete unless we find overflow
+                        
+                        for (size_t w = 0; w < wave_size; ++w) {
+                            uint32_t dpu_id = static_cast<uint32_t>(w);
+                            const auto& index = wave_indices[w];
+                            
+                            if (index.keys.empty()) continue;
+                            
+                            // Use precomputed offsets for this DPU
+                            uint32_t keys_off = VARIABLE_INDEX_START_OFF;
+                            uint32_t offsets_off = keys_off + DpuCommunicationManager::alignToMram(index.keys.size() * sizeof(uint32_t));
+                            uint32_t entries_off = offsets_off + DpuCommunicationManager::alignToMram(index.offsets.size() * sizeof(uint32_t));
+                            uint32_t results_off = entries_off + DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+                            
+                            // Read result header from this DPU
+                            KmerResultHeader result_header;
+                            dpu_comm_.gatherDataFromDPU(dpu_id, &result_header, sizeof(KmerResultHeader), RESULTS_HEADER_OFF);
+                            DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " Iteration " << overflow_iterations << ": total_hits=" << result_header.total_hits << " overflow=" << result_header.overflow << "\n";
+
+                            // Read double hits from this DPU
+                            if (result_header.total_hits > 0) {
+                                uint32_t hits_to_read = result_header.total_hits;
+                                // Read even count for alignment (4-byte hits) and skip padding
+                                uint32_t read_count_even = (hits_to_read + 1) & ~1U;
+                                std::vector<KmerDoubleHit> iteration_results(read_count_even);
+                                dpu_comm_.gatherDataFromDPU(dpu_id, iteration_results.data(), read_count_even * sizeof(KmerDoubleHit), results_off);
+                                
+                                // Append only real hits (skip padding sentinels if present)
+                                uint32_t appended = 0;
+                                for (uint32_t i = 0; i < read_count_even && appended < hits_to_read; ++i) {
+                                    if (iteration_results[i].target_id == KMER_TARGET_ID_PADDING) continue;
+                                    per_dpu_accumulated_results[dpu_id].push_back(iteration_results[i]);
+                                    appended++;
+                                }
+                                
+                                query_double_hits += appended;
+                                DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " Read " << appended << " double hits\n";
+                                DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " Total accumulated: " << per_dpu_accumulated_results[dpu_id].size() << " results\n";
+                            }
+
+                            if (result_header.overflow != 0) {
+                                all_dpus_complete = false;
+                                DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " has overflow, will relaunch\n";
+
+                                // Clear result header only (checkpoint persists for resume)
+                                KmerResultHeader zero_header = {0, 0};
+                                dpu_comm_.scatterDataToDPU(dpu_id, &zero_header, sizeof(KmerResultHeader), RESULTS_HEADER_OFF);
+                            }
+                        }
+                        
+                        if (all_dpus_complete) {
+                            DPU_DEBUG_LOG << "[CPU] All DPUs complete (no overflow)\n";
+                        } else {
+                            DPU_DEBUG_LOG << "[CPU] At least one DPU has overflow, relaunching batch\n";
+                        }
+                    } // end while overflow loop (!all_dpus_complete)
+                    
+                    // Batch complete, advance offset for next batch
+                    global_packet_offset += batch_packet_count;
+                    total_iterations += overflow_iterations;
+                    DPU_DEBUG_LOG << "[CPU] Query " << q << " - Batch finished, advanced offset to " << global_packet_offset << " (" << overflow_iterations << " iteration(s))\n";
+                    
+                } // end while batch loop (global_packet_offset < total_packets_this_query)
+                            
+                DPU_DEBUG_LOG << "[CPU] Query " << q << " complete! Processed " << global_packet_offset << " packets in " << total_iterations << " total iteration(s)\n";
+
+                raw_hits.clear();
+                raw_hits.reserve(query_double_hits);
+
+                size_t total_query_results = 0;
+                for (size_t w = 0; w < wave_size; ++w) {
+                    size_t dpu_results = per_dpu_accumulated_results[w].size();
+                    total_query_results += dpu_results;
+                    DPU_DEBUG_LOG << "[CPU]   DPU " << w << ": " << dpu_results << " results\n";
+
+                    const auto& dpu_hits = per_dpu_accumulated_results[w];
+                    const auto& chunk_targets = splits[wave_start + w];
+                    
+                    for (const auto& hit : dpu_hits) {
+                        // Safety check: DPU index must be within chunk range
+                        if (hit.target_id >= chunk_targets.size()) {
+                            Debug(Debug::ERROR) << "[CPU] FATAL: DPU returned invalid TargetID " << hit.target_id 
+                                                << ". Max valid ID for this chunk is " << (chunk_targets.size() - 1) << ".\n";
+                            Debug(Debug::ERROR) << "  This indicates memory corruption or an index generation bug in the DPU kernel.\n";
+                            Debug(Debug::ERROR) << "  Chunk start: " << splits[wave_start + w][0] << ", Chunk size: " << chunk_targets.size() << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        
+                        hit_t shortHit;
+                        shortHit.seqId = chunk_targets[hit.target_id]; // Map: Local DPU ID -> Global DB ID
+                        shortHit.prefScore = 1;                        // "Hits" = 1 (Count/Existence)
+                        shortHit.diagonal = hit.diagonal;              // Diagonal
+                        
+                        raw_hits.push_back(shortHit);
+                    }
+                }
+
+                DPU_DEBUG_LOG << "[CPU]   Total results: " << total_query_results << "\n";
+                DPU_DEBUG_LOG << "[CPU]   Consecutive double hits: " << query_double_hits << "\n";
+
+                // Aggregate hits by (TargetId, Diagonal)
+                std::vector<hit_t> final_query_hits;
+                if (!raw_hits.empty()) {
+                    // Sort by SeqId then Diagonal to group identical hits
+                    std::sort(raw_hits.begin(), raw_hits.end(), [](const hit_t& a, const hit_t& b) {
+                        if (a.seqId != b.seqId) return a.seqId < b.seqId;
+                        return a.diagonal < b.diagonal;
+                    });
+
+                    final_query_hits.reserve(raw_hits.size());
+                    final_query_hits.push_back(raw_hits[0]);
+
+                    for (size_t i = 1; i < raw_hits.size(); ++i) {
+                        hit_t& last = final_query_hits.back();
+                        const hit_t& curr = raw_hits[i];
+                        
+                        if (last.seqId == curr.seqId && last.diagonal == curr.diagonal) {
+                            last.prefScore += curr.prefScore;
+                        } else {
+                            final_query_hits.push_back(curr);
+                        }
+                    }
+                }
+                
+                if (!final_query_hits.empty()) {
+                    // Sort by score (descending) and then ID, required by MMseqs
+                    std::sort(final_query_hits.begin(), final_query_hits.end(), hit_t::compareHitsByScoreAndId);
+                    
+                    // Limit results if configured
+                    size_t keep = final_query_hits.size(); //std::min(final_query_hits.size(), (size_t)par.maxResListLen);
+                    
+                    resultBuffer.clear();
+                    resultBuffer.reserve(keep * 16); // Optimization: Pre-reserve buffer
+                    
+                    for (size_t i = 0; i < keep; ++i) {
+                        char outbuf[256];
+                        // Formats as binary for DBWriter, which createtsv reads as:
+                        // QueryId (Implicit) | TargetId | Score | Diagonal
+                        size_t len = QueryMatcher::prefilterHitToBuffer(outbuf, final_query_hits[i]);
+                        resultBuffer.append(outbuf, len);
+                    }
+                    
+                    resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
+                }
+                
+                // Track per-query stats for final summary
+                perQueryPackets.push_back(packets.size());
+                perQueryDoubleHits.push_back(query_double_hits);
+                totalDoubleHits += query_double_hits;
+                
+            } // end for q (query loop)
+            
+            DPU_DEBUG_LOG << "\n[CPU] Wave " << (wave_idx + 1) << " complete! Processed " << qdbr->getSize() << " queries\n"; 
+        } // end for wave_idx
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        double seconds = std::chrono::duration<double>(endTime - startTime).count();
+        
+        // Per-query summary table
+        for (size_t q = 0; q < perQueryPackets.size(); ++q) {
+            double hitRate = (perQueryPackets[q] > 0) ? (100.0 * perQueryDoubleHits[q] / perQueryPackets[q]) : 0.0;
+        }
     }
 
     // ============================================================================

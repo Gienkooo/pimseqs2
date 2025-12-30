@@ -798,6 +798,15 @@ bool Prefiltering::runSplit(const std::string &resultDB, const std::string &resu
         mmseqs::dpu::DpuPrefilterHostPipeline pipeline(par.dpuNumDpus);
         Parameters& nonConstPar = const_cast<Parameters&>(par);
 
+        if (!this->spacedKmerPattern.empty()) {
+             nonConstPar.spacedKmerPattern = this->spacedKmerPattern;
+        }
+
+        // Force DPU to use the computed parameters in case they are not explicitly set
+        nonConstPar.kmerSize = this->kmerSize;
+        nonConstPar.compBiasCorrection = this->aaBiasCorrection;;
+        nonConstPar.compBiasCorrectionScale = this->aaBiasCorrectionScale;
+
         pipeline.runPrefilterOnDpu(
             nonConstPar,
             kmerSubMat,                // BaseMatrix*
@@ -809,7 +818,13 @@ bool Prefiltering::runSplit(const std::string &resultDB, const std::string &resu
             tmpDbw,                    // ResultWriter
             NULL,                      // EvalueComputation* (not used for kmer)
             taxonomyHook,              // Taxonomy
-            Parameters::PREF_MODE_KMER // Mode 0
+            Parameters::PREF_MODE_KMER, // Mode 0
+            // PASS PRE-COMPUTED RESOURCES
+            this->kmerThr,             // Threshold
+            &this->_2merSubMatrix,     // 2-mer Matrix
+            &this->_3merSubMatrix,     // 3-mer Matrix
+            this->spacedKmerPattern,   // Spaced Pattern String
+            this->takeOnlyBestKmer     // Correctly computed boolean
         );
 
         // Cleanup

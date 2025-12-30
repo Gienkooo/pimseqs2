@@ -357,10 +357,20 @@ void runFilterOnDpu(
         numDpus = 8;
     }
     mmseqs::dpu::DpuPrefilterHostPipeline pipeline(numDpus);
-    pipeline.runPrefilterOnDpu(par, subMat, tinySubMat, qdbr, tdbr, 
-                                                         sequenceLookup, sameDB, resultWriter,
-                                                         evaluer, taxonomyHook, alignmentMode);
+
+    // MOCKUP: These parameters are strictly for K-mer prefiltering.
+    // Since we are in the 'Ungapped' workflow (PREF_MODE_UNGAPPED),
+    // the DPU pipeline will ignore these, so we pass dummy values to avoid expensive computation.
+    int kmerThr = 0;
+    std::string spacedPatternStr = "";
+    bool takeOnlyBestKmer = false;
+
+    pipeline.runPrefilterOnDpu(par, subMat, tinySubMat, qdbr, tdbr,
+                              sequenceLookup, sameDB, resultWriter,
+                              evaluer, taxonomyHook, alignmentMode,
+                              kmerThr, nullptr, nullptr, spacedPatternStr, takeOnlyBestKmer);
 }
+
 #endif
 
 void runFilterOnCpu(Parameters & par, BaseMatrix * subMat, int8_t * tinySubMat,
