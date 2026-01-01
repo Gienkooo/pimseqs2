@@ -401,6 +401,7 @@ Parameters::Parameters():
     alignall.push_back(&PARAM_COMPRESSED);
     alignall.push_back(&PARAM_V);
     alignall.push_back(&PARAM_DPU);
+    alignall.push_back(&PARAM_DPU_NUM_DPUS);
 
     // alignment
     align.push_back(&PARAM_SUB_MAT);
@@ -420,6 +421,7 @@ Parameters::Parameters():
     align.push_back(&PARAM_NO_COMP_BIAS_CORR_SCALE);
 
     align.push_back(&PARAM_DPU);
+    align.push_back(&PARAM_DPU_NUM_DPUS);
 
     align.push_back(&PARAM_MAX_REJECTED);
     align.push_back(&PARAM_MAX_ACCEPT);
@@ -472,6 +474,7 @@ Parameters::Parameters():
     prefilter.push_back(&PARAM_SPACED_KMER_PATTERN);
     prefilter.push_back(&PARAM_LOCAL_TMP);
     prefilter.push_back(&PARAM_DPU);
+    prefilter.push_back(&PARAM_DPU_NUM_DPUS);
     prefilter.push_back(&PARAM_THREADS);
     prefilter.push_back(&PARAM_COMPRESSED);
     prefilter.push_back(&PARAM_V);
@@ -1569,6 +1572,7 @@ Parameters::Parameters():
 
     // tsv2exprofiledb
     tsv2exprofiledb.push_back(&PARAM_DPU);
+    tsv2exprofiledb.push_back(&PARAM_DPU_NUM_DPUS);
     tsv2exprofiledb.push_back(&PARAM_GPU);
     tsv2exprofiledb.push_back(&PARAM_THREADS);
     tsv2exprofiledb.push_back(&PARAM_COMPRESSED);
