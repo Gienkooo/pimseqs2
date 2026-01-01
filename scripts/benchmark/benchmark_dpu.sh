@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -e
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
 BUILD_DIR="$ROOT_DIR/build"
@@ -37,10 +39,10 @@ prepare_dbs() {
     fi
 }
 
-prepare_dbs
-
 OUT_DIR="$RESULTS_DIR/ungapped"
 mkdir -p "$OUT_DIR"
+
+prepare_dbs
 
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="1000"
