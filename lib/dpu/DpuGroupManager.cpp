@@ -11,7 +11,8 @@ DpuGroupManager::DpuGroupManager(uint32_t num_groups, uint32_t dpus_per_group)
       dpus_per_group_(dpus_per_group),
       dpu_sets_(num_groups),
       statuses_(num_groups, GroupStatus::IDLE),
-      contexts_(num_groups) {
+    contexts_(num_groups),
+    owns_sets_(true) {
     
     if (num_groups == 0) {
         Debug(Debug::ERROR) << "[DPU GROUP] Must have at least 1 group\n";
@@ -64,16 +65,33 @@ DpuGroupManager::DpuGroupManager(uint32_t num_groups, uint32_t dpus_per_group)
     Debug(Debug::INFO) << "[DPU GROUP] Initialized " << num_groups_ << " groups × " << dpus_per_group_ << " DPUs = " << getTotalDpus() << "\n";
 }
 
+DpuGroupManager::DpuGroupManager(const std::vector<struct dpu_set_t>& external_sets)
+        : num_groups_(external_sets.size()),
+            dpus_per_group_(1),
+            dpu_sets_(external_sets),
+            statuses_(external_sets.size(), GroupStatus::IDLE),
+            contexts_(external_sets.size()),
+            owns_sets_(false) {
+        if (num_groups_ == 0) {
+                Debug(Debug::ERROR) << "[DPU GROUP] Must have at least 1 group\n";
+                exit(EXIT_FAILURE);
+        }
+        Debug(Debug::INFO) << "[DPU GROUP] Wrapped " << num_groups_ << " existing DPUs (no ownership)\n";
+}
+
 DpuGroupManager::~DpuGroupManager() {
     // Wait for any executing groups
     syncAllGroups();
-    
-    // Free all groups
-    for (uint32_t g = 0; g < num_groups_; ++g) {
-        dpu_free(dpu_sets_[g]);
+
+    if (owns_sets_) {
+        // Free all groups
+        for (uint32_t g = 0; g < num_groups_; ++g) {
+            dpu_free(dpu_sets_[g]);
+        }
+        Debug(Debug::INFO) << "[DPU GROUP] Released " << num_groups_ << " groups\n";
+    } else {
+        Debug(Debug::INFO) << "[DPU GROUP] Wrapped DPUs released (ownership=false)\n";
     }
-    
-    Debug(Debug::INFO) << "[DPU GROUP] Released " << num_groups_ << " groups\n";
 }
 
 void DpuGroupManager::loadKernel(const char* kernel_binary_path) {
@@ -190,14 +208,11 @@ void DpuGroupManager::broadcastToGroup(uint32_t group_id, const void* data,
         Debug(Debug::ERROR) << "[DPU GROUP] MRAM offset/size not 8-byte aligned\n";
         exit(EXIT_FAILURE);
     }
-    
-    // Broadcast to all DPUs in the group
-    struct dpu_set_t dpu;
-    DPU_FOREACH(dpu_sets_[group_id], dpu) {
-        dpu_error_t status = dpu_copy_to(dpu, "__sys_used_mram_end", mram_offset,
-                                          (void*)data, size);
-        checkStatus(status, "Broadcast", group_id);
-    }
+
+    // Single call broadcasts to the whole group set.
+    dpu_error_t status = dpu_copy_to(dpu_sets_[group_id], "__sys_used_mram_end", mram_offset,
+                                     (void*)data, size);
+    checkStatus(status, "Broadcast", group_id);
 }
 
 void DpuGroupManager::launchGroupAsync(uint32_t group_id, const GroupContext& context) {

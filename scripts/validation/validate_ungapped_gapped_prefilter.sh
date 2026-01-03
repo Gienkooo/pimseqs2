@@ -22,9 +22,11 @@ rm -f "${DPU_DB}"* "${GPU_DB}"* "${DPU_RES}" "${GPU_RES}"
 E_VALUE="${E_VALUE:-1000}"
 # Max results per query (default high to not truncate results)
 MAX_SEQS="${MAX_SEQS:-10000}"
+# Number of DPUs (default 0 = auto, override with DPU_NUM_DPUS env var)
+DPU_NUM_DPUS="${DPU_NUM_DPUS:-0}"
 
 log "Comparing DPU vs GPU Gapped Prefilter"
-log "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS"
+log "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS, num-dpus: $DPU_NUM_DPUS"
 
 # -----------------------------------------------------------------------------
 # PREPARE GPU DATABASE (Required!)
@@ -61,6 +63,7 @@ fi
 log "1. Running Ungapped-Gapped Prefilter on DPU..."
 "$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
     --dpu 1 \
+    --dpu-num-dpus "$DPU_NUM_DPUS" \
     --prefilter-mode 3 \
     -v 3 \
     -e "$E_VALUE" \

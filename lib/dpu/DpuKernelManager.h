@@ -7,17 +7,26 @@ namespace mmseqs::dpu {
 
 class DpuKernelManager {
 public:
-    enum class KernelType { KMER, UNGAPPED, GAPPED, COMBINED };
+    enum class KernelType { KMER, UNGAPPED, GAPPED, COMBINED, NONE };
 
-    explicit DpuKernelManager(DpuCommunicationManager& comm) : comm_(comm) {}
+    explicit DpuKernelManager(DpuCommunicationManager& comm) 
+        : comm_(comm), lastLoadedKernel_(KernelType::NONE) {}
 
     void loadKernel(KernelType type) {
+        // Optimization: On hardware, avoid reloading the same kernel to save time.
+        // The kernel must reset its own state (BSS) if not reloaded.
+        if (!comm_.isSimulator() && type == lastLoadedKernel_) {
+            return;
+        }
+
         std::string path = resolvePath(type);
         comm_.loadKernel(path.c_str());
+        lastLoadedKernel_ = type;
     }
 
 private:
     DpuCommunicationManager& comm_;
+    KernelType lastLoadedKernel_;
 
     std::string resolvePath(KernelType type) {
         std::string name;
@@ -26,6 +35,7 @@ private:
             case KernelType::UNGAPPED: name = "ungapped_prefilter"; break;
             case KernelType::GAPPED:   name = "gapped_prefilter"; break;
             case KernelType::COMBINED: name = "ungapped_gapped_prefilter"; break;
+            default: return "";
         }
 
         if (type == KernelType::GAPPED && getenv("DPU_GAPPED_KERNEL")) {

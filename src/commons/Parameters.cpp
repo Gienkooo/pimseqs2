@@ -488,6 +488,7 @@ Parameters::Parameters():
     ungappedprefilter.push_back(&PARAM_TAXON_LIST);
     ungappedprefilter.push_back(&PARAM_PRELOAD_MODE);
     ungappedprefilter.push_back(&PARAM_DPU);
+    ungappedprefilter.push_back(&PARAM_DPU_NUM_DPUS);
     ungappedprefilter.push_back(&PARAM_GPU);
     ungappedprefilter.push_back(&PARAM_GPU_SERVER);
     ungappedprefilter.push_back(&PARAM_GPU_SERVER_WAIT_TIMEOUT);

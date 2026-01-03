@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 
 namespace mmseqs::dpu {
 
@@ -30,8 +31,10 @@ public:
     MramLayout calculateLayout(uint32_t descriptor_size,
                            uint32_t common_data_size,
                            uint32_t num_targets,
+                           uint32_t num_queries,
                            uint32_t target_data_size,
-                           uint32_t result_struct_size) 
+                           uint32_t result_struct_size,
+                           uint32_t extra_results_bytes = 0) 
     {
         MramLayout layout;
         
@@ -49,8 +52,11 @@ public:
         uint32_t tdata_size = DpuCommunicationManager::alignToMram(target_data_size);
         layout.results_offset = layout.target_data_offset + tdata_size;
         
-        // Allocate space for results: (Count:8bytes) + (Hits) + (Padding)
-        uint32_t res_bytes = num_targets * result_struct_size + 64; // +64 safety/count
+        // Allocate space for results: (Count:8bytes) + (Hits for all query/target pairs) + (Extra/Scratch)
+        const uint64_t hits_bytes = static_cast<uint64_t>(num_targets) * static_cast<uint64_t>(num_queries) * static_cast<uint64_t>(result_struct_size);
+        uint32_t hits_aligned = DpuCommunicationManager::alignToMram(static_cast<uint32_t>(hits_bytes + 64));
+        uint32_t extra_aligned = DpuCommunicationManager::alignToMram(extra_results_bytes);
+        uint32_t res_bytes = hits_aligned + extra_aligned;
         layout.results_capacity = DpuCommunicationManager::alignToMram(res_bytes);
         
         layout.total_mram_used = layout.results_offset + layout.results_capacity;
@@ -159,6 +165,47 @@ public:
         }
         
         return hits;
+    }
+
+    // Gather with clamping to result capacity and export overflow flag (upper 32 bits of header)
+    template <typename HitType>
+    std::vector<HitType> gatherResultsClamped(uint32_t dpu_id,
+                                              uint32_t results_mram_offset,
+                                              uint32_t result_capacity_bytes,
+                                              uint32_t* overflow_out) {
+        uint64_t hdr = 0;
+        comm_.gatherDataFromDPU(dpu_id, &hdr, 8, results_mram_offset);
+        uint32_t hitcount = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+        uint32_t overflow = static_cast<uint32_t>(hdr >> 32);
+        if (overflow_out) *overflow_out = overflow;
+
+        if (result_capacity_bytes <= 8) return {};
+        uint32_t maxHits = (result_capacity_bytes - 8) / sizeof(HitType);
+        if (hitcount > maxHits) hitcount = maxHits;
+
+        if (hitcount == 0) return {};
+
+        uint32_t hits_offset = results_mram_offset + 8;
+        uint32_t data_size = hitcount * sizeof(HitType);
+        uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
+
+        std::vector<HitType> hits(hitcount);
+        if (aligned_size != data_size) {
+            std::vector<uint8_t> buf(aligned_size);
+            comm_.gatherDataFromDPU(dpu_id, buf.data(), aligned_size, hits_offset);
+            memcpy(hits.data(), buf.data(), data_size);
+        } else {
+            comm_.gatherDataFromDPU(dpu_id, hits.data(), aligned_size, hits_offset);
+        }
+        return hits;
+    }
+
+    // Scatter only the descriptor to DPU (leave targets in MRAM)
+    template <typename BatchDescT>
+    void scatterDescriptor(uint32_t dpu_id, const BatchDescT& bd) {
+        uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(BatchDescT));
+        BatchDescT bd_copy = bd;
+        comm_.scatterDataToDPU(dpu_id, &bd_copy, bd_size, 0);
     }
 
 private:

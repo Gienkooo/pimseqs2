@@ -12,6 +12,8 @@ make -j$(nproc)
 cd ..
 
 echo "Running Gapped validation..."
+
+export DPU_NUM_DPUS=12
 time ./scripts/validation/validate_gapped_prefilter.sh
 
 echo "Comparing results (CPU vs DPU)..."

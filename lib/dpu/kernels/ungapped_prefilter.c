@@ -23,6 +23,7 @@ MUTEX_INIT(hit_mutex);
 
 __host uint32_t g_hit_count;
 __host uint32_t g_hit_write_offset;
+__host uint32_t g_overflow;
 
 /* Compute simple diagonal heuristic and return score + best diagonal */
 static void compute_ungapped_diagonal_with_diag(
@@ -85,25 +86,37 @@ int main() {
         g_hit_count = 0;
         // Hit write offset usually starts after the counter (first 8 bytes)
         g_hit_write_offset = 8; 
+        g_overflow = 0;
+    }
+    barrier_wait(&my_barrier);
+
+    // Reset WRAM allocator per launch to avoid heap growth across launches.
+    if (tasklet_id == 0) {
+        mem_reset();
     }
     barrier_wait(&my_barrier);
 
     /* DYNAMIC TASKLET CHECK: exit immediately if this tasklet is not active */
     if (!is_tasklet_active(g_bd.header.num_active_tasklets)) return 0;
+
+    // Guard against undersized results buffer; need space for 8-byte header.
+    if (g_bd.header.results_buffer_size < 8) return 0;
     
     // Allocations
     uint8_t *task_target_seq = (uint8_t *)mem_alloc(MAX_TARGET_WRAM_LEN);
-    // Buffer for diagonals: needs to hold t_len + q_len
-    // Max requirement approx MAX_TARGET + MAX_QUERY. 
-    // Allocating a safe upper bound e.g. 8KB or similar
-    int16_t *diag_buffer = (int16_t *)mem_alloc(8192 * sizeof(int16_t));
+    // Buffer for diagonals: allocate based on batch max query length
+    uint32_t max_query_len = g_bd.header.query_len;
+    uint32_t max_diags = MAX_TARGET_WRAM_LEN + max_query_len;
+    uint32_t diag_bytes = ((max_diags * sizeof(int16_t) + 7) & ~7U);
+    int16_t *diag_buffer = (int16_t *)mem_alloc(diag_bytes);
     
     if (!task_target_seq || !diag_buffer) return 0;
     
-    uint32_t query_len = g_bd.header.query_len;
-    // For Ungapped mode, we use min_score from the batch descriptor
+    // Use header.query_len as max_query_len for safety checks if needed, 
+    // but we will read actual len from metadata.
     int16_t min_score = g_bd.min_score; 
-    uintptr_t pssm_base = mram_base + g_bd.header.pssm_data_offset;
+    uintptr_t pssm_base_start = mram_base + g_bd.header.pssm_data_offset;
+    uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
     uintptr_t results_base = mram_base + g_bd.header.results_offset;
     
     for (uint32_t t = tasklet_id; t < g_bd.header.num_targets; t += NR_TASKLETS) {
@@ -116,32 +129,44 @@ int main() {
         uintptr_t seq_addr = mram_base + g_bd.header.targets_data_offset + meta.offset_in_data;
         mram_read((__mram_ptr void*)seq_addr, task_target_seq, MRAM_ALIGN_SIZE(meta.target_len));
         
-        int16_t score = 0;
-        int16_t diagonal = 0;
-        
-        compute_ungapped_diagonal_with_diag(
-            task_target_seq, meta.target_len, query_len, pssm_base, 
-            diag_buffer, &score, &diagonal
-        );
-        
-        if (score >= min_score) {
-            __dma_aligned Hit hit;
-            hit.target_id = meta.target_id;
-            hit.query_id = 0;      // Typically 0 for single-query batches
-            hit.score = score;     // Correct score field for Hit struct
-            hit.diagonal = diagonal;
-            hit.pad1 = 0;
-            hit.pad2 = 0;
+        // Loop over all queries in the batch
+        for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
+            __dma_aligned QueryMetadata qmeta;
+            mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
+
+            int16_t score = 0;
+            int16_t diagonal = 0;
             
-            mutex_lock(hit_mutex);
-            uint32_t offset = g_hit_write_offset;
-            g_hit_write_offset += sizeof(Hit);
-            g_hit_count++;
-            mutex_unlock(hit_mutex);
+            uintptr_t pssm_addr = pssm_base_start + qmeta.pssm_offset_in_batch;
+
+            compute_ungapped_diagonal_with_diag(
+                task_target_seq, meta.target_len, qmeta.query_len, pssm_addr, 
+                diag_buffer, &score, &diagonal
+            );
             
-            // Ensure we write to 8-byte aligned offset if MRAM requires it, 
-            // but Hit is 16 bytes, so straightforward increment is fine.
-            mram_write(&hit, (__mram_ptr void*)(results_base + offset), sizeof(Hit));
+            if (score >= min_score) {
+                __dma_aligned Hit hit;
+                hit.target_id = meta.target_id;
+                hit.query_id = (uint16_t)q_idx; // Store batch index
+                hit.score = score;
+                hit.diagonal = diagonal;
+                hit.pad1 = 0;
+                hit.pad2 = 0;
+                
+                mutex_lock(hit_mutex);
+                uint32_t next = g_hit_write_offset + sizeof(Hit);
+                if (next > g_bd.header.results_buffer_size) {
+                    g_overflow = 1;
+                    mutex_unlock(hit_mutex);
+                    continue; // drop hit
+                }
+                uint32_t offset = g_hit_write_offset;
+                g_hit_write_offset = next;
+                g_hit_count++;
+                mutex_unlock(hit_mutex);
+
+                mram_write(&hit, (__mram_ptr void*)(results_base + offset), sizeof(Hit));
+            }
         }
     }
     
@@ -149,7 +174,7 @@ int main() {
     if (tasklet_id == 0) {
         __dma_aligned uint32_t count_buf[2];
         count_buf[0] = g_hit_count;
-        count_buf[1] = 0;
+        count_buf[1] = g_overflow; // signal overflow in high word
         mram_write(count_buf, (__mram_ptr void*)results_base, 8);
     }
     

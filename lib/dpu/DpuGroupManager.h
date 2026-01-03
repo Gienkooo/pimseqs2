@@ -38,6 +38,9 @@ public:
 
     // Create manager with num_groups and optional dpus_per_group (0 = auto).
     explicit DpuGroupManager(uint32_t num_groups, uint32_t dpus_per_group = 0);
+
+    // Create manager that wraps externally allocated per-DPU sets (no ownership).
+    explicit DpuGroupManager(const std::vector<struct dpu_set_t>& external_sets);
     ~DpuGroupManager();
     
     // Disable copy
@@ -105,6 +108,7 @@ private:
     std::vector<struct dpu_set_t> dpu_sets_;
     std::vector<GroupStatus> statuses_;
     std::vector<GroupContext> contexts_;
+    bool owns_sets_ = true;
 
     void checkStatus(dpu_error_t status, const char* context, uint32_t group_id);
 };

@@ -11,11 +11,12 @@ make -j$(nproc)
 cd ..
 
 echo "Running DPU vs GPU Validation..."
-# Ensure this script is the modified version that runs DPU and GPU
+
+export DPU_NUM_DPUS=12
 time ./scripts/validation/validate_ungapped_gapped_prefilter.sh
 
 echo "Comparing results (DPU vs GPU)..."
-# UPDATE: Changed filenames to compare DPU vs GPU
+
 python3 scripts/validation/compare_results.py \
     scripts/validation/results/ungapped_gapped/ungapped_gapped_dpu.tsv \
     scripts/validation/results/ungapped_gapped/ungapped_gapped_gpu.tsv \

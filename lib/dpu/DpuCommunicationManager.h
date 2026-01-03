@@ -46,6 +46,14 @@ class DpuCommunicationManager {
   void waitForKernels();       // Wait for async execution to complete
   bool isExecutionComplete();  // Check if async execution finished (non-blocking)
   bool isAsyncInProgress() const { return async_in_progress_; }
+  void readLogs();             // Read and print logs from all DPUs
+
+  // Per-DPU controls for fine-grained scheduling
+  void loadKernel(uint32_t dpu_id, const char* kernel_binary_path);
+  void executeKernel(uint32_t dpu_id);
+  void executeKernelAsync(uint32_t dpu_id);
+  void waitForKernel(uint32_t dpu_id);
+  bool isExecutionComplete(uint32_t dpu_id);
 
   static constexpr uint32_t MRAM_SIZE = 64 * 1024 * 1024;  // 64 MB
   static constexpr uint32_t WRAM_SIZE = 64 * 1024;         // 64 KB
@@ -57,15 +65,22 @@ class DpuCommunicationManager {
 
   void readAndPrintLog();
 
-  // Access to raw DPU set for advanced operations
+  bool isSimulator() const { return is_simulator_; }
+
+  // Access to raw DPU sets for advanced operations
   struct dpu_set_t& getDpuSet() { return dpu_set_; }
+  struct dpu_set_t& getDpuSet(uint32_t dpu_id) { return dpu_sets_.at(dpu_id); }
+  const std::vector<struct dpu_set_t>& getDpuSets() const { return dpu_sets_; }
 
  private:
   struct dpu_set_t dpu_set_;
   struct dpu_set_t rank_;
+  std::vector<struct dpu_set_t> dpu_sets_; // one set per DPU for independent control
+  std::vector<bool> async_per_dpu_;
   uint32_t num_dpus_available_;
   uint32_t num_dpus_active_;
   bool async_in_progress_ = false;
+  bool is_simulator_ = false;
 
   void checkStatus(dpu_error_t status, const char* context);
 };

@@ -141,7 +141,7 @@ typedef struct {
 DPU_STATIC_ASSERT(sizeof(KmerBatchDescriptor) % 8 == 0, "KmerBatchDescriptor must be 8-byte aligned");
 
 /* --- 1. Common Batch Header --- */
-typedef struct {
+struct DpuBatchHeader {
     uint32_t batch_id;
     uint32_t num_queries;
     uint32_t num_targets;
@@ -162,20 +162,49 @@ typedef struct {
     uint16_t flags;
     uint8_t  num_active_tasklets; /* Dynamic tasklet control */
     uint8_t  pad[5];              /* pad to 8 bytes */
-} __attribute__((packed)) DpuBatchHeader;
+
+#ifdef __cplusplus
+    DpuBatchHeader() = default;
+    DpuBatchHeader(uint32_t num_queries, uint32_t num_targets, uint32_t query_len,
+                   uint32_t queries_metadata_offset, uint32_t pssm_data_offset,
+                   uint32_t targets_metadata_offset, uint32_t targets_data_offset,
+                   uint32_t results_offset, uint32_t results_buffer_size,
+                   uint32_t pssm_total_size, uint32_t targets_total_size,
+                   uint16_t flags, uint8_t num_active_tasklets)
+        : num_queries(num_queries), num_targets(num_targets), query_len(query_len),
+          queries_metadata_offset(queries_metadata_offset), pssm_data_offset(pssm_data_offset),
+          targets_metadata_offset(targets_metadata_offset), targets_data_offset(targets_data_offset),
+          results_offset(results_offset),
+          pssm_total_size(pssm_total_size), targets_total_size(targets_total_size),
+          results_buffer_size(results_buffer_size),
+          flags(flags), num_active_tasklets(num_active_tasklets) {
+        for (int i = 0; i < 5; ++i) pad[i] = 0;
+    }
+#endif
+} __attribute__((packed));
+typedef struct DpuBatchHeader DpuBatchHeader;
 
 /* Ungapped descriptor */
-typedef struct {
+struct UngappedBatchDescriptor {
     DpuBatchHeader header;
     
     int16_t min_score;
     int16_t gap_open_cost;      // Not used by ungapped, but kept for struct similarity if needed
     int16_t gap_extend_cost;
     int16_t pssm_bias;
-} __attribute__((packed)) UngappedBatchDescriptor;
+
+#ifdef __cplusplus
+    UngappedBatchDescriptor() = default;
+    UngappedBatchDescriptor(const DpuBatchHeader& header, int16_t min_score,
+                            int16_t gap_open_cost, int16_t gap_extend_cost, int16_t pssm_bias)
+        : header(header), min_score(min_score), gap_open_cost(gap_open_cost),
+          gap_extend_cost(gap_extend_cost), pssm_bias(pssm_bias) {}
+#endif
+} __attribute__((packed));
+typedef struct UngappedBatchDescriptor UngappedBatchDescriptor;
 
 /* Gapped descriptor */
-typedef struct {
+struct GappedBatchDescriptor {
     DpuBatchHeader header;
     
     int16_t min_score;
@@ -189,11 +218,26 @@ typedef struct {
     uint8_t min_aln_len;
     uint8_t seq_id_thr_pct;
     
-    uint8_t padding[4];
-} __attribute__((packed)) GappedBatchDescriptor;
+    uint8_t padding[2];
+
+#ifdef __cplusplus
+    GappedBatchDescriptor() = default;
+    GappedBatchDescriptor(const DpuBatchHeader& header, int16_t min_score,
+                          int16_t gap_open_cost, int16_t gap_extend_cost, int16_t xdrop_threshold,
+                          int16_t pssm_bias, uint8_t cov_mode, uint8_t cov_thr_pct,
+                          uint8_t min_aln_len, uint8_t seq_id_thr_pct)
+        : header(header), min_score(min_score), gap_open_cost(gap_open_cost),
+          gap_extend_cost(gap_extend_cost), xdrop_threshold(xdrop_threshold),
+          pssm_bias(pssm_bias), cov_mode(cov_mode), cov_thr_pct(cov_thr_pct),
+          min_aln_len(min_aln_len), seq_id_thr_pct(seq_id_thr_pct) {
+        padding[0] = 0; padding[1] = 0;
+    }
+#endif
+} __attribute__((packed));
+typedef struct GappedBatchDescriptor GappedBatchDescriptor;
 
 /* Combined (ungapped+gapped) descriptor */
-typedef struct {
+struct CombinedBatchDescriptor {
     DpuBatchHeader header;
     
     int16_t min_ungapped_score;
@@ -207,9 +251,20 @@ typedef struct {
     uint8_t cov_thr_pct;
     uint8_t min_aln_len;
     uint8_t seq_id_thr_pct;
-    
-    uint8_t padding[2];
-} __attribute__((packed)) CombinedBatchDescriptor;
+
+#ifdef __cplusplus
+    CombinedBatchDescriptor() = default;
+    CombinedBatchDescriptor(const DpuBatchHeader& header, int16_t min_ungapped_score,
+                            int16_t min_score, int16_t gap_open_cost, int16_t gap_extend_cost,
+                            int16_t xdrop_threshold, int16_t pssm_bias, uint8_t cov_mode,
+                            uint8_t cov_thr_pct, uint8_t min_aln_len, uint8_t seq_id_thr_pct)
+        : header(header), min_ungapped_score(min_ungapped_score), min_score(min_score),
+          gap_open_cost(gap_open_cost), gap_extend_cost(gap_extend_cost),
+          xdrop_threshold(xdrop_threshold), pssm_bias(pssm_bias), cov_mode(cov_mode),
+          cov_thr_pct(cov_thr_pct), min_aln_len(min_aln_len), seq_id_thr_pct(seq_id_thr_pct) {}
+#endif
+} __attribute__((packed));
+typedef struct CombinedBatchDescriptor CombinedBatchDescriptor;
 
 
 /* Data Structures */
