@@ -56,12 +56,14 @@ THREADS_FOR_LOOP=( 1 2 4 8 16 32 64 128 )
 
 CMD_CPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/ungapped_cpu_db-{threads}\" --prefilter-mode 1 --comp-bias-corr 0 --threads {threads} -v 3 -e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" 2>&1 | tee \"$OUT_DIR/ungapped_cpu.log\""
 
-BENCHMARK_RESULT="$OUT_DIR/bench_cpu_ungapped_params_threads.json"
+BENCHMARK_RESULT="$ROOT_DIR/bench_cpu_ungapped_params_threads.json"
 
 if [ -f "$BENCHMARK_RESULT" ]; then
     echo "[BENCHMARK] File $BENCHMARK_RESULT exists, will rename to $BENCHMARK_RESULT.old"
     mv "$BENCHMARK_RESULT" "$BENCHMARK_RESULT.old"
 fi
+
+echo "[BENCHMARK] Result will be saved to $BENCHMARK_RESULT"
 
 hyperfine --warmup 1 \
             --runs 1 \
