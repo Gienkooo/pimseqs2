@@ -12,6 +12,8 @@ extern "C" {
 #include <cstring>
 #include <cerrno>
 #include <cstdio>
+#include <chrono>
+#include <array>
 
 namespace mmseqs::dpu {
 
@@ -48,6 +50,11 @@ class DpuCommunicationManager {
   bool isAsyncInProgress() const { return async_in_progress_; }
   void readLogs();             // Read and print logs from all DPUs
 
+  // Optional lightweight profiling (enable with env var DPU_PROFILE=1)
+  void dumpProfile(const char* tag = nullptr) const;
+  void resetProfile();
+  bool isProfilingEnabled() const { return profile_enabled_; }
+
   // Per-DPU controls for fine-grained scheduling
   void loadKernel(uint32_t dpu_id, const char* kernel_binary_path);
   void executeKernel(uint32_t dpu_id);
@@ -81,6 +88,50 @@ class DpuCommunicationManager {
   uint32_t num_dpus_active_;
   bool async_in_progress_ = false;
   bool is_simulator_ = false;
+  bool profile_enabled_ = false;
+
+  struct ProfileEntry {
+    uint64_t count = 0;
+    uint64_t bytes = 0;
+    double total_ms = 0.0;
+    double max_ms = 0.0;
+  };
+
+  enum class ProfileSlot {
+    Broadcast = 0,
+    ScatterSingle,
+    ScatterParallel,
+    GatherSingle,
+    GatherParallel,
+    LoadKernel,
+    LaunchSync,
+    LaunchAsync,
+    WaitSync,
+    WaitAsync,
+    Count
+  };
+
+  std::array<ProfileEntry, static_cast<size_t>(ProfileSlot::Count)> profile_{};
+
+  using Clock = std::chrono::steady_clock;
+
+  struct ScopedTimer {
+    Clock::time_point start;
+    ProfileEntry* entry;
+    ScopedTimer(ProfileEntry* e) : start(Clock::now()), entry(e) {}
+    ~ScopedTimer() {
+      if (!entry) return;
+      auto end = Clock::now();
+      double ms = std::chrono::duration<double, std::milli>(end - start).count();
+      entry->count += 1;
+      entry->total_ms += ms;
+      if (ms > entry->max_ms) entry->max_ms = ms;
+    }
+  };
+
+  inline ProfileEntry* slot(ProfileSlot s) {
+    return profile_enabled_ ? &profile_[static_cast<size_t>(s)] : nullptr;
+  }
 
   void checkStatus(dpu_error_t status, const char* context);
 };

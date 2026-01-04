@@ -763,86 +763,63 @@ namespace mmseqs::dpu
             std::vector<uint32_t> active_dpus;
             std::vector<uint32_t> maxHitsPerDpu(num_dpus, 0);
 
-            // Upload Targets & Calc Layouts
+            // Calculate fixed layout for parallel transfer
+            // MAX_SEQS_PER_DPU = 16384, TARGET_BUDGET_BYTES = 40MB
+            uint32_t max_tmeta_size = DpuCommunicationManager::alignToMram(16384 * sizeof(TargetMetadata));
+            uint32_t max_tdata_size = DpuCommunicationManager::alignToMram(40 * 1024 * 1024);
+            DpuWorkflow::MramLayout max_layout = workflow_.calculateLayout(
+                sizeof(GappedBatchDescriptor), max_common_size, 16384, 1, max_tdata_size, sizeof(GappedHit), scratch_size);
+
+            // Prepare descriptors with fixed layout
             for (uint32_t d = 0; d < num_dpus; ++d) {
-                layouts[d] = workflow_.calculateLayout(
-                    sizeof(GappedBatchDescriptor), max_common_size, perDpuTargetMeta[d].size(), 1, perDpuTargetData[d].size(), sizeof(GappedHit), scratch_size);
+                layouts[d] = max_layout; // Use fixed layout for everyone
 
                 if (!perDpuTargetMeta[d].empty()) {
                     active_dpus.push_back(d);
                 }
 
-                const uint32_t usable_results = (layouts[d].results_capacity > 8u)
-                    ? (layouts[d].results_capacity - 8u)
+                const uint32_t usable_results = (max_layout.results_capacity > 8u)
+                    ? (max_layout.results_capacity - 8u)
                     : 0u;
                 maxHitsPerDpu[d] = usable_results / static_cast<uint32_t>(sizeof(GappedHit));
+                
+                // Initialize descriptor placeholder so initial scatter writes a valid struct.
+                // Query-dependent fields (e.g., PSSM offsets) are rewritten in the per-query loop below.
+                GappedBatchDescriptor init_bd{};
+                init_bd.header.num_targets = perDpuTargetMeta[d].size();
+                init_bd.header.num_active_tasklets = active_tasklets;
 
-                if (!perDpuTargetMeta[d].empty()) {
-                    uint32_t tmeta_bytes = perDpuTargetMeta[d].size() * sizeof(TargetMetadata);
-                    uint32_t tmeta_aligned = DpuCommunicationManager::alignToMram(tmeta_bytes);
-                    
-                    if (tmeta_bytes == tmeta_aligned) {
-                        dpu_comm_.scatterDataToDPU(d, perDpuTargetMeta[d].data(), tmeta_aligned, layouts[d].target_meta_offset);
-                    } else {
-                        std::vector<uint8_t> buf(tmeta_aligned, 0);
-                        memcpy(buf.data(), perDpuTargetMeta[d].data(), tmeta_bytes);
-                        dpu_comm_.scatterDataToDPU(d, buf.data(), tmeta_aligned, layouts[d].target_meta_offset);
-                    }
-
-                    uint32_t tdata_bytes = perDpuTargetData[d].size();
-                    uint32_t tdata_aligned = DpuCommunicationManager::alignToMram(tdata_bytes);
-                    
-                    if (tdata_bytes == tdata_aligned) {
-                        dpu_comm_.scatterDataToDPU(d, perDpuTargetData[d].data(), tdata_aligned, layouts[d].target_data_offset);
-                    } else {
-                        std::vector<uint8_t> buf(tdata_aligned, 0);
-                        memcpy(buf.data(), perDpuTargetData[d].data(), tdata_bytes);
-                        dpu_comm_.scatterDataToDPU(d, buf.data(), tdata_aligned, layouts[d].target_data_offset);
-                    }
-                }
+                // Use maximum-aligned query metadata size for a stable common-data offset.
+                const uint32_t qmeta_aligned = DpuCommunicationManager::alignToMram(sizeof(QueryMetadata));
+                init_bd.header.queries_metadata_offset = max_layout.common_data_offset;
+                init_bd.header.pssm_data_offset = init_bd.header.queries_metadata_offset + qmeta_aligned;
+                init_bd.header.targets_metadata_offset = max_layout.target_meta_offset;
+                init_bd.header.targets_data_offset = max_layout.target_data_offset;
+                init_bd.header.results_offset = max_layout.results_offset;
+                init_bd.header.results_buffer_size = max_layout.results_capacity;
+                bds[d] = init_bd;
             }
 
-            auto gatherGappedChecked = [&](uint32_t dpu_id, const DpuWorkflow::MramLayout& layout) {
-                uint64_t hdr = 0;
-                dpu_comm_.gatherDataFromDPU(dpu_id, &hdr, 8, layout.results_offset);
-                const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-                const uint32_t max_hits = maxHitsPerDpu[dpu_id];
-                if (hit_count > max_hits) {
-                    Debug(Debug::ERROR) << "[DPU] Gapped batch overflow detected for DPU " << dpu_id
-                                        << " (hits=" << hit_count << ", max=" << max_hits << ")";
-                    EXIT(EXIT_FAILURE);
-                }
-                if (hit_count == 0) return std::vector<GappedHit>{};
+            // Parallel Scatter Targets
+            workflow_.scatterBatchParallel(bds, perDpuTargetMeta, perDpuTargetData, max_layout);
 
-                const uint32_t data_size = hit_count * static_cast<uint32_t>(sizeof(GappedHit));
-                const uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
-                std::vector<GappedHit> hits(hit_count);
-                if (aligned_size != data_size) {
-                    std::vector<uint8_t> buf(aligned_size);
-                    dpu_comm_.gatherDataFromDPU(dpu_id, buf.data(), aligned_size, layout.results_offset + 8);
-                    memcpy(hits.data(), buf.data(), data_size);
-                } else {
-                    dpu_comm_.gatherDataFromDPU(dpu_id, hits.data(), aligned_size, layout.results_offset + 8);
-                }
-                return hits;
-            };
+            std::vector<std::vector<GappedHit>> prev_hits;
+            bool prev_valid = false;
+            uint32_t prev_qKey = 0;
+            uint32_t prev_qLen = 0;
+            size_t prev_qId_val = 0;
 
-            bool prev_active = false;
-            uint32_t prev_queryKey = 0;
-            uint32_t prev_queryLen = 0;
-            size_t prev_qId = 0;
-            std::vector<std::vector<GappedHit>> prev_dpu_hits(num_dpus);
-
-            auto processPrevQuery = [&]() {
-                if (!prev_active) return;
+            auto processPrevResults = [&]() {
+                if (!prev_valid) return;
                 std::vector<Matcher::result_t> local_results;
                 for (uint32_t d = 0; d < num_dpus; ++d) {
-                    for (const auto &hit : prev_dpu_hits[d]) {
+                    if (d >= prev_hits.size()) break;
+                    for (const auto &hit : prev_hits[d]) {
                         unsigned int targetKey = tdbr->getDbKey(hit.target_id);
-                        bool isIdentity = (prev_queryKey == targetKey && (par.includeIdentity || sameDB));
+                        bool isIdentity = (prev_qKey == targetKey && (par.includeIdentity || sameDB));
                         double evalue = 0.0;
                         if (par.evalThr < std::numeric_limits<double>::max()) {
-                            evalue = evaluer->computeEvalue(hit.score, prev_queryLen);
+                            evalue = evaluer->computeEvalue(hit.score, prev_qLen);
                         }
                         if (!isIdentity && evalue > par.evalThr) continue;
 
@@ -852,7 +829,7 @@ namespace mmseqs::dpu
                         res.dbEndPos = hit.t_end;
                         res.dbLen = tdbr->getSeqLen(hit.target_id);
                         res.qEndPos = hit.q_end;
-                        res.qLen = prev_queryLen;
+                        res.qLen = prev_qLen;
                         res.score = evaluer ? static_cast<int>(evaluer->computeBitScore(hit.score) + 0.5) : hit.score;
                         res.qStartPos = 0;
                         res.dbStartPos = 0;
@@ -869,10 +846,9 @@ namespace mmseqs::dpu
                     }
                 }
                 if (!local_results.empty()) {
-                    allResults[prev_qId].insert(allResults[prev_qId].end(), local_results.begin(), local_results.end());
+                    allResults[prev_qId_val].insert(allResults[prev_qId_val].end(), local_results.begin(), local_results.end());
                 }
-                for (auto &v : prev_dpu_hits) v.clear();
-                prev_active = false;
+                prev_hits.clear();
             };
 
             for (size_t qId = 0; qId < qdbr->getSize(); ++qId) {
@@ -901,6 +877,7 @@ namespace mmseqs::dpu
                 memcpy(commonData.data() + DpuCommunicationManager::alignToMram(qmeta_size), pssm.data(), pssm_size);
 
                 // Update BDs
+                std::vector<std::vector<uint8_t>> bd_bufs(num_dpus);
                 for (uint32_t d = 0; d < num_dpus; ++d) {
                     GappedBatchDescriptor bd = {};
                     bd.header.num_queries = 1;
@@ -925,67 +902,45 @@ namespace mmseqs::dpu
                     bd.gap_extend_cost = static_cast<int16_t>(par.gapExtend.values.aminoacid());
                     bd.xdrop_threshold = static_cast<int16_t>(par.zdrop);
                     bd.pssm_bias = 0;
-                    bds[d] = bd;
+                    
+                    bd_bufs[d].resize(sizeof(GappedBatchDescriptor));
+                    memcpy(bd_bufs[d].data(), &bd, sizeof(GappedBatchDescriptor));
                 }
 
-                if (prev_active) {
-                    size_t done = 0;
-                    while (done < active_dpus.size()) {
-                        uint32_t gid = group_mgr.findCompletedGroup();
-                        if (gid == UINT32_MAX) {
-                            group_mgr.syncAllGroups();
-                            continue;
-                        }
-                        prev_dpu_hits[gid] = gatherGappedChecked(gid, layouts[gid]);
-                        group_mgr.releaseGroup(gid);
-                        done++;
-                    }
-                    processPrevQuery();
+                // Wait for previous and gather
+                if (prev_valid) {
+                    dpu_comm_.waitForKernels();
+                    prev_hits = workflow_.gatherResultsParallel<GappedHit>(max_layout.results_offset, max_layout.results_capacity);
                 }
 
-                workflow_.broadcastCommon(commonData.data(), common_size, layouts[0].common_data_offset);
-                for (uint32_t d : active_dpus) {
-                    dpu_comm_.scatterDataToDPU(d, &bds[d], bd_size, 0);
-                }
+                // Launch Current
+                workflow_.broadcastCommon(commonData.data(), common_size, max_layout.common_data_offset);
+                dpu_comm_.scatterDataParallel(bd_bufs, 0);
 
                 uint64_t zero_hdr = 0;
-                for (uint32_t d : active_dpus) {
-                    dpu_comm_.scatterDataToDPU(d, &zero_hdr, sizeof(uint64_t), layouts[d].results_offset);
-                }
+                dpu_comm_.broadcastData(&zero_hdr, 8, max_layout.results_offset);
 
-                // WORKAROUND: Reload kernel before every launch to avoid simulator bugs / reset state completely
                 kernel_mgr_.loadKernel(DpuKernelManager::KernelType::GAPPED);
+                dpu_comm_.executeKernelsAsync();
 
-                for (uint32_t d : active_dpus) {
-                    DpuGroupManager::GroupContext ctx{};
-                    ctx.query_id = 0;
-                    ctx.results_offset = layouts[d].results_offset;
-                    ctx.results_size = layouts[d].results_capacity;
-                    ctx.num_targets = static_cast<uint32_t>(perDpuTargetMeta[d].size());
-                    group_mgr.launchGroupAsync(d, ctx);
+                // Process Previous
+                if (prev_valid) {
+                    processPrevResults();
                 }
 
-                prev_active = true;
-                prev_queryKey = queryKey;
-                prev_queryLen = queryLen;
-                prev_qId = qId;
+                prev_valid = true;
+                prev_qKey = queryKey;
+                prev_qLen = queryLen;
+                prev_qId_val = qId;
             }
 
             // Drain last query of this batch
-            if (prev_active) {
-                size_t done = 0;
-                while (done < active_dpus.size()) {
-                    uint32_t gid = group_mgr.findCompletedGroup();
-                    if (gid == UINT32_MAX) {
-                        group_mgr.syncAllGroups();
-                        continue;
-                    }
-                    prev_dpu_hits[gid] = gatherGappedChecked(gid, layouts[gid]);
-                    group_mgr.releaseGroup(gid);
-                    done++;
-                }
-                processPrevQuery();
+            if (prev_valid) {
+                dpu_comm_.waitForKernels();
+                prev_hits = workflow_.gatherResultsParallel<GappedHit>(max_layout.results_offset, max_layout.results_capacity);
+                processPrevResults();
             }
+
         } // End Target Batch Loop
 
         // 3. Write Results
@@ -1002,6 +957,11 @@ namespace mmseqs::dpu
                 }
                 resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), qdbr->getDbKey(qId), 0);
             }
+        }
+
+        if (dpu_comm_.isProfilingEnabled()) {
+            dpu_comm_.dumpProfile("gapped_prefilter");
+            dpu_comm_.resetProfile();
         }
     }
 
@@ -1785,6 +1745,11 @@ namespace mmseqs::dpu
                     resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), qdbr->getDbKey(qId), 0);
                 }
             }
+        }
+
+        if (dpu_comm_.isProfilingEnabled()) {
+            dpu_comm_.dumpProfile("ungapped_prefilter");
+            dpu_comm_.resetProfile();
         }
     }
 

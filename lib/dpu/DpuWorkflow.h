@@ -208,6 +208,91 @@ public:
         comm_.scatterDataToDPU(dpu_id, &bd_copy, bd_size, 0);
     }
 
+    // Parallel Scatter Batch
+    template <typename BatchDescT>
+    void scatterBatchParallel(
+        const std::vector<BatchDescT>& descriptors,
+        const std::vector<std::vector<TargetMetadata>>& t_meta,
+        const std::vector<std::vector<uint8_t>>& t_data,
+        const MramLayout& layout) 
+    {
+        uint32_t num_dpus = descriptors.size();
+        if (num_dpus == 0) return;
+
+        // 1. Send Batch Descriptors
+        std::vector<std::vector<uint8_t>> desc_bufs(num_dpus);
+        uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(BatchDescT));
+        for (uint32_t i = 0; i < num_dpus; ++i) {
+            desc_bufs[i].resize(bd_size);
+            memcpy(desc_bufs[i].data(), &descriptors[i], sizeof(BatchDescT));
+        }
+        comm_.scatterDataParallel(desc_bufs, 0);
+
+        // 2. Send Target Metadata
+        std::vector<std::vector<uint8_t>> meta_bufs(num_dpus);
+        for (uint32_t i = 0; i < num_dpus; ++i) {
+            if (!t_meta[i].empty()) {
+                uint32_t tmeta_bytes = t_meta[i].size() * sizeof(TargetMetadata);
+                meta_bufs[i].resize(tmeta_bytes); 
+                memcpy(meta_bufs[i].data(), t_meta[i].data(), tmeta_bytes);
+            }
+        }
+        comm_.scatterDataParallel(meta_bufs, layout.target_meta_offset);
+
+        // 3. Send Target Data
+        comm_.scatterDataParallel(t_data, layout.target_data_offset);
+    }
+
+    // Parallel Gather Results
+    template <typename HitType>
+    std::vector<std::vector<HitType>> gatherResultsParallel(
+        uint32_t results_mram_offset,
+        uint32_t result_capacity_bytes) 
+    {
+        uint32_t num_dpus = comm_.getNumDPUsActive();
+        std::vector<std::vector<HitType>> all_hits(num_dpus);
+
+        // 1. Gather Counts (8 bytes each)
+        std::vector<std::vector<uint8_t>> count_bufs;
+        comm_.gatherDataParallel(count_bufs, 8, results_mram_offset);
+
+        uint32_t max_hits = 0;
+        std::vector<uint32_t> hit_counts(num_dpus);
+
+        for (uint32_t i = 0; i < num_dpus; ++i) {
+            uint64_t hdr = 0;
+            memcpy(&hdr, count_bufs[i].data(), 8);
+            uint32_t count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+            
+            if (result_capacity_bytes > 8) {
+                uint32_t max_cap = (result_capacity_bytes - 8) / sizeof(HitType);
+                if (count > max_cap) count = max_cap;
+            } else {
+                count = 0;
+            }
+            
+            hit_counts[i] = count;
+            if (count > max_hits) max_hits = count;
+        }
+
+        if (max_hits == 0) return all_hits;
+
+        uint32_t transfer_size = max_hits * sizeof(HitType);
+        uint32_t aligned_transfer = DpuCommunicationManager::alignToMram(transfer_size);
+        
+        std::vector<std::vector<uint8_t>> hit_bufs;
+        comm_.gatherDataParallel(hit_bufs, aligned_transfer, results_mram_offset + 8);
+
+        for (uint32_t i = 0; i < num_dpus; ++i) {
+            if (hit_counts[i] > 0) {
+                all_hits[i].resize(hit_counts[i]);
+                memcpy(all_hits[i].data(), hit_bufs[i].data(), hit_counts[i] * sizeof(HitType));
+            }
+        }
+
+        return all_hits;
+    }
+
 private:
     DpuCommunicationManager& comm_;
 };

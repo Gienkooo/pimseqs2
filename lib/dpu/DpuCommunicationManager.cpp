@@ -16,6 +16,9 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     is_simulator_(false) {
   const char* profile = nullptr;
 
+  const char* prof_env = getenv("DPU_PROFILE");
+  profile_enabled_ = prof_env && std::strcmp(prof_env, "0") != 0;
+
   // Smart backend detection to suppress warnings
   // If UPMEM_PROFILE_BASE is not set, check for hardware presence.
   if (!getenv("UPMEM_PROFILE_BASE")) {
@@ -29,6 +32,7 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     if (!has_hardware) {
       profile = "backend=simulator";
       is_simulator_ = true;
+      fprintf(stderr, "[DPU] No DPU hardware detected. Using simulator profile.\n");
     }
   } else {
     // Check if env var specifies simulator
@@ -66,6 +70,7 @@ DpuCommunicationManager::~DpuCommunicationManager() {
 
 void DpuCommunicationManager::broadcastData(
     const void* host_data, uint32_t size_bytes, uint32_t dpu_mram_offset) {
+  ScopedTimer timer(slot(ProfileSlot::Broadcast));
   
   if (dpu_mram_offset % MRAM_ALIGN != 0 || size_bytes % MRAM_ALIGN != 0) {
     fprintf(stderr, "[DPU ERROR] MRAM offset/size not 8-byte aligned\n");
@@ -76,11 +81,14 @@ void DpuCommunicationManager::broadcastData(
   dpu_error_t status = dpu_copy_to(dpu_set_, "__sys_used_mram_end", dpu_mram_offset,
                                    (void*)host_data, size_bytes);
   checkStatus(status, "Broadcast (aggregate)");
+
+  if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(size_bytes) * num_dpus_active_;
 }
 
 void DpuCommunicationManager::scatterDataToDPU(
     uint32_t dpu_id, const void* host_data,
     uint32_t size_bytes, uint32_t dpu_mram_offset) {
+  ScopedTimer timer(slot(ProfileSlot::ScatterSingle));
   
   if (dpu_id >= num_dpus_active_) {
     fprintf(stderr, "[DPU ERROR] DPU ID %u out of range\n", dpu_id);
@@ -95,11 +103,14 @@ void DpuCommunicationManager::scatterDataToDPU(
   dpu_error_t status = dpu_copy_to(dpu_sets_[dpu_id], "__sys_used_mram_end", dpu_mram_offset,
                                     (void*)host_data, size_bytes);
   checkStatus(status, "Scatter");
+
+  if (timer.entry) timer.entry->bytes += size_bytes;
 }
 
 void DpuCommunicationManager::scatterDataParallel(
     const std::vector<std::vector<uint8_t>>& per_dpu_data,
     uint32_t dpu_mram_offset) {
+  ScopedTimer timer(slot(ProfileSlot::ScatterParallel));
   
   if (per_dpu_data.size() != num_dpus_active_) {
     fprintf(stderr, "[DPU ERROR] scatterDataParallel: data vector size mismatch\n");
@@ -111,25 +122,53 @@ void DpuCommunicationManager::scatterDataParallel(
     exit(EXIT_FAILURE);
   }
 
-  // Transfer data to each DPU in parallel by iterating once
-  uint32_t idx = 0;
-  for (; idx < num_dpus_active_; ++idx) {
-    if (idx < per_dpu_data.size() && !per_dpu_data[idx].empty()) {
-      uint32_t size = per_dpu_data[idx].size();
-      if (size % MRAM_ALIGN != 0) {
-        fprintf(stderr, "[DPU ERROR] DPU %u data size not 8-byte aligned\n", idx);
-        exit(EXIT_FAILURE);
+  // Find maximum size to determine transfer length
+  size_t max_size = 0;
+  for (const auto& data : per_dpu_data) {
+    max_size = std::max(max_size, data.size());
+  }
+  
+  if (max_size == 0) return;
+
+  uint32_t aligned_len = alignToMram(static_cast<uint32_t>(max_size));
+
+  // Store temporary padded buffers to keep them alive until push_xfer
+  std::vector<std::vector<uint8_t>> temp_buffers;
+  temp_buffers.reserve(num_dpus_active_);
+
+  struct dpu_set_t dpu;
+  uint32_t each_dpu;
+  DPU_FOREACH(dpu_set_, dpu, each_dpu) {
+    if (each_dpu >= per_dpu_data.size()) break;
+
+    const auto& data = per_dpu_data[each_dpu];
+    if (data.size() < aligned_len) {
+      // Create padded copy
+      temp_buffers.emplace_back(aligned_len, 0);
+      if (!data.empty()) {
+        std::memcpy(temp_buffers.back().data(), data.data(), data.size());
       }
-      dpu_error_t status = dpu_copy_to(dpu_sets_[idx], "__sys_used_mram_end", dpu_mram_offset,
-                                        (void*)per_dpu_data[idx].data(), size);
-      checkStatus(status, "Parallel Scatter");
+      dpu_error_t status = dpu_prepare_xfer(dpu, temp_buffers.back().data());
+      checkStatus(status, "Prepare xfer (padded)");
+    } else {
+      // Use existing buffer
+      dpu_error_t status = dpu_prepare_xfer(dpu, (void*)data.data());
+      checkStatus(status, "Prepare xfer");
     }
   }
+
+  // Perform parallel transfer
+  dpu_error_t status = dpu_push_xfer(dpu_set_, DPU_XFER_TO_DPU, "__sys_used_mram_end", 
+                                     dpu_mram_offset, aligned_len, DPU_XFER_DEFAULT);
+  checkStatus(status, "Push xfer (scatter)");
+
+  if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(aligned_len) * num_dpus_active_;
 }
 
 void DpuCommunicationManager::gatherDataFromDPU(
     uint32_t dpu_id, void* host_buffer,
     uint32_t size_bytes, uint32_t dpu_mram_offset) {
+  ScopedTimer timer(slot(ProfileSlot::GatherSingle));
   
   if (dpu_id >= num_dpus_active_) {
     fprintf(stderr, "[DPU ERROR] DPU ID %u out of range\n", dpu_id);
@@ -144,11 +183,14 @@ void DpuCommunicationManager::gatherDataFromDPU(
   dpu_error_t status = dpu_copy_from(dpu_sets_[dpu_id], "__sys_used_mram_end", dpu_mram_offset,
                                       host_buffer, size_bytes);
   checkStatus(status, "Gather");
+
+  if (timer.entry) timer.entry->bytes += size_bytes;
 }
 
 void DpuCommunicationManager::gatherDataParallel(
     std::vector<std::vector<uint8_t>>& per_dpu_buffers,
     uint32_t size_per_dpu, uint32_t dpu_mram_offset) {
+  ScopedTimer timer(slot(ProfileSlot::GatherParallel));
   
   if (dpu_mram_offset % MRAM_ALIGN != 0 || size_per_dpu % MRAM_ALIGN != 0) {
     fprintf(stderr, "[DPU ERROR] MRAM offset/size not 8-byte aligned\n");
@@ -157,15 +199,23 @@ void DpuCommunicationManager::gatherDataParallel(
 
   per_dpu_buffers.resize(num_dpus_active_);
   
-  for (uint32_t idx = 0; idx < num_dpus_active_; ++idx) {
-    per_dpu_buffers[idx].resize(size_per_dpu);
-    dpu_error_t status = dpu_copy_from(dpu_sets_[idx], "__sys_used_mram_end", dpu_mram_offset,
-                                        per_dpu_buffers[idx].data(), size_per_dpu);
-    checkStatus(status, "Parallel Gather");
+  struct dpu_set_t dpu;
+  uint32_t each_dpu;
+  DPU_FOREACH(dpu_set_, dpu, each_dpu) {
+    per_dpu_buffers[each_dpu].resize(size_per_dpu);
+    dpu_error_t status = dpu_prepare_xfer(dpu, per_dpu_buffers[each_dpu].data());
+    checkStatus(status, "Prepare xfer (gather)");
   }
+
+  dpu_error_t status = dpu_push_xfer(dpu_set_, DPU_XFER_FROM_DPU, "__sys_used_mram_end", 
+                                     dpu_mram_offset, size_per_dpu, DPU_XFER_DEFAULT);
+  checkStatus(status, "Push xfer (gather)");
+
+  if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(size_per_dpu) * num_dpus_active_;
 }
 
 void DpuCommunicationManager::loadKernel(const char* kernel_binary_path) {
+  ScopedTimer timer(slot(ProfileSlot::LoadKernel));
   if (async_in_progress_) {
     waitForKernels();
   }
@@ -175,6 +225,7 @@ void DpuCommunicationManager::loadKernel(const char* kernel_binary_path) {
 
 void DpuCommunicationManager::loadKernel(uint32_t dpu_id,
                                          const char* kernel_binary_path) {
+  ScopedTimer timer(slot(ProfileSlot::LoadKernel));
   if (dpu_id >= num_dpus_active_) {
     throw std::runtime_error("loadKernel: invalid dpu_id");
   }
@@ -186,6 +237,7 @@ void DpuCommunicationManager::loadKernel(uint32_t dpu_id,
 }
 
 void DpuCommunicationManager::executeKernels() {
+  ScopedTimer timer(slot(ProfileSlot::LaunchSync));
   if (async_in_progress_) {
     waitForKernels();
   }
@@ -200,6 +252,7 @@ void DpuCommunicationManager::executeKernels() {
 }
 
 void DpuCommunicationManager::executeKernelsAsync() {
+  ScopedTimer timer(slot(ProfileSlot::LaunchAsync));
   if (async_in_progress_) {
     waitForKernels();
   }
@@ -213,6 +266,7 @@ void DpuCommunicationManager::executeKernelsAsync() {
 }
 
 void DpuCommunicationManager::waitForKernels() {
+  ScopedTimer timer(slot(ProfileSlot::WaitAsync));
   if (!async_in_progress_) return;
   for (uint32_t i = 0; i < num_dpus_active_; ++i) {
     if (!async_per_dpu_[i]) continue;
@@ -227,6 +281,7 @@ void DpuCommunicationManager::waitForKernels() {
 }
 
 void DpuCommunicationManager::executeKernel(uint32_t dpu_id) {
+  ScopedTimer timer(slot(ProfileSlot::LaunchSync));
   if (dpu_id >= num_dpus_active_) {
     throw std::runtime_error("executeKernel: invalid dpu_id");
   }
@@ -241,6 +296,7 @@ void DpuCommunicationManager::executeKernel(uint32_t dpu_id) {
 }
 
 void DpuCommunicationManager::executeKernelAsync(uint32_t dpu_id) {
+  ScopedTimer timer(slot(ProfileSlot::LaunchAsync));
   if (dpu_id >= num_dpus_active_) {
     throw std::runtime_error("executeKernelAsync: invalid dpu_id");
   }
@@ -273,6 +329,7 @@ bool DpuCommunicationManager::isExecutionComplete() {
 }
 
 void DpuCommunicationManager::waitForKernel(uint32_t dpu_id) {
+  ScopedTimer timer(slot(ProfileSlot::WaitSync));
   if (dpu_id >= num_dpus_active_) {
     throw std::runtime_error("waitForKernel: invalid dpu_id");
   }
@@ -328,6 +385,43 @@ void DpuCommunicationManager::readAndPrintLog() {
 
 void DpuCommunicationManager::readLogs() {
   readAndPrintLog();
+}
+
+void DpuCommunicationManager::resetProfile() {
+  for (auto &e : profile_) {
+    e = ProfileEntry{};
+  }
+}
+
+void DpuCommunicationManager::dumpProfile(const char* tag) const {
+  if (!profile_enabled_) return;
+  static const char* kNames[] = {
+    "broadcast",
+    "scatter_single",
+    "scatter_parallel",
+    "gather_single",
+    "gather_parallel",
+    "load_kernel",
+    "launch_sync",
+    "launch_async",
+    "wait_sync",
+    "wait_async"
+  };
+
+  fprintf(stderr, "[DPU PROFILE] %s\n", tag ? tag : "comm");
+  for (size_t i = 0; i < static_cast<size_t>(ProfileSlot::Count); ++i) {
+    const auto &e = profile_[i];
+    if (e.count == 0) continue;
+    double avg = e.total_ms / static_cast<double>(e.count);
+    double mb = e.bytes / (1024.0 * 1024.0);
+    fprintf(stderr, "  %-17s count=%6llu total=%10.3f ms avg=%8.3f ms max=%8.3f ms bytes=%.2f MB\n",
+            kNames[i],
+            static_cast<unsigned long long>(e.count),
+            e.total_ms,
+            avg,
+            e.max_ms,
+            mb);
+  }
 }
 
 }  // namespace mmseqs::dpu
