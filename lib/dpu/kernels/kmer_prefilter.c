@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <defs.h>
 #include <barrier.h>
 
@@ -315,6 +316,13 @@ int main() {
     DPU_LOG("[DPU T0] Max output hits: %u, Total packets: %u\n", max_results, total_packets);
     DPU_LOG("[DPU T0] State table initialized: %u entries (%u bytes)\n", MAX_DPU_SEQS, state_bytes);
     
+    // ===== HIT EMISSION STATE =====
+    uint32_t total_hits_written = 0;  // Total double-hits written to MRAM
+    uint32_t batch_count = 0;          // Current fill level of w_result_batch
+    uint32_t single_hits_count = 0;    // Count of single hits (for stats)
+    uint32_t double_hits_count = 0;    // Count of double hits detected (for stats)
+    bool overflow_occurred = false;
+
     // Check for checkpoint - resuming after output buffer overflow
     KmerCheckpoint checkpoint;
     mram_read(checkpoint_ptr, &checkpoint, sizeof(KmerCheckpoint));
@@ -324,22 +332,33 @@ int main() {
     int32_t cached_key_idx = -1;
     
     if (checkpoint.valid == 1) {
-        // Resume from saved position
         start_packet = checkpoint.packet_idx;
-        start_entry = checkpoint.entry_idx;
-        cached_key_idx = (int32_t)checkpoint.key_idx;
-        DPU_LOG("[DPU T0] Resuming from checkpoint: packet=%u entry=%u key_idx=%d\n", 
-               start_packet, start_entry, cached_key_idx);
+        
+        // Check for Spillover Resume using the entry index as an indicator
+        // This happens when we overflowed at a sentinel (query boundary) 
+        //with pending hits that didn't fit
+        if (checkpoint.entry_idx == 1) {
+            // Load spilled hits from state table MRAM backup area
+            uint32_t spill_count = checkpoint.key_idx;
+            DPU_LOG("[DPU T0] Resuming with %u spilled hits from state table\n", spill_count);
+            
+            if (spill_count > 0 && spill_count <= RESULT_BATCH_SIZE) {
+                mram_read(state_table_mram, w_result_batch, spill_count << 3);
+                batch_count = spill_count;
+            }
+
+            start_entry = 0;
+            cached_key_idx = -1;
+        } else {
+            // Normal resume from mid-packet processing
+            start_entry = checkpoint.entry_idx;
+            cached_key_idx = (int32_t)checkpoint.key_idx;
+            DPU_LOG("[DPU T0] Resuming from checkpoint: packet=%u entry=%u key_idx=%d\n", 
+                   start_packet, start_entry, cached_key_idx);
+        }
     } else {
         DPU_LOG("[DPU T0] Starting from beginning (no checkpoint)\n");
     }
-    
-    // ===== HIT EMISSION STATE =====
-    uint32_t total_hits_written = 0;  // Total double-hits written to MRAM
-    uint32_t batch_count = 0;          // Current fill level of w_result_batch
-    uint32_t single_hits_count = 0;    // Count of single hits (for stats)
-    uint32_t double_hits_count = 0;    // Count of double hits detected (for stats)
-    bool overflow_occurred = false;
     
     // ===== MAIN PACKET PROCESSING LOOP =====
     for (uint32_t pkt_idx = start_packet; pkt_idx < total_packets; ++pkt_idx) {
@@ -348,6 +367,99 @@ int main() {
         uint32_t kmer_idx = w_packet_cache[0].kmer_idx;
         uint16_t hint_idx = w_packet_cache[0].hint_idx;
         uint16_t query_pos = w_packet_cache[0].query_pos;
+        
+        // ===== NEW QUERY DETECTION =====
+        // If kmer_idx == KMER_PACKET_SENTINEL_KEY, this marks the end of a query
+        // 1) Flush pending hits with spillover protection, 2) Write result delimiter, 3) Reset state table
+        if (kmer_idx == KMER_PACKET_SENTINEL_KEY) {
+            DPU_LOG("[DPU T0] SENTINEL detected at packet %u - query boundary\n", pkt_idx);
+            
+            // 1. Flush Pending Hits with Spillover Protection
+            if (batch_count > 0) {
+                // Check for Overflow
+                if (total_hits_written + batch_count > max_results) {
+                    DPU_LOG("[DPU T0] OVERFLOW at sentinel flush: batch_count=%u, space=%u\n", 
+                           batch_count, max_results - total_hits_written);
+                    
+                    uint32_t can_write = max_results - total_hits_written;
+                    uint32_t spill_count = batch_count - can_write;
+                    
+                    // A. Write what fits to Output Buffer
+                    if (can_write > 0) {
+                        mram_write(w_result_batch, &output_buffer[total_hits_written], can_write << 3);
+                        total_hits_written += can_write;
+                    }
+
+                    // B. SPILL remaining hits to State Table MRAM (Backup)
+                    // The state table backup can be safely overwritten because it is no longer needed
+                    // because the state is about to be reset anyway. The state table MRAM area is 32KB,
+                    // more than enough to hold RESULT_BATCH_SIZE (128) hits (1KB max).
+                    if (spill_count > 0) {
+                        mram_write(&w_result_batch[can_write], state_table_mram, spill_count << 3);
+                        DPU_LOG("[DPU T0] Spilled %u hits to state table MRAM\n", spill_count);
+                    }
+
+                    // C. Save Checkpoint with "Spill Flag"
+                    // entry_idx = 1 signals "Resume by loading spill from state table"
+                    // key_idx stores the spill count
+                    KmerCheckpoint save_checkpoint;
+                    save_checkpoint.packet_idx = pkt_idx;
+                    save_checkpoint.entry_idx = 1;        // FLAG: Load spill on resume
+                    save_checkpoint.key_idx = spill_count; // SIZE: How many hits to load
+                    save_checkpoint.valid = 1;
+                    mram_write(&save_checkpoint, checkpoint_ptr, sizeof(KmerCheckpoint));
+
+                    overflow_occurred = true;
+                    goto finish;
+                }
+                
+                // Normal Flush (No Overflow)
+                mram_write(w_result_batch, &output_buffer[total_hits_written], batch_count << 3);
+                total_hits_written += batch_count;
+                batch_count = 0;
+            }
+            
+            // 2. Write Result Sentinel (Delimiter) to MRAM
+            // Check if there is space for the delimiter hit
+            if (total_hits_written + 1 > max_results) {
+                DPU_LOG("[DPU T0] OVERFLOW writing sentinel delimiter\n");
+                
+                // Standard overflow - no WRAM data to lose at this point
+                // Checkpoint simply points to packet_idx, entry_idx=0 (no spill)
+                KmerCheckpoint save_checkpoint;
+                save_checkpoint.packet_idx = pkt_idx;
+                save_checkpoint.entry_idx = 0;  
+                save_checkpoint.key_idx = 0;
+                save_checkpoint.valid = 1;
+                mram_write(&save_checkpoint, checkpoint_ptr, sizeof(KmerCheckpoint));
+                
+                overflow_occurred = true;
+                goto finish;
+            }
+            
+            // Write delimiter directly to MRAM output
+            KmerDoubleHit delimiter;
+            delimiter.target_id = KMER_RESULT_SENTINEL_TARGET; 
+            delimiter.diagonal = 0;
+            delimiter.padding = 0;
+            mram_write(&delimiter, &output_buffer[total_hits_written], sizeof(KmerDoubleHit));
+            total_hits_written++;
+            
+            DPU_LOG("[DPU T0] Result delimiter written, total_hits=%u\n", total_hits_written);
+            
+            // 3. Reset State Table for Next Query 
+            // The next packet belongs to a new query, so previous diagonals are irrelevant.
+            memset(w_state_table, 0xFF, MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
+            
+            DPU_LOG("[DPU T0] State table reset for next query\n");
+            
+            // Reset entry tracking for clean start on next query
+            start_entry = 0;
+            cached_key_idx = -1;
+            
+            // Skip to next packet (sentinel has no k-mer to search)
+            continue;
+        }
         
         // Binary search for k-mer (use cached result if resuming same packet)
         int32_t found_idx = -1;

@@ -49,6 +49,9 @@ extern "C" {
 #define HINT_TABLE_SIZE 400     /* 20x20 AA prefix combinations (base-20 encoding) */
 #define KMER_TARGET_ID_PADDING 0xFFFF
 
+#define KMER_PACKET_SENTINEL_KEY     0xFFFFFFFF   /* End-of-query marker in packet stream */
+#define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
+
 // The following can be adjusted in order to optimize performance TODO
 /* Max number of sequences per DPU database chunk for kmer prefiltering 
    has to fit in WRAM comfortably (8192 fits in 32KB state table with 4-byte entries) */
