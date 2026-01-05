@@ -40,7 +40,7 @@ extern "C" {
  *   [STATIC]   Checkpoint         (16 B)    ← Resume state on overflow
  *   [STATIC]   Hint Table         (~1.6 KB) ← 400-entry prefix lookup
  *   [STATIC]   State Table        (32 KB)   ← Per-sequence diagonal tracking
- *   [STATIC]   Query Buffer       (1 MB)    ← Input packets, fixed size
+ *   [STATIC]   Query Buffer       (24 MB)    ← Input packets, fixed size
  *   [VARIABLE] Index (Keys/Off/Ent) (varies per chunk)
  *   [VARIABLE] Output Buffer       (remaining MRAM)
  *      ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
@@ -57,12 +57,12 @@ extern "C" {
 /* Max number of sequences per DPU database chunk for kmer prefiltering 
    has to fit in WRAM comfortably (8192 fits in 32KB state table with 4-byte entries) */
 #define MAX_DPU_SEQS 8192       
-#define MAX_DPU_INDEX_SIZE (16 * 1024 * 1024) /* 16 MB max index size per DPU (keys + offsets + entries) */
+#define MAX_DPU_INDEX_SIZE (32 * 1024 * 1024) /* 32 MB max index size per DPU (keys + offsets + entries) */
 #define BLOCK_SEARCH_SIZE 16    /* Fetch 16 keys (64 bytes) per MRAM access */
 
 /* Buffer Size Configuration */
-#define KMER_QUERY_BUFFER_SIZE (5 * 1024 * 1024)     /* query packet buffer */
-#define KMER_MIN_OUTPUT_BUFFER_SIZE (1024 * 1024)    /* 1 MB = 128 hits * 1024  */
+#define KMER_QUERY_BUFFER_SIZE (24 * 1024 * 1024)     /* query packet buffer */
+#define KMER_MIN_OUTPUT_BUFFER_SIZE (4 * 1024 * 1024)    /* 4 MB = 128 hits * 32768  */
 
 #define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))  /* 131072 packets for 5MB buffer */
 

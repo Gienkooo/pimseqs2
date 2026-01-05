@@ -90,10 +90,8 @@ namespace mmseqs::dpu
         DBReader<unsigned int> *tdbr, uint32_t num_dpus)
     {
         // Rank-aware packing: use bin-packing splitter to even out work per DPU.
-        constexpr size_t TARGET_BUDGET_BYTES = 40u * 1024u * 1024u; // leave headroom for descriptor/common/results
-        constexpr uint32_t MAX_SEQS_PER_DPU = 16384u;
 
-        auto chunks = DpuDbSplitter::splitDatabase(tdbr, num_dpus, TARGET_BUDGET_BYTES, MAX_SEQS_PER_DPU);
+        auto chunks = DpuDbSplitter::splitDatabase(tdbr, num_dpus, MAX_DPU_INDEX_SIZE, MAX_DPU_SEQS);
         if (chunks.empty()) {
             return {};
         }
@@ -368,8 +366,9 @@ namespace mmseqs::dpu
                 }
             }
             
-            // === MULTI-QUERY BATCHING: Streaming packet generation ===
+            // === MULTI-QUERY BATCHING: Streaming packet generation with async double buffering ===
             // Uses DpuQueryPacketGenerator as a stateful iterator that generates packets on-demand.
+            // 3-stage pipeline: CPU fills batch N+1 while DPU executes batch N
             
             std::string resultBuffer;
             
@@ -383,7 +382,11 @@ namespace mmseqs::dpu
             // Reserve ~1% buffer for sentinel packets and alignment padding
             uint32_t max_packets_per_batch = (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket)) - 1000;
             
-            std::vector<KmerQueryPacket> batchBuffer(max_packets_per_batch + 100);
+            // Double-buffered batch data
+            KmerBatchData batches[2];
+            for (int i = 0; i < 2; ++i) {
+                batches[i].packets.resize(max_packets_per_batch + 100);
+            }
             
             std::vector<std::vector<hit_t>> perQueryRawHits(qdbr->getSize());
             std::vector<uint64_t> perQueryPacketCount(qdbr->getSize(), 0);
@@ -393,78 +396,39 @@ namespace mmseqs::dpu
             std::vector<uint8_t> reset_state(DpuCommunicationManager::alignToMram(MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)), 0xFF);
             dpu_comm_.broadcastData(reset_state.data(), reset_state.size(), ctx.STATE_TABLE_OFF);
             
-            // === STREAMING BATCH LOOP ===
-            while (!streamer.isFinished()) {
-                size_t packets_written = streamer.fillNextBatch(batchBuffer.data(), max_packets_per_batch);
-                
-                if (packets_written == 0) {
-                    break;  // No more packets to send
-                }
-                
-                const auto& activeBatchQueryIndices = streamer.getLastBatchQueryIndices();
-                
-                // Track packets sent (excluding sentinels)
-                auto stats = streamer.getStats();
-                totalPacketsSent = stats.total_packets;  // Cumulative from streamer
-                
-                // Update per-query packet counts for queries completed in this batch
-                for (size_t qi : activeBatchQueryIndices) {
-                    // Mark that this query has been processed
-                    // Actual packet count is tracked globally by streamer
-                    perQueryPacketCount[qi] = 1;  // Mark as processed
-                }
-                
-                DPU_DEBUG_LOG << "[CPU] Batch: " << packets_written << " packets, " 
-                              << activeBatchQueryIndices.size() << " queries, "
-                              << streamer.getLastBatchCompleteQueryCount() << " complete\n";
-                
-                // === SEND BATCH TO DPUs ===
-                auto descriptors = prepareKmerDescriptors(ctx, wave_indices, splits, packets_written, wave_start, wave_size);
-                
-                // Broadcast Query Packets Batch
-                uint32_t packets_size = packets_written * sizeof(KmerQueryPacket);
-                dpu_comm_.broadcastData(batchBuffer.data(), packets_size, ctx.QUERY_PACKETS_OFF);
-                
-                auto per_dpu_batch_results = executeKmerBatchWithOverflow(ctx, descriptors);
-                totalBatchTransfers++;
-                
-                // === PARSE RESULTS: Separate by query using delimiter sentinels ===
-                // Process results from each DPU and map back to queries
+            // Lambda to parse results from one DPU batch
+            auto parseResults = [&](const std::vector<std::vector<KmerDoubleHit>>& per_dpu_results,
+                                    const std::vector<size_t>& batchQueryIndices) {
                 for (size_t w = 0; w < wave_size; ++w) {
-                    const auto& dpu_hits = per_dpu_batch_results[w];
+                    const auto& dpu_hits = per_dpu_results[w];
                     const auto& chunk_targets = splits[wave_start + w];
                     
                     if (dpu_hits.empty()) continue;
                     
-                    size_t queryIdxInBatch = 0;  // Index into activeBatchQueryIndices
+                    size_t queryIdxInBatch = 0;  // Index into batchQueryIndices
                     
                     for (const auto& hit : dpu_hits) {
                         // Check for result sentinel (query boundary)
                         if (hit.target_id == KMER_RESULT_SENTINEL_TARGET) {
-                            // Move to next query in the batch
                             queryIdxInBatch++;
-                            if (queryIdxInBatch > activeBatchQueryIndices.size()) {
+                            if (queryIdxInBatch > batchQueryIndices.size()) {
                                 Debug(Debug::ERROR) << "[CPU] ERROR: Received more delimiters than queries sent!\n";
-                                Debug(Debug::ERROR) << "  Expected max " << activeBatchQueryIndices.size() << " delimiters\n";
                             }
                             continue;
                         }
                         
-                        // Safety check: ensure we have a valid query context
-                        if (queryIdxInBatch >= activeBatchQueryIndices.size()) {
+                        if (queryIdxInBatch >= batchQueryIndices.size()) {
                             Debug(Debug::ERROR) << "[CPU] ERROR: Hit received after all query delimiters!\n";
                             continue;
                         }
                         
-                        // Safety check: target_id must be within chunk range
                         if (hit.target_id >= chunk_targets.size()) {
                             Debug(Debug::ERROR) << "[CPU] FATAL: Invalid TargetID " << hit.target_id 
                                                 << " (max: " << (chunk_targets.size() - 1) << ")\n";
                             EXIT(EXIT_FAILURE);
                         }
                         
-                        // Get the actual query index
-                        size_t actualQueryIdx = activeBatchQueryIndices[queryIdxInBatch];
+                        size_t actualQueryIdx = batchQueryIndices[queryIdxInBatch];
                         
                         hit_t shortHit;
                         shortHit.seqId = chunk_targets[hit.target_id];
@@ -474,8 +438,73 @@ namespace mmseqs::dpu
                         perQueryRawHits[actualQueryIdx].push_back(shortHit);
                     }
                 }
+            };
+            
+            // Lambda to fill a batch from the streamer
+            auto fillBatch = [&](KmerBatchData& batch) {
+                auto t_start_gen = std::chrono::high_resolution_clock::now();
                 
-            }  // End streaming batch loop
+                batch.packet_count = streamer.fillNextBatch(batch.packets.data(), max_packets_per_batch);
+                
+                auto t_end_gen = std::chrono::high_resolution_clock::now();
+                double gen_time = std::chrono::duration<double>(t_end_gen - t_start_gen).count();
+                
+                if (batch.packet_count > 0) {
+                    batch.query_indices = streamer.getLastBatchQueryIndices();
+                    batch.valid = true;
+                    
+                    // Update per-query packet counts
+                    for (size_t qi : batch.query_indices) {
+                        perQueryPacketCount[qi] = 1;  // Mark as processed
+                    }
+                    
+                    auto stats = streamer.getStats();
+                    totalPacketsSent = stats.total_packets;
+                    
+                    Debug(Debug::INFO) << "[BENCH] Generation: " << batch.packet_count << " packets in "
+                                       << gen_time << "s (" << (batch.packet_count / gen_time) / 1e6 << " Mpps)\n";
+                    
+                    DPU_DEBUG_LOG << "[CPU] Filled batch: " << batch.packet_count << " packets, "
+                                  << batch.query_indices.size() << " queries\n";
+                } else {
+                    batch.valid = false;
+                }
+            };
+            
+            // === ASYNC DOUBLE-BUFFERED BATCH LOOP ===
+            int current = 0;
+            
+            // Prime the pipeline: fill first batch on CPU
+            fillBatch(batches[current]);
+            
+            std::future<std::vector<std::vector<KmerDoubleHit>>> pendingDpuResult;
+            std::vector<size_t> pendingQueryIndices;
+            
+            while (batches[current].valid) {
+                // 1. Start DPU execution asynchronously
+                pendingQueryIndices = batches[current].query_indices;
+                pendingDpuResult = std::async(std::launch::async, [&, current]() {
+                    return processBatchOnDpu(ctx, batches[current], wave_indices, splits, wave_start, wave_size);
+                });
+                totalBatchTransfers++;
+                
+                // 2. While DPU is running, fill the next batch on CPU
+                int next = 1 - current;
+                if (!streamer.isFinished()) {
+                    fillBatch(batches[next]);
+                } else {
+                    batches[next].valid = false;
+                }
+                
+                // 3. Wait for DPU results
+                auto per_dpu_batch_results = pendingDpuResult.get();
+                
+                // 4. Parse results while next batch is ready to go
+                parseResults(per_dpu_batch_results, pendingQueryIndices);
+                
+                // 5. Swap buffers
+                current = next;
+            }  // End async streaming batch loop
             
             // === WRITE RESULTS FOR ALL QUERIES ===
             for (size_t q = 0; q < qdbr->getSize(); ++q) {
@@ -673,6 +702,47 @@ namespace mmseqs::dpu
         DPU_DEBUG_LOG << "[CPU] Batch complete after " << overflow_retries << " iterations\n";
         
         return accumulated_results;
+    }
+    
+    std::vector<std::vector<KmerDoubleHit>> DpuPrefilterHostPipeline::processBatchOnDpu(
+        const KmerRunContext& ctx,
+        const KmerBatchData& batch,
+        const std::vector<DpuIndexBuffer>& wave_indices,
+        const std::vector<std::vector<uint32_t>>& splits,
+        size_t wave_start,
+        size_t wave_size)
+    {
+        if (!batch.valid || batch.packet_count == 0) {
+            return std::vector<std::vector<KmerDoubleHit>>(ctx.num_dpus);
+        }
+        
+        // 1. Prepare descriptors for this batch
+        auto descriptors = prepareKmerDescriptors(ctx, wave_indices, splits, 
+                                                   batch.packet_count, wave_start, wave_size);
+        
+        // 2. Transfer: Broadcast Query Packets to all DPUs
+        auto t_start_xfer = std::chrono::high_resolution_clock::now();
+        
+        uint32_t packets_size = batch.packet_count * sizeof(KmerQueryPacket);
+        dpu_comm_.broadcastData(batch.packets.data(), packets_size, ctx.QUERY_PACKETS_OFF);
+        
+        auto t_end_xfer = std::chrono::high_resolution_clock::now();
+        
+        // 3. Execute kernel and gather results (handles overflow internally, includes descriptor scatter)
+        auto t_start_exec = std::chrono::high_resolution_clock::now();
+        
+        auto results = executeKmerBatchWithOverflow(ctx, descriptors);
+        
+        auto t_end_exec = std::chrono::high_resolution_clock::now();
+        
+        double xfer_time = std::chrono::duration<double>(t_end_xfer - t_start_xfer).count();
+        double exec_time = std::chrono::duration<double>(t_end_exec - t_start_exec).count();
+        double xfer_mb = packets_size / (1024.0 * 1024.0);
+        
+        Debug(Debug::INFO) << "[BENCH] DPU: Xfer " << xfer_time << "s (" << (xfer_mb / xfer_time) << " MB/s), "
+                           << "Exec " << exec_time << "s\n";
+        
+        return results;
     }
 
     // ============================================================================

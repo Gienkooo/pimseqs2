@@ -43,7 +43,7 @@ fi
 
 # Convert results to TSV for comparison
 log "Converting results..."
-"$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$CPU_DB.aln" "$CPU_RES" > /dev/null 2>&1
+"$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$CPU_DB" "$CPU_RES" > /dev/null 2>&1
 "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$DPU_DB" "$DPU_RES" > /dev/null 2>&1
 
 log "Results saved to:"
