@@ -146,9 +146,9 @@ namespace mmseqs::dpu
         // Setup parameters
         int ksize = par.kmerSize;
 
-        int alphabetSize = subMat->alphabetSize;
-        // Pass reduced alphabet size for Amino Acids (21 -> 20) to Gnerator to match upstream matrices
-        std::unique_ptr<KmerGenerator> kmerGen = std::make_unique<KmerGenerator>(ksize, alphabetSize - 1, (short)kmerThr);
+        // Reduced alphabet size for Amino Acids (21 -> 20) - excluded 'X'
+        int alphabetSize = subMat->alphabetSize - 1;
+        std::unique_ptr<KmerGenerator> kmerGen = std::make_unique<KmerGenerator>(ksize, alphabetSize, (short)kmerThr);
         std::unique_ptr<Indexer> indexer = std::make_unique<Indexer>(alphabetSize, ksize);
         
         // Setup divide strategy for similar k-mer generation

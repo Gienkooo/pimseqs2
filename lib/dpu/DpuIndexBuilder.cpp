@@ -58,7 +58,7 @@ DpuIndexBuffer DpuIndexBuilder::build(
                        << (useSpacedKmers ? " (spaced)" : " (contiguous)") << "\n";
     
     // Create local thread-safe indexer
-    Indexer indexer(subMat->alphabetSize, kmer_size);
+    Indexer indexer(subMat->alphabetSize - 1, kmer_size);
     
     // Step 1: Extract exact k-mers from all target sequences
     std::vector<TempIndexEntry> temp_entries;
