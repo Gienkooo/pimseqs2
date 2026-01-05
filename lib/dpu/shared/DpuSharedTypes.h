@@ -37,13 +37,14 @@ extern "C" {
 /* ==================== K-mer Matching Specific Limits and Structures ==================== 
  * MRAM Layout (default):
  *   [0x000000] Descriptor         (~96 B)
- *   [STATIC]   Result Header      (8 B)     ← Host polls this at fixed address
  *   [STATIC]   Checkpoint         (16 B)    ← Resume state on overflow
  *   [STATIC]   Hint Table         (~1.6 KB) ← 400-entry prefix lookup
  *   [STATIC]   State Table        (32 KB)   ← Per-sequence diagonal tracking
  *   [STATIC]   Query Buffer       (1 MB)    ← Input packets, fixed size
  *   [VARIABLE] Index (Keys/Off/Ent) (varies per chunk)
- *   [VARIABLE] Output Buffer       (remaining MRAM) 
+ *   [VARIABLE] Output Buffer       (remaining MRAM)
+ *      ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
+ *      ↳ [0x08] Double Hits...      ← Contiguous hit array
  */
 
 #define HINT_TABLE_SIZE 400     /* 20x20 AA prefix combinations (base-20 encoding) */

@@ -288,7 +288,12 @@ int main() {
     
     // ===== SETUP MRAM POINTERS =====
     __mram_ptr KmerQueryPacket* query_packets = (__mram_ptr KmerQueryPacket*)(mram_base + g_descriptor.query_packets_offset);
-    __mram_ptr KmerDoubleHit* output_buffer = (__mram_ptr KmerDoubleHit*)(mram_base + g_descriptor.results_offset);
+    
+    // Point output_buffer 8 bytes AFTER the start of the results region
+    // This reserves the first 8 bytes for the KmerResultHeader
+    uint32_t header_size = sizeof(KmerResultHeader);
+    __mram_ptr KmerDoubleHit* output_buffer = (__mram_ptr KmerDoubleHit*)(mram_base + g_descriptor.results_offset + header_size);
+    
     __mram_ptr KmerResultHeader* result_header_ptr = (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_header_offset);
     __mram_ptr KmerCheckpoint* checkpoint_ptr = (__mram_ptr KmerCheckpoint*)(mram_base + g_descriptor.checkpoint_offset);
     __mram_ptr KmerCompactIndexEntry* index_entries = (__mram_ptr KmerCompactIndexEntry*)(mram_base + g_descriptor.index_entries_offset);
@@ -310,7 +315,8 @@ int main() {
     safe_mram_read(state_table_mram, w_state_table, state_bytes);
 
     // [ >> 3 ] == [ / sizeof(KmerDoubleHit) ]
-    uint32_t max_results = g_descriptor.results_buffer_size >> 3;
+    // Reduce capacity by 1 hit (8 bytes) to account for the header
+    uint32_t max_results = (g_descriptor.results_buffer_size - header_size) >> 3;
     uint32_t total_packets = g_descriptor.num_query_packets;
     
     DPU_LOG("[DPU T0] Max output hits: %u, Total packets: %u\n", max_results, total_packets);
@@ -746,11 +752,13 @@ finish:
     // Always save state table back to MRAM (for multi-batch queries)
     safe_mram_write(w_state_table, state_table_mram, state_bytes);
     
-    // write result header
+    // Write the header to the START of the results region (g_descriptor.results_offset)
+    // This makes the layout: [HEADER (8B)] [HIT 1] [HIT 2] ...
     KmerResultHeader result_header;
     result_header.total_hits = total_hits_written;
     result_header.overflow = overflow_occurred ? 1 : 0;
-    mram_write(&result_header, result_header_ptr, sizeof(KmerResultHeader));
+    __mram_ptr KmerResultHeader* header_dest = (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
+    mram_write(&result_header, header_dest, sizeof(KmerResultHeader));
     
     DPU_LOG("[DPU T0] EXECUTION COMPLETE:\n");
     DPU_LOG("[DPU T0]   Single hits processed: %u\n", single_hits_count);

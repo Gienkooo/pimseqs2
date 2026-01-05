@@ -21,6 +21,8 @@ class QueryMatcherTaxonomyHook;
 
 namespace mmseqs::dpu {
 
+struct DpuIndexBuffer;
+
 class DpuPrefilterHostPipeline {
  public:
   explicit DpuPrefilterHostPipeline(uint32_t num_dpus);
@@ -123,6 +125,21 @@ class DpuPrefilterHostPipeline {
       ScoreMatrix* extMatThree,
       const std::string& spacedPatternStr,
       bool takeOnlyBestKmer);
+  
+  // K-mer batch helpers
+  struct KmerRunContext;
+  
+  std::vector<std::vector<uint8_t>> prepareKmerDescriptors(
+      const KmerRunContext& ctx,
+      const std::vector<DpuIndexBuffer>& wave_indices,
+      const std::vector<std::vector<uint32_t>>& splits,
+      uint32_t num_packets,
+      size_t wave_start,
+      size_t wave_size);
+  
+  std::vector<std::vector<KmerDoubleHit>> executeKmerBatchWithOverflow(
+      const KmerRunContext& ctx,
+      const std::vector<std::vector<uint8_t>>& descriptors);
   
   void runDpuUngappedBatch(
       Parameters& par,
