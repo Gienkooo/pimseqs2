@@ -47,7 +47,7 @@ extern "C" {
  */
 
 /* ==================== BUCKETED INDEX PARAMETERS ==================== */
-/* 65536 buckets * 256 bytes = 16 MB Index Size (Fits in 32MB budget) */
+/* 65536 buckets * 256 bytes = 16 MB Index Size */
 #define NUM_BUCKETS 65536
 #define BUCKET_SIZE 256
 #define BUCKET_CAPACITY 20  /* (256 - 2 count - 2 pad - 4 next - 8 pad) / 12 bytes per item = 20 */
@@ -55,17 +55,18 @@ extern "C" {
 /* Sentinels */
 #define CHAIN_END_IDX 0xFFFFFFFF
 
-#define KMER_TARGET_ID_PADDING 0xFFFF
+#define KMER_TARGET_ID_PADDING 0xFFFE
 
 #define KMER_PACKET_SENTINEL_KEY     0xFFFFFFFF   /* End-of-query marker in packet stream */
 #define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
 
-#define MAX_DPU_SEQS 4096       
+#define MAX_DPU_SEQS 8192       
 #define MAX_DPU_INDEX_SIZE (32 * 1024 * 1024) /* 32 MB max index size per DPU */
+#define PACKET_READ_BATCH_SIZE 32
 
 /* Buffer Size Configuration */
-#define KMER_QUERY_BUFFER_SIZE (24 * 1024 * 1024)     /* query packet buffer */
-#define KMER_MIN_OUTPUT_BUFFER_SIZE (4 * 1024 * 1024) /* 4 MB minimum output */
+#define KMER_QUERY_BUFFER_SIZE (30 * 1024 * 1024)     /* query packet buffer */
+#define KMER_MIN_OUTPUT_BUFFER_SIZE (1 * 1024 * 1024) /* 1 MB minimum output */
 
 #define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))
 

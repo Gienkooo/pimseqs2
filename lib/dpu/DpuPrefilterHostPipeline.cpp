@@ -34,7 +34,7 @@
 #endif
 
 // comment out to disable DPU debug logs
-// #define DPU_DEBUG_MODE
+#define DPU_DEBUG_MODE
 
 #ifdef DPU_DEBUG_MODE
   #define DPU_DEBUG_LOG Debug(Debug::INFO)
@@ -288,7 +288,7 @@ namespace mmseqs::dpu
                 DPU_DEBUG_LOG << "    Result Header: offset " << ctx.RESULTS_HEADER_OFF << " (STATIC)\n";
                 DPU_DEBUG_LOG << "    Checkpoint:    offset " << ctx.CHECKPOINT_OFF << " (STATIC)\n";
                 DPU_DEBUG_LOG << "    State Table:   offset " << ctx.STATE_TABLE_OFF << " (STATIC)\n";
-                DPU_DEBUG_LOG << "    Query Buffer:  offset " << ctx.QUERY_PACKETS_OFF << " (STATIC, 24MB)\n";
+                DPU_DEBUG_LOG << "    Query Buffer:  offset " << ctx.QUERY_PACKETS_OFF << " (STATIC)\n";
                 DPU_DEBUG_LOG << "  Variable region: " << ((variable_structures_end - fixed_structures_end) / 1024) << " KB\n";
                 DPU_DEBUG_LOG << "    Buckets:       " << index.num_buckets << " buckets (" << (buckets_size / 1024) << " KB)\n";
                 DPU_DEBUG_LOG << "    Index Entries: " << index.entries.size() << " entries\n";
@@ -378,15 +378,26 @@ namespace mmseqs::dpu
                     
                     if (dpu_hits.empty()) continue;
                     
+                    DPU_DEBUG_LOG << "[CPU] Wave " << w << " DPU " << (wave_start + w) 
+                                  << ": " << dpu_hits.size() << " hits, chunk has " 
+                                  << chunk_targets.size() << " targets\n";
+                    
                     size_t queryIdxInBatch = 0;  // Index into batchQueryIndices
+                    size_t hitIdx = 0;
                     
                     for (const auto& hit : dpu_hits) {
-                        // Check for result sentinel (query boundary)
-                        if (hit.target_id == KMER_RESULT_SENTINEL_TARGET) {
+                        hitIdx++;
+                        // Check sentinel (32-bit) to detect query delimiters
+                        if (hit.target_id == (uint32_t)KMER_RESULT_SENTINEL_TARGET) {
                             queryIdxInBatch++;
                             if (queryIdxInBatch > batchQueryIndices.size()) {
                                 Debug(Debug::ERROR) << "[CPU] ERROR: Received more delimiters than queries sent!\n";
                             }
+                            continue;
+                        }
+
+                        // Ignore alignment padding hits
+                        if (hit.target_id == (uint32_t)KMER_TARGET_ID_PADDING) {
                             continue;
                         }
                         
