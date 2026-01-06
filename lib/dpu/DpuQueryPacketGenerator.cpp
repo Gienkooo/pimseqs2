@@ -136,12 +136,10 @@ size_t DpuQueryPacketGenerator::writePacketsFromKmerList(
     
     for (size_t i = start_idx; i < list_size && written < max_packets; ++i) {
         uint32_t kmer_idx = static_cast<uint32_t>(kmer_list[i]);
-        uint16_t hint_idx = static_cast<uint16_t>(
-            DpuIndexBuilder::calculateHintIndex(kmer_idx, kmer_size_)
-        );
+        uint16_t bucket_idx = static_cast<uint16_t>(dpu_compute_hash(kmer_idx));
         
         buffer[written].kmer_idx = kmer_idx;
-        buffer[written].hint_idx = hint_idx;
+        buffer[written].bucket_idx = bucket_idx;
         buffer[written].query_pos = query_pos;
         written++;
     }
@@ -165,7 +163,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
         // === 1. Handle pending sentinel from previous batch ===
         if (current_query_sentinel_pending_) {
             buffer[written].kmer_idx = KMER_PACKET_SENTINEL_KEY;
-            buffer[written].hint_idx = 0;
+            buffer[written].bucket_idx = 0;
             buffer[written].query_pos = 0;
             written++;
             stats_.total_sentinels++;
@@ -270,12 +268,10 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
                 // Exact k-mer matching only - always fits in 1 packet
                 size_t exactKmer = indexer_->int2index(kmer, 0, kmer_size_);
                 uint32_t kmer_idx = static_cast<uint32_t>(exactKmer);
-                uint16_t hint_idx = static_cast<uint16_t>(
-                    DpuIndexBuilder::calculateHintIndex(kmer_idx, kmer_size_)
-                );
+                uint16_t bucket_idx = static_cast<uint16_t>(dpu_compute_hash(kmer_idx));
                 
                 buffer[written].kmer_idx = kmer_idx;
-                buffer[written].hint_idx = hint_idx;
+                buffer[written].bucket_idx = bucket_idx;
                 buffer[written].query_pos = query_pos;
                 written++;
                 stats_.total_similar_kmers++;
@@ -331,7 +327,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             if (written < max_packets) {
                 // Room for sentinel
                 buffer[written].kmer_idx = KMER_PACKET_SENTINEL_KEY;
-                buffer[written].hint_idx = 0;
+                buffer[written].bucket_idx = 0;
                 buffer[written].query_pos = 0;
                 written++;
                 stats_.total_sentinels++;

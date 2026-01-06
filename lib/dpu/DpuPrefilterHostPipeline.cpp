@@ -50,7 +50,6 @@ namespace mmseqs::dpu
     
     struct DpuPrefilterHostPipeline::KmerRunContext {
         // MRAM Offsets 
-        uint32_t HINTS_OFF;
         uint32_t STATE_TABLE_OFF;
         uint32_t QUERY_PACKETS_OFF;
         uint32_t VARIABLE_INDEX_START;
@@ -69,10 +68,7 @@ namespace mmseqs::dpu
             uint32_t desc_size = CM::alignToMram(sizeof(KmerBatchDescriptor));
             ctx.RESULTS_HEADER_OFF = desc_size;
             ctx.CHECKPOINT_OFF     = ctx.RESULTS_HEADER_OFF + CM::alignToMram(sizeof(KmerResultHeader));
-            ctx.HINTS_OFF          = ctx.CHECKPOINT_OFF + CM::alignToMram(sizeof(KmerCheckpoint));
-            
-            uint32_t hint_bytes    = CM::alignToMram((HINT_TABLE_SIZE + 1) * sizeof(uint32_t));
-            ctx.STATE_TABLE_OFF    = ctx.HINTS_OFF + hint_bytes;
+            ctx.STATE_TABLE_OFF    = ctx.CHECKPOINT_OFF + CM::alignToMram(sizeof(KmerCheckpoint));
             
             uint32_t state_bytes   = CM::alignToMram(MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
             ctx.QUERY_PACKETS_OFF  = ctx.STATE_TABLE_OFF + state_bytes;
@@ -269,36 +265,32 @@ namespace mmseqs::dpu
             // Transfer indices to DPUs
             // Prepare parallel transfer buffers (one per DPU slot in the wave)
             // Must be sized to num_dpus for scatterDataParallel, even if some slots are empty
-            std::vector<std::vector<uint8_t>> wave_hints(num_dpus);
             std::vector<std::vector<uint8_t>> wave_index_buffers(num_dpus);
 
             for (size_t w = 0; w < wave_size; ++w) {
                 uint32_t dpu_id = static_cast<uint32_t>(w);
                 const auto& index = wave_indices[w];
 
-                if (index.keys.empty()) {
+                if (index.buckets.empty()) {
                     Debug(Debug::WARNING) << "[CPU] Chunk " << (wave_start + w) << " has empty index, skipping\n";
                     continue;
                 }
                 
-                // Check total size using pre-calculated base offset
-                uint32_t keys_size = DpuCommunicationManager::alignToMram(index.keys.size() * sizeof(uint32_t));
-                uint32_t offsets_size = DpuCommunicationManager::alignToMram(index.offsets.size() * sizeof(uint32_t));
+                // Check total size using pre-calculated base offset (Buckets + Entries)
+                uint32_t buckets_size = DpuCommunicationManager::alignToMram(index.buckets.size());
                 uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
                 
-                uint32_t variable_structures_end = ctx.VARIABLE_INDEX_START + keys_size + offsets_size + entries_size;
+                uint32_t variable_structures_end = ctx.VARIABLE_INDEX_START + buckets_size + entries_size;
                 uint32_t fixed_structures_end = ctx.VARIABLE_INDEX_START;
                 DPU_DEBUG_LOG << "[CPU] DPU " << dpu_id << " Memory Layout:\n";
                 DPU_DEBUG_LOG << "  Fixed region: " << (fixed_structures_end / 1024) << " KB\n";
                 DPU_DEBUG_LOG << "    Descriptor:    offset 0x0\n";
                 DPU_DEBUG_LOG << "    Result Header: offset " << ctx.RESULTS_HEADER_OFF << " (STATIC)\n";
                 DPU_DEBUG_LOG << "    Checkpoint:    offset " << ctx.CHECKPOINT_OFF << " (STATIC)\n";
-                DPU_DEBUG_LOG << "    Hints:         offset " << ctx.HINTS_OFF << " (STATIC)\n";
                 DPU_DEBUG_LOG << "    State Table:   offset " << ctx.STATE_TABLE_OFF << " (STATIC)\n";
-                DPU_DEBUG_LOG << "    Query Buffer:  offset " << ctx.QUERY_PACKETS_OFF << " (STATIC, 1MB)\n";
+                DPU_DEBUG_LOG << "    Query Buffer:  offset " << ctx.QUERY_PACKETS_OFF << " (STATIC, 24MB)\n";
                 DPU_DEBUG_LOG << "  Variable region: " << ((variable_structures_end - fixed_structures_end) / 1024) << " KB\n";
-                DPU_DEBUG_LOG << "    Index Keys:    " << index.keys.size() << " entries\n";
-                DPU_DEBUG_LOG << "    Index Offsets: " << index.offsets.size() << " entries\n";
+                DPU_DEBUG_LOG << "    Buckets:       " << index.num_buckets << " buckets (" << (buckets_size / 1024) << " KB)\n";
                 DPU_DEBUG_LOG << "    Index Entries: " << index.entries.size() << " entries\n";
 
                 // === OUTPUT BUFFER: Uses remaining MRAM ===
@@ -318,50 +310,31 @@ namespace mmseqs::dpu
                     Debug(Debug::ERROR) << "  SOLUTION: Reduce MAX_DPU_SEQS or database chunk size\n";
                     EXIT(EXIT_FAILURE);
                 }
-                
-                // Build hint buffer for this DPU
-                uint32_t hint_bytes_aligned = DpuCommunicationManager::alignToMram((HINT_TABLE_SIZE + 1) * sizeof(uint32_t));
-                wave_hints[w].resize(hint_bytes_aligned);
-                memcpy(wave_hints[w].data(), index.hints.data(), index.hints.size() * sizeof(uint32_t));
 
-                // Build merged index buffer (keys | offsets | entries) in variable region
-                uint32_t keys_size_bytes = index.keys.size() * sizeof(uint32_t);
-                uint32_t offsets_size_bytes = index.offsets.size() * sizeof(uint32_t);
-                uint32_t entries_size_bytes = index.entries.size() * sizeof(KmerCompactIndexEntry);
-
-                uint32_t total_index_size =
-                    DpuCommunicationManager::alignToMram(keys_size_bytes) +
-                    DpuCommunicationManager::alignToMram(offsets_size_bytes) +
-                    DpuCommunicationManager::alignToMram(entries_size_bytes);
+                // Build merged index buffer (buckets | entries) in variable region
+                uint32_t total_index_size = buckets_size + entries_size;
 
                 wave_index_buffers[w].resize(total_index_size);
                 uint8_t* ptr = wave_index_buffers[w].data();
 
-                // Copy Keys
-                if (keys_size_bytes > 0) memcpy(ptr, index.keys.data(), keys_size_bytes);
-                ptr += DpuCommunicationManager::alignToMram(keys_size_bytes);
-
-                // Copy Offsets
-                if (offsets_size_bytes > 0) memcpy(ptr, index.offsets.data(), offsets_size_bytes);
-                ptr += DpuCommunicationManager::alignToMram(offsets_size_bytes);
+                // Copy Buckets
+                if (!index.buckets.empty()) memcpy(ptr, index.buckets.data(), index.buckets.size());
+                ptr += buckets_size;
 
                 // Copy Entries
-                if (entries_size_bytes > 0) memcpy(ptr, index.entries.data(), entries_size_bytes);
+                if (!index.entries.empty()) memcpy(ptr, index.entries.data(), index.entries.size() * sizeof(KmerCompactIndexEntry));
 
-                DPU_DEBUG_LOG << "[CPU " << dpu_id << "] Prepared index: " << index.keys.size() << " keys, " << index.entries.size() << " entries (" << (index.getTotalBytes() / 1024) << " KB)\n";
+                DPU_DEBUG_LOG << "[CPU " << dpu_id << "] Prepared index: " << index.num_buckets << " buckets, " << index.entries.size() << " entries (" << (index.getTotalBytes() / 1024) << " KB)\n";
             }
 
             {
-                // Transfer Hints (Fixed Region) in one pass
-                dpu_comm_.scatterDataParallel(wave_hints, ctx.HINTS_OFF);
-
                 // Transfer merged Index Data (Variable Region) in one pass
                 dpu_comm_.scatterDataParallel(wave_index_buffers, ctx.VARIABLE_INDEX_START);
 
                 // Log which DPUs received indices
                 for (size_t w = 0; w < wave_size; ++w) {
                     if (!wave_index_buffers[w].empty()) {
-                        DPU_DEBUG_LOG << "[CPU " << w << "] Loaded index (parallel) size=" << (wave_index_buffers[w].size() / 1024) << " KB, hints=" << (wave_hints[w].size() / 1024) << " KB\n";
+                        DPU_DEBUG_LOG << "[CPU " << w << "] Loaded index (parallel) size=" << (wave_index_buffers[w].size() / 1024) << " KB\n";
                     }
                 }
             }
@@ -601,10 +574,9 @@ namespace mmseqs::dpu
         for (uint32_t d = 0; d < ctx.num_dpus; ++d) {
             descriptors[d].resize(desc_size, 0); // Zero initialize
             
-            if (d >= wave_size || wave_indices[d].keys.empty()) {
+            if (d >= wave_size || wave_indices[d].buckets.empty()) {
                 // Empty descriptor for idle DPUs
                 KmerBatchDescriptor empty_desc = {};
-                empty_desc.results_header_offset = ctx.RESULTS_HEADER_OFF;
                 memcpy(descriptors[d].data(), &empty_desc, sizeof(empty_desc));
                 continue;
             }
@@ -612,11 +584,12 @@ namespace mmseqs::dpu
             const auto& index = wave_indices[d];
             const auto& chunk = splits[wave_start + d];
             
-            // Calculate Variable Offsets
-            uint32_t keys_off = ctx.VARIABLE_INDEX_START;
-            uint32_t offsets_off = keys_off + DpuCommunicationManager::alignToMram(index.keys.size() * sizeof(uint32_t));
-            uint32_t entries_off = offsets_off + DpuCommunicationManager::alignToMram(index.offsets.size() * sizeof(uint32_t));
-            uint32_t results_off = entries_off + DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+            // Calculate Variable Offsets (Buckets | Entries)
+            uint32_t buckets_off = ctx.VARIABLE_INDEX_START;
+            uint32_t buckets_size = DpuCommunicationManager::alignToMram(index.buckets.size());
+            uint32_t entries_off = buckets_off + buckets_size;
+            uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+            uint32_t results_off = entries_off + entries_size;
             
             uint32_t remaining_mram = DPU_MRAM_TOTAL_SIZE - results_off;
             uint32_t result_buffer_size = std::max((uint32_t)KMER_MIN_OUTPUT_BUFFER_SIZE, remaining_mram);
@@ -625,17 +598,12 @@ namespace mmseqs::dpu
             KmerBatchDescriptor desc = {};
             desc.num_query_packets = num_packets;
             desc.num_targets = chunk.size();
-            desc.num_index_keys = index.keys.size();
+            desc.num_buckets = index.num_buckets;
             desc.num_index_entries = index.entries.size();
             
-            desc.hint_table_offset = ctx.HINTS_OFF;
             desc.state_table_offset = ctx.STATE_TABLE_OFF;
             desc.query_packets_offset = ctx.QUERY_PACKETS_OFF;
-            desc.checkpoint_offset = ctx.CHECKPOINT_OFF;
-            desc.results_header_offset = ctx.RESULTS_HEADER_OFF;
-            
-            desc.index_keys_offset = keys_off;
-            desc.index_offsets_offset = offsets_off;
+            desc.buckets_offset = buckets_off;
             desc.index_entries_offset = entries_off;
             
             desc.results_offset = results_off;

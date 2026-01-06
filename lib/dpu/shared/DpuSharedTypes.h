@@ -35,41 +35,79 @@ extern "C" {
 #define DPU_MRAM_TOTAL_SIZE (64 * 1024 * 1024) 
 
 /* ==================== K-mer Matching Specific Limits and Structures ==================== 
- * MRAM Layout (default):
+ * MRAM Layout (Bucketed Hash Index):
  *   [0x000000] Descriptor         (~96 B)
- *   [STATIC]   Checkpoint         (16 B)    ← Resume state on overflow
- *   [STATIC]   Hint Table         (~1.6 KB) ← 400-entry prefix lookup
- *   [STATIC]   State Table        (32 KB)   ← Per-sequence diagonal tracking
- *   [STATIC]   Query Buffer       (24 MB)    ← Input packets, fixed size
- *   [VARIABLE] Index (Keys/Off/Ent) (varies per chunk)
- *   [VARIABLE] Output Buffer       (remaining MRAM)
+ *   [STATIC]   State Table        (16 KB)   ← Per-sequence diagonal tracking
+ *   [STATIC]   Query Buffer       (24 MB)   ← Input packets, fixed size
+ *   [VARIABLE] Bucket Array       (~16 MB)  ← 65536 primary buckets + overflow
+ *   [VARIABLE] Entries Array      (varies)  ← {target_id, pos} pairs
+ *   [VARIABLE] Output Buffer      (remaining MRAM)
  *      ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
  *      ↳ [0x08] Double Hits...      ← Contiguous hit array
  */
 
-#define HINT_TABLE_SIZE 400     /* 20x20 AA prefix combinations (base-20 encoding) */
+/* ==================== BUCKETED INDEX PARAMETERS ==================== */
+/* 65536 buckets * 256 bytes = 16 MB Index Size (Fits in 32MB budget) */
+#define NUM_BUCKETS 65536
+#define BUCKET_SIZE 256
+#define BUCKET_CAPACITY 20  /* (256 - 2 count - 2 pad - 4 next - 8 pad) / 12 bytes per item = 20 */
+
+/* Sentinels */
+#define CHAIN_END_IDX 0xFFFFFFFF
+
 #define KMER_TARGET_ID_PADDING 0xFFFF
 
 #define KMER_PACKET_SENTINEL_KEY     0xFFFFFFFF   /* End-of-query marker in packet stream */
 #define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
 
-// The following can be adjusted in order to optimize performance TODO
-/* Max number of sequences per DPU database chunk for kmer prefiltering 
-   has to fit in WRAM comfortably (8192 fits in 32KB state table with 4-byte entries) */
-#define MAX_DPU_SEQS 8192       
-#define MAX_DPU_INDEX_SIZE (32 * 1024 * 1024) /* 32 MB max index size per DPU (keys + offsets + entries) */
-#define BLOCK_SEARCH_SIZE 16    /* Fetch 16 keys (64 bytes) per MRAM access */
+#define MAX_DPU_SEQS 4096       
+#define MAX_DPU_INDEX_SIZE (32 * 1024 * 1024) /* 32 MB max index size per DPU */
 
 /* Buffer Size Configuration */
 #define KMER_QUERY_BUFFER_SIZE (24 * 1024 * 1024)     /* query packet buffer */
-#define KMER_MIN_OUTPUT_BUFFER_SIZE (4 * 1024 * 1024)    /* 4 MB = 128 hits * 32768  */
+#define KMER_MIN_OUTPUT_BUFFER_SIZE (4 * 1024 * 1024) /* 4 MB minimum output */
 
-#define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))  /* 131072 packets for 5MB buffer */
+#define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))
+
+/* ==================== HASH CALCULATION ==================== */
+/* MurmurHash3 Finalizer (fast integer hash)
+ * Maps k-mer to Bucket Index [0, 65535] */
+static inline uint32_t dpu_compute_hash(uint32_t k) {
+    k ^= k >> 16;
+    k *= 0x85ebca6b;
+    k ^= k >> 13;
+    k *= 0xc2b2ae35;
+    k ^= k >> 16;
+    return k & (NUM_BUCKETS - 1); /* Modulo 65536 */
+}
+
+/* ==================== BUCKET DATA STRUCTURES ==================== */
+
+/* 12-byte Bucket Item: Key + Offset + Count */
+typedef struct {
+    uint32_t key;       /* K-mer value */
+    uint32_t offset;    /* Start offset in entries array */
+    uint16_t count;     /* Number of entries for this k-mer */
+    uint16_t pad;       /* Alignment padding */
+} __attribute__((packed)) KmerBucketItem;
+
+DPU_STATIC_ASSERT(sizeof(KmerBucketItem) == 12, "KmerBucketItem must be 12 bytes");
+
+/* 256-byte Bucket (Aligned for single MRAM transfer) */
+typedef struct {
+    uint16_t count;                      /* Number of items in this bucket */
+    uint16_t pad1;                       /* Padding for alignment */
+    uint32_t next_idx;                   /* Index of overflow bucket (0xFFFFFFFF if none) */
+    KmerBucketItem items[BUCKET_CAPACITY]; /* 20 * 12 = 240 bytes */
+    uint32_t padding[2];                 /* 8 bytes to reach 256 */
+} __attribute__((packed)) KmerBucket;
+
+DPU_STATIC_ASSERT(sizeof(KmerBucket) == 256, "KmerBucket must be 256 bytes");
 
 /* Query Packet */
 typedef struct {
-    uint32_t kmer_idx;      /* Encoded k-mer index for binary search */
-    uint16_t hint_idx;      /* Pre-calculated hint index */
+    uint32_t kmer_idx;      /* Encoded k-mer index for hash lookup */
+    uint16_t bucket_idx;    /* Pre-calculated bucket index (hash result) */
     uint16_t query_pos;     /* Position i in query sequence */
 } __attribute__((packed)) KmerQueryPacket;
 
@@ -123,23 +161,18 @@ DPU_STATIC_ASSERT(sizeof(KmerResultHeader) == 8, "KmerResultHeader must be 8 byt
 typedef struct {
     uint32_t num_query_packets;     /* Number of query k-mer packets */
     uint32_t num_targets;           /* Number of target sequences */
-    uint32_t num_index_keys;        /* Number of unique k-mers in index */
+    uint32_t num_buckets;           /* Total buckets (primary + overflow) */
     uint32_t num_index_entries;     /* Total index entries */
     
     /* MRAM Offsets */
-    uint32_t hint_table_offset;     
-    uint32_t query_packets_offset;
-    uint32_t index_keys_offset;
-    uint32_t index_offsets_offset;
-    uint32_t index_entries_offset;
-    uint32_t state_table_offset;    /* MRAM backup of state table for resuming after an overflow */
-    uint32_t checkpoint_offset;     /* Checkpoint for resuming after an overflow structure offset */
-    uint32_t results_header_offset; 
-    uint32_t results_offset;        
-    uint32_t results_buffer_size;   /* Actual output buffer size (max(KMER_MIN_OUTPUT_BUFFER_SIZE, remaining_mram)) */
+    uint32_t state_table_offset;    /* State table for diagonal tracking */
+    uint32_t query_packets_offset;  /* Query packet buffer */
+    uint32_t buckets_offset;        /* Start of bucket array */
+    uint32_t index_entries_offset;  /* Start of entries array */
+    uint32_t results_offset;        /* Start of results buffer */
+    uint32_t results_buffer_size;   /* Actual output buffer size */
     
-    uint32_t packet_start_idx;      /* Start index for this batch (for resume) */
-    uint32_t reserved1;             /* Align to 8 bytes */
+    uint32_t reserved[2];           /* Padding for 8-byte alignment */
 } __attribute__((packed)) KmerBatchDescriptor;
 
 DPU_STATIC_ASSERT(sizeof(KmerBatchDescriptor) % 8 == 0, "KmerBatchDescriptor must be 8-byte aligned");
