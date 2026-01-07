@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DpuCommunicationManager.h"
+#include "DpuGroupManager.h"
 #include "shared/DpuSharedTypes.h"
 #include <vector>
 #include <cstdio>
@@ -295,6 +296,59 @@ public:
 
 private:
     DpuCommunicationManager& comm_;
+};
+
+// Lightweight helper to manage rank-level scheduling with DpuGroupManager.
+class RankDispatcher {
+public:
+    RankDispatcher(DpuGroupManager& mgr, const std::vector<std::vector<uint32_t>>& group_to_dpu_ids)
+        : group_mgr_(mgr), group_to_dpu_ids_(group_to_dpu_ids), group_in_flight_(group_to_dpu_ids.size(), false) {}
+
+    // Drain all completed groups; for each DPU in that group, call handler(dpu_id).
+    template <typename HandlerFn>
+    size_t drainCompleted(const HandlerFn& handle_dpu) {
+        size_t drained = 0;
+        while (true) {
+            uint32_t gid = group_mgr_.findCompletedGroup();
+            if (gid == UINT32_MAX) break;
+            for (uint32_t d : group_to_dpu_ids_[gid]) {
+                handle_dpu(d);
+            }
+            group_mgr_.releaseGroup(gid);
+            group_in_flight_[gid] = false;
+            drained++;
+        }
+        return drained;
+    }
+
+    // Attempt to launch the specified group after preparing its DPUs.
+    // prepare_dpu should return true if the DPU was armed with work.
+    template <typename PrepareFn>
+    bool launchGroup(uint32_t gid, const PrepareFn& prepare_dpu) {
+        if (gid >= group_to_dpu_ids_.size()) return false;
+        if (group_in_flight_[gid]) return false;
+
+        bool has_work = false;
+        for (uint32_t d : group_to_dpu_ids_[gid]) {
+            if (prepare_dpu(d)) {
+                has_work = true;
+            }
+        }
+
+        if (!has_work) return false;
+
+        DpuGroupManager::GroupContext ctx{};
+        group_mgr_.launchGroupAsync(gid, ctx);
+        group_in_flight_[gid] = true;
+        return true;
+    }
+
+    void poll() { group_mgr_.pollAllGroups(); }
+
+private:
+    DpuGroupManager& group_mgr_;
+    const std::vector<std::vector<uint32_t>>& group_to_dpu_ids_;
+    std::vector<bool> group_in_flight_;
 };
 
 } // namespace mmseqs::dpu

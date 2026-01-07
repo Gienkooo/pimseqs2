@@ -74,6 +74,11 @@ public:
     void broadcastToGroup(uint32_t group_id, const void* data,
                          uint32_t size, uint32_t mram_offset);
 
+    // Scatter different data to each DPU in the group efficiently
+    void scatterToGroupParallel(uint32_t group_id,
+                               const std::vector<std::vector<uint8_t>>& per_dpu_data,
+                               uint32_t mram_offset);
+
     // Launch all DPUs in a group asynchronously; group becomes EXECUTING.
     void launchGroupAsync(uint32_t group_id, const GroupContext& context);
 

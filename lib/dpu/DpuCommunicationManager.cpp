@@ -68,6 +68,16 @@ DpuCommunicationManager::~DpuCommunicationManager() {
   dpu_free(dpu_set_);
 }
 
+std::vector<struct dpu_set_t> DpuCommunicationManager::getRankSets() {
+  std::vector<struct dpu_set_t> ranks;
+  struct dpu_set_t rank;
+
+  DPU_RANK_FOREACH(dpu_set_, rank) {
+    ranks.push_back(rank);
+  }
+  return ranks;
+}
+
 void DpuCommunicationManager::broadcastData(
     const void* host_data, uint32_t size_bytes, uint32_t dpu_mram_offset) {
   ScopedTimer timer(slot(ProfileSlot::Broadcast));

@@ -157,6 +157,11 @@ class DpuPrefilterHostPipeline {
       bool sameDB,
       DBWriter& resultWriter);
 
+  std::vector<int8_t> extractPSSMFromProfile(
+      const char* profileData,
+      uint32_t seqlen,
+      BaseMatrix* subMat);
+
   std::vector<int8_t> buildPSSMFromSequence(
       const char* sequence, uint32_t seq_len, BaseMatrix* subMat,
       bool compBiasCorrection, float compBiasCorrectionScale, std::vector<float>& compositionBias);

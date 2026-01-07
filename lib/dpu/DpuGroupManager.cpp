@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <cstring>
 #include "Debug.h"
 
 namespace mmseqs::dpu {
@@ -66,16 +67,24 @@ DpuGroupManager::DpuGroupManager(uint32_t num_groups, uint32_t dpus_per_group)
 }
 
 DpuGroupManager::DpuGroupManager(const std::vector<struct dpu_set_t>& external_sets)
-        : num_groups_(external_sets.size()),
-            dpus_per_group_(1),
-            dpu_sets_(external_sets),
-            statuses_(external_sets.size(), GroupStatus::IDLE),
-            contexts_(external_sets.size()),
-            owns_sets_(false) {
+    : num_groups_(external_sets.size()),
+      dpus_per_group_(0),
+      dpu_sets_(external_sets),
+      statuses_(external_sets.size(), GroupStatus::IDLE),
+      contexts_(external_sets.size()),
+      owns_sets_(false) {
         if (num_groups_ == 0) {
                 Debug(Debug::ERROR) << "[DPU GROUP] Must have at least 1 group\n";
                 exit(EXIT_FAILURE);
         }
+    if (!dpu_sets_.empty()) {
+        dpu_error_t status = dpu_get_nr_dpus(dpu_sets_[0], &dpus_per_group_);
+        if (status != DPU_OK) {
+            Debug(Debug::ERROR) << "[DPU GROUP] Failed to query DPUs in first group: "
+                        << dpu_error_to_string(status) << "\n";
+            exit(EXIT_FAILURE);
+        }
+    }
         Debug(Debug::INFO) << "[DPU GROUP] Wrapped " << num_groups_ << " existing DPUs (no ownership)\n";
 }
 
@@ -213,6 +222,70 @@ void DpuGroupManager::broadcastToGroup(uint32_t group_id, const void* data,
     dpu_error_t status = dpu_copy_to(dpu_sets_[group_id], "__sys_used_mram_end", mram_offset,
                                      (void*)data, size);
     checkStatus(status, "Broadcast", group_id);
+}
+
+void DpuGroupManager::scatterToGroupParallel(uint32_t group_id,
+                                            const std::vector<std::vector<uint8_t>>& per_dpu_data,
+                                            uint32_t mram_offset) {
+    if (group_id >= num_groups_) {
+        Debug(Debug::ERROR) << "[DPU GROUP] Invalid group ID " << group_id << "\n";
+        exit(EXIT_FAILURE);
+    }
+
+    if (statuses_[group_id] != GroupStatus::IDLE) {
+        Debug(Debug::ERROR) << "[DPU GROUP] Cannot scatter to non-idle group " << group_id << "\n";
+        exit(EXIT_FAILURE);
+    }
+
+    if (mram_offset % MRAM_ALIGN != 0) {
+        Debug(Debug::ERROR) << "[DPU GROUP] MRAM offset not 8-byte aligned\n";
+        exit(EXIT_FAILURE);
+    }
+
+    size_t max_size = 0;
+    uint32_t dpu_count = 0;
+    struct dpu_set_t dpu;
+    DPU_FOREACH(dpu_sets_[group_id], dpu) {
+        if (dpu_count >= per_dpu_data.size()) {
+            Debug(Debug::ERROR) << "[DPU GROUP] per_dpu_data too small for group " << group_id << "\n";
+            exit(EXIT_FAILURE);
+        }
+        max_size = std::max(max_size, per_dpu_data[dpu_count].size());
+        dpu_count++;
+    }
+
+    if (dpu_count != per_dpu_data.size()) {
+        Debug(Debug::ERROR) << "[DPU GROUP] per_dpu_data size mismatch for group " << group_id << "\n";
+        exit(EXIT_FAILURE);
+    }
+
+    if (max_size == 0) {
+        return;
+    }
+
+    const uint32_t aligned_len = alignToMram(static_cast<uint32_t>(max_size));
+    std::vector<std::vector<uint8_t>> temp_buffers;
+    temp_buffers.reserve(dpu_count);
+
+    uint32_t each_dpu = 0;
+    DPU_FOREACH(dpu_sets_[group_id], dpu, each_dpu) {
+        const auto &payload = per_dpu_data[each_dpu];
+        if (payload.size() < aligned_len) {
+            temp_buffers.emplace_back(aligned_len, 0);
+            if (!payload.empty()) {
+                memcpy(temp_buffers.back().data(), payload.data(), payload.size());
+            }
+            dpu_error_t status = dpu_prepare_xfer(dpu, temp_buffers.back().data());
+            checkStatus(status, "Prepare xfer (padded)", group_id);
+        } else {
+            dpu_error_t status = dpu_prepare_xfer(dpu, (void*)payload.data());
+            checkStatus(status, "Prepare xfer", group_id);
+        }
+    }
+
+    dpu_error_t status = dpu_push_xfer(dpu_sets_[group_id], DPU_XFER_TO_DPU, "__sys_used_mram_end",
+                                       mram_offset, aligned_len, DPU_XFER_DEFAULT);
+    checkStatus(status, "Push xfer (scatter parallel)", group_id);
 }
 
 void DpuGroupManager::launchGroupAsync(uint32_t group_id, const GroupContext& context) {
