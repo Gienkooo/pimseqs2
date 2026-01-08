@@ -10,6 +10,7 @@ gunzip uniref50.fasta.gz
 # We use a temp file to avoid holding everything in RAM if using 'shuf' on massive files directly
 awk '/^>/ {printf("\n%s\t",$0);next;} {printf("%s",$0);} END {printf("\n");}' "uniref50.fasta" \
 | grep -v "^$" \
+| head -n $((TARGET_SIZE + QUERY_SIZE)) \
 | shuf > "uniref50_randomized.tsv"
 
 echo "[+] Creating Target DB data ($TARGET_SIZE sequences)..."
