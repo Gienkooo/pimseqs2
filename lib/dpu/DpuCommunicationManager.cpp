@@ -10,8 +10,8 @@
 namespace mmseqs::dpu {
 
 DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
-  : num_dpus_available_(num_dpus_requested),
-    num_dpus_active_(num_dpus_requested),
+  : num_dpus_available_(0),
+    num_dpus_active_(0),
     async_in_progress_(false),
     is_simulator_(false) {
   const char* profile = nullptr;
@@ -42,40 +42,77 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     }
   }
 
-  // Allocate aggregate set, then derive per-DPU views from it.
-  dpu_error_t status = dpu_alloc(num_dpus_requested, profile, &dpu_set_);
-  checkStatus(status, "DPU allocation (aggregate)");
+  const std::string base_profile = is_simulator_ ? "backend=simulator" : (profile ? profile : "backend=hw");
+  const uint32_t ranks_to_scan = 40; // max number of ranks in system
+  const bool allocate_all = (num_dpus_requested == DPU_ALLOCATE_ALL);
+  uint32_t remaining = allocate_all ? 0 : num_dpus_requested;
 
-  status = dpu_get_nr_dpus(dpu_set_, &num_dpus_available_);
-  checkStatus(status, "Getting rank count");
+  fprintf(stderr, "[DPU] Incremental rank discovery (profile=%s)\n", base_profile.c_str());
 
-  num_dpus_active_ = num_dpus_available_;
-  dpu_sets_.clear();
-  async_per_dpu_.assign(num_dpus_active_, false);
+  for (uint32_t r = 0; r < ranks_to_scan; ++r) {
+    if (!allocate_all && remaining == 0) {
+      break;
+    }
 
-  struct dpu_set_t dpu;
-  DPU_FOREACH(dpu_set_, dpu) {
-    dpu_sets_.push_back(dpu);
+    std::string rank_profile = base_profile + ",rank=" + std::to_string(r);
+    uint32_t request_for_rank = allocate_all ? DPU_ALLOCATE_ALL : std::min<uint32_t>(remaining, 64);
+    struct dpu_set_t rank_set;
+    dpu_error_t status = dpu_alloc(request_for_rank, rank_profile.c_str(), &rank_set);
+    if (status != DPU_OK) {
+      continue; // rank not present or unavailable
+    }
+
+    uint32_t rank_dpus = 0;
+    status = dpu_get_nr_dpus(rank_set, &rank_dpus);
+    if (status != DPU_OK || rank_dpus == 0) {
+      dpu_free(rank_set);
+      continue;
+    }
+
+    rank_sets_.push_back(rank_set);
+
+    struct dpu_set_t dpu;
+    DPU_FOREACH(rank_set, dpu) {
+      dpu_sets_.push_back(dpu);
+      async_per_dpu_.push_back(false);
+      ++num_dpus_active_;
+      if (!allocate_all && num_dpus_active_ >= num_dpus_requested) {
+        break;
+      }
+    }
+
+    num_dpus_available_ = num_dpus_active_;
+    if (!allocate_all) {
+      remaining = (num_dpus_active_ >= num_dpus_requested) ? 0 : (num_dpus_requested - num_dpus_active_);
+    }
   }
 
-  fprintf(stderr, "[DPU] Allocated %u DPUs (Profile: %s)\n", num_dpus_available_, profile ? profile : "default");
+  if (num_dpus_requested != DPU_ALLOCATE_ALL && num_dpus_active_ < num_dpus_requested) {
+    fprintf(stderr, "[DPU ERROR] Unable to allocate requested DPUs (%u requested, %u acquired)\n",
+            num_dpus_requested, num_dpus_active_);
+    exit(EXIT_FAILURE);
+  }
+
+  if (num_dpus_active_ == 0) {
+    fprintf(stderr, "[DPU ERROR] No healthy DPUs found during incremental allocation.\n");
+    exit(EXIT_FAILURE);
+  }
+
+  fprintf(stderr, "[DPU] Allocated %u DPUs across %zu ranks (Profile: %s)\n",
+          num_dpus_active_, rank_sets_.size(), base_profile.c_str());
 }
 
 DpuCommunicationManager::~DpuCommunicationManager() {
   if (async_in_progress_) {
     waitForKernels();
   }
-  dpu_free(dpu_set_);
+  for (auto &rank_set : rank_sets_) {
+    dpu_free(rank_set);
+  }
 }
 
 std::vector<struct dpu_set_t> DpuCommunicationManager::getRankSets() {
-  std::vector<struct dpu_set_t> ranks;
-  struct dpu_set_t rank;
-
-  DPU_RANK_FOREACH(dpu_set_, rank) {
-    ranks.push_back(rank);
-  }
-  return ranks;
+  return rank_sets_;
 }
 
 void DpuCommunicationManager::broadcastData(
@@ -87,10 +124,11 @@ void DpuCommunicationManager::broadcastData(
     exit(EXIT_FAILURE);
   }
 
-  // Single call to aggregate set lets the driver broadcast to all DPUs efficiently.
-  dpu_error_t status = dpu_copy_to(dpu_set_, "__sys_used_mram_end", dpu_mram_offset,
-                                   (void*)host_data, size_bytes);
-  checkStatus(status, "Broadcast (aggregate)");
+  for (auto &rank_set : rank_sets_) {
+    dpu_error_t status = dpu_copy_to(rank_set, "__sys_used_mram_end", dpu_mram_offset,
+                                     (void*)host_data, size_bytes);
+    checkStatus(status, "Broadcast (rank)");
+  }
 
   if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(size_bytes) * num_dpus_active_;
 }
@@ -146,31 +184,32 @@ void DpuCommunicationManager::scatterDataParallel(
   std::vector<std::vector<uint8_t>> temp_buffers;
   temp_buffers.reserve(num_dpus_active_);
 
-  struct dpu_set_t dpu;
-  uint32_t each_dpu;
-  DPU_FOREACH(dpu_set_, dpu, each_dpu) {
-    if (each_dpu >= per_dpu_data.size()) break;
+  size_t global_idx = 0;
+  for (auto &rank_set : rank_sets_) {
+    struct dpu_set_t dpu;
+    DPU_FOREACH(rank_set, dpu) {
+      if (global_idx >= per_dpu_data.size()) break;
 
-    const auto& data = per_dpu_data[each_dpu];
-    if (data.size() < aligned_len) {
-      // Create padded copy
-      temp_buffers.emplace_back(aligned_len, 0);
-      if (!data.empty()) {
-        std::memcpy(temp_buffers.back().data(), data.data(), data.size());
+      const auto &data = per_dpu_data[global_idx];
+      if (data.size() < aligned_len) {
+        temp_buffers.emplace_back(aligned_len, 0);
+        if (!data.empty()) {
+          std::memcpy(temp_buffers.back().data(), data.data(), data.size());
+        }
+        dpu_error_t status = dpu_prepare_xfer(dpu, temp_buffers.back().data());
+        checkStatus(status, "Prepare xfer (padded)");
+      } else {
+        dpu_error_t status = dpu_prepare_xfer(dpu, (void*)data.data());
+        checkStatus(status, "Prepare xfer");
       }
-      dpu_error_t status = dpu_prepare_xfer(dpu, temp_buffers.back().data());
-      checkStatus(status, "Prepare xfer (padded)");
-    } else {
-      // Use existing buffer
-      dpu_error_t status = dpu_prepare_xfer(dpu, (void*)data.data());
-      checkStatus(status, "Prepare xfer");
-    }
-  }
 
-  // Perform parallel transfer
-  dpu_error_t status = dpu_push_xfer(dpu_set_, DPU_XFER_TO_DPU, "__sys_used_mram_end", 
-                                     dpu_mram_offset, aligned_len, DPU_XFER_DEFAULT);
-  checkStatus(status, "Push xfer (scatter)");
+      ++global_idx;
+    }
+
+    dpu_error_t status = dpu_push_xfer(rank_set, DPU_XFER_TO_DPU, "__sys_used_mram_end",
+                                       dpu_mram_offset, aligned_len, DPU_XFER_DEFAULT);
+    checkStatus(status, "Push xfer (scatter rank)");
+  }
 
   if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(aligned_len) * num_dpus_active_;
 }
@@ -208,18 +247,22 @@ void DpuCommunicationManager::gatherDataParallel(
   }
 
   per_dpu_buffers.resize(num_dpus_active_);
-  
-  struct dpu_set_t dpu;
-  uint32_t each_dpu;
-  DPU_FOREACH(dpu_set_, dpu, each_dpu) {
-    per_dpu_buffers[each_dpu].resize(size_per_dpu);
-    dpu_error_t status = dpu_prepare_xfer(dpu, per_dpu_buffers[each_dpu].data());
-    checkStatus(status, "Prepare xfer (gather)");
-  }
 
-  dpu_error_t status = dpu_push_xfer(dpu_set_, DPU_XFER_FROM_DPU, "__sys_used_mram_end", 
-                                     dpu_mram_offset, size_per_dpu, DPU_XFER_DEFAULT);
-  checkStatus(status, "Push xfer (gather)");
+  size_t global_idx = 0;
+  for (auto &rank_set : rank_sets_) {
+    struct dpu_set_t dpu;
+    DPU_FOREACH(rank_set, dpu) {
+      if (global_idx >= per_dpu_buffers.size()) break;
+      per_dpu_buffers[global_idx].resize(size_per_dpu);
+      dpu_error_t status = dpu_prepare_xfer(dpu, per_dpu_buffers[global_idx].data());
+      checkStatus(status, "Prepare xfer (gather)");
+      ++global_idx;
+    }
+
+    dpu_error_t status = dpu_push_xfer(rank_set, DPU_XFER_FROM_DPU, "__sys_used_mram_end",
+                                       dpu_mram_offset, size_per_dpu, DPU_XFER_DEFAULT);
+    checkStatus(status, "Push xfer (gather rank)");
+  }
 
   if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(size_per_dpu) * num_dpus_active_;
 }
@@ -229,8 +272,10 @@ void DpuCommunicationManager::loadKernel(const char* kernel_binary_path) {
   if (async_in_progress_) {
     waitForKernels();
   }
-  dpu_error_t status = dpu_load(dpu_set_, kernel_binary_path, NULL);
-  checkStatus(status, "Kernel load (aggregate)");
+  for (auto &rank_set : rank_sets_) {
+    dpu_error_t status = dpu_load(rank_set, kernel_binary_path, NULL);
+    checkStatus(status, "Kernel load (rank)");
+  }
 }
 
 void DpuCommunicationManager::loadKernel(uint32_t dpu_id,
@@ -382,10 +427,8 @@ void DpuCommunicationManager::checkStatus(dpu_error_t status,
 }
 
 void DpuCommunicationManager::readAndPrintLog() {
-  struct dpu_set_t dpu;
-
-  DPU_FOREACH(dpu_set_, dpu) {
-    dpu_error_t status = dpu_log_read(dpu, stderr);
+  for (auto &dpu_set : dpu_sets_) {
+    dpu_error_t status = dpu_log_read(dpu_set, stderr);
     if (status != DPU_OK) {
         fprintf(stderr, "[DPU WARNING] Failed to read log from a DPU: %s\n", dpu_error_to_string(status));
     }

@@ -75,14 +75,12 @@ class DpuCommunicationManager {
   bool isSimulator() const { return is_simulator_; }
 
   // Access to raw DPU sets for advanced operations
-  struct dpu_set_t& getDpuSet() { return dpu_set_; }
   struct dpu_set_t& getDpuSet(uint32_t dpu_id) { return dpu_sets_.at(dpu_id); }
   std::vector<struct dpu_set_t> getRankSets();
   const std::vector<struct dpu_set_t>& getDpuSets() const { return dpu_sets_; }
 
  private:
-  struct dpu_set_t dpu_set_;
-  struct dpu_set_t rank_;
+  std::vector<struct dpu_set_t> rank_sets_; // one set per rank
   std::vector<struct dpu_set_t> dpu_sets_; // one set per DPU for independent control
   std::vector<bool> async_per_dpu_;
   uint32_t num_dpus_available_;
