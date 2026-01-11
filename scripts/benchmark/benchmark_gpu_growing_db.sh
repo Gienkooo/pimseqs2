@@ -5,19 +5,24 @@ set -e
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
 BUILD_DIR="$ROOT_DIR/build"
-MMSEQS_BIN="$BUILD_DIR/src/mmseqs"
+export MMSEQS_BIN="$BUILD_DIR/src/mmseqs"
 
 # Default datasets (can be overridden by environment variables)
-UNIREF_RANDOMIZED_TSV="${UNIREF_RANDOMIZED_TSV:-$ROOT_DIR/examples/uniref50_randomized.tsv}"
-QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY_gpu.fasta}"
-TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB_gpu.fasta}"
+export UNIREF_RANDOMIZED_TSV="${UNIREF_RANDOMIZED_TSV:-$ROOT_DIR/examples/export uniref50_randomized.tsv}"
+export QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY_gpu.fasta}"
+export TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB_gpu.fasta}"
 
 # Output directory
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
 
-QUERY_DB="$RESULTS_DIR/query_db"
-TARGET_DB="$RESULTS_DIR/target_db"
-TARGET_DB_PADDED="$RESULTS_DIR/target_db_padded"
+export QUERY_DB="$RESULTS_DIR/query_db"
+export TARGET_DB="$RESULTS_DIR/target_db"
+export TARGET_DB_PADDED="$RESULTS_DIR/target_db_padded"
+
+OUT_DIR="$RESULTS_DIR/ungapped_gapped"
+mkdir -p "$OUT_DIR"
+
+export GPU_DB="$OUT_DIR/ungapped_gapped_gpu_db"
 
 # Ensure MMseqs2 is built
 check_mmseqs() {
@@ -28,12 +33,10 @@ check_mmseqs() {
 
 # Prepare databases if they don't exist
 prepare_dbs() {
-    check_mmseqs
-    
     QUERY_SIZE=$1
     TARGET_SIZE=$2
 
-    rm -f "${QUERY_DB}"* "${TARGET_DB}"* "${TARGET_DB_PADDED}"*
+    rm -f "${QUERY_DB}"* "${TARGET_DB}"* "${TARGET_DB_PADDED}"* "${GPU_DB}"*
 
     echo "Creating query database..."
     tail -n +$((TARGET_SIZE + 1)) "$UNIREF_RANDOMIZED_TSV" | head -n "$QUERY_SIZE" | tr "\t" "\n" > "$QUERY_FASTA"
@@ -47,8 +50,9 @@ prepare_dbs() {
     "$MMSEQS_BIN" makepaddedseqdb "$TARGET_DB" "$TARGET_DB_PADDED" > /dev/null || echo "Failed to create padded target DB"
 }
 
-OUT_DIR="$RESULTS_DIR/ungapped_gapped"
-mkdir -p "$OUT_DIR"
+check_mmseqs
+
+export -f prepare_dbs
 
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="1000"
@@ -57,30 +61,28 @@ MAX_SEQS="10000"
 # Minimum ungapped score threshold (default 15, override with MIN_UNGAPPED env var)
 MIN_UNGAPPED="15"
 
-QUERY_DB_SIZES=( 10000 20000 40000 )
+BASE_QUERY_DB_SIZE=10000
+BASE_TARGET_DB_SIZE=100000
+MULTIPLIERS="1,2,4"
 
-for query_db_size in "${QUERY_DB_SIZES[@]}"; do
+BENCHMARK_RESULT="$OUT_DIR/bench_gpu_growing_db.json"
 
-    TARGET_SIZE=$(( query_db_size * 10 ))
-    prepare_dbs "$query_db_size" "$TARGET_SIZE"
+CMD_GPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB_PADDED\" \"$GPU_DB\" \
+--prefilter-mode 3 --comp-bias-corr 0 --gpu 1 -v 3 \
+-e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" \
+2>&1 | tee \"$OUT_DIR/ungapped_gapped_gpu_growing_db_iter_{multiplier}.log\""
 
-    GPU_DB="$OUT_DIR/ungapped_gapped_gpu_db-$query_db_size"
-    BENCHMARK_RESULT="$OUT_DIR/bench_gpu_query_db_size_of_$query_db_size.json"
+REPORT_CMD="\"$MMSEQS_BIN\" createtsv \"$QUERY_DB\" \"$TARGET_DB\" \"$GPU_DB\" \"$OUT_DIR/ungapped_gapped_gpu_growing_db_iter_{multiplier}.tsv\""
 
-    CMD_GPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB_PADDED\" \"$GPU_DB\" \
-    --prefilter-mode 3 --comp-bias-corr 0 --gpu 1 -v 3 \
-    -e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" \
-    2>&1 | tee \"$OUT_DIR/ungapped_gapped_gpu-$query_db_size.log\""
+hyperfine --warmup 0 \
+            --runs 2 \
+            --export-json "$BENCHMARK_RESULT" \
+            --show-output \
+            --shell bash \
+            --parameter-list multiplier $MULTIPLIERS \
+            --prepare "prepare_dbs \$(( {multiplier} * $BASE_QUERY_DB_SIZE )) \$(( {multiplier} * $BASE_TARGET_DB_SIZE ))" \
+            --conclude "$REPORT_CMD" \
+            --command-name "Ungapped+gapped prefilter on GPU" \
+            "$CMD_GPU_STR"
 
-    hyperfine --warmup 0 \
-                --runs 2 \
-                --export-json "$BENCHMARK_RESULT" \
-                --show-output \
-                --prepare "rm -f \"$GPU_DB\"*" \
-                --command-name "Ungapped+gapped prefilter on GPU with db sizes - query: $query_db_size, target: $TARGET_SIZE" \
-                "$CMD_GPU_STR"
-
-    "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$GPU_DB" "$OUT_DIR/ungapped_gapped_gpu-$query_db_size.tsv"
-
-    echo "[BENCHMARK] Run succeeded. Saved result to $BENCHMARK_RESULT"
-done
+echo "[BENCHMARK] Run succeeded. Saved result to $BENCHMARK_RESULT"
