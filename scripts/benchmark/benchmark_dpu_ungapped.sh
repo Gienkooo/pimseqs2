@@ -51,8 +51,8 @@ MAX_SEQS="10000"
 # Minimum ungapped score threshold (default 15, override with MIN_UNGAPPED env var)
 MIN_UNGAPPED="15"
 
-DPU_COUNTS="1,2,4,16,64,256,512,1024,2048,2556"
-DPU_COUNTS_FOR_LOOP=( 1 2 4 16 64 256 512 1024 2048 2556 )
+DPU_COUNTS="2048,1024,512,256,128,64,2496"
+DPU_COUNTS_FOR_LOOP=( 2048 1024 512 256 128 64 2496 )
 
 CMD_DPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/ungapped_dpu_db-{dpus}\" \
 --prefilter-mode 1 --comp-bias-corr 0 --dpu 1 -v 3 \

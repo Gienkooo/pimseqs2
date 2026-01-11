@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -e
 
@@ -27,15 +27,15 @@ check_mmseqs() {
 # Prepare databases if they don't exist
 prepare_dbs() {
     check_mmseqs
-    
+
     if [ ! -f "${QUERY_DB}.dbtype" ]; then
         echo "Creating query database..."
-        "$MMSEQS_BIN" createdb "$QUERY_FASTA" "$QUERY_DB" --mask 0 > /dev/null || echo "Failed to create query DB"
+        "$MMSEQS_BIN" createdb "$QUERY_FASTA" "$QUERY_DB" --mask 0
     fi
 
     if [ ! -f "${TARGET_DB}.dbtype" ]; then
         echo "Creating target database..."
-        "$MMSEQS_BIN" createdb "$TARGET_FASTA" "$TARGET_DB" --mask 0 > /dev/null || echo "Failed to create target DB"
+        "$MMSEQS_BIN" createdb "$TARGET_FASTA" "$TARGET_DB" --mask 0
     fi
 }
 
@@ -51,8 +51,8 @@ MAX_SEQS="10000"
 # Minimum ungapped score threshold (default 15, override with MIN_UNGAPPED env var)
 MIN_UNGAPPED="15"
 
-THREADS_COUNT="1,2,4,8,16,32,64,128"
-THREADS_FOR_LOOP=( 1 2 4 8 16 32 64 128 )
+THREADS_COUNT="8,16"
+THREADS_FOR_LOOP=( 8 16 )
 
 CMD_CPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/ungapped_cpu_db-{threads}\" --prefilter-mode 1 --comp-bias-corr 0 --threads {threads} -v 3 -e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" 2>&1 | tee \"$OUT_DIR/ungapped_cpu.log\""
 
@@ -65,10 +65,11 @@ fi
 
 echo "[BENCHMARK] Result will be saved to $BENCHMARK_RESULT"
 
-hyperfine --warmup 1 \
-            --runs 1 \
+hyperfine --warmup 0 \
+            --runs 2 \
             --export-json "$BENCHMARK_RESULT" \
             --parameter-list threads "$THREADS_COUNT" --show-output \
+            --prepare "rm -f \"$OUT_DIR/ungapped_cpu_db-{threads}\"*" \
             --command-name "Ungapped prefilter on CPU with {threads} threads" \
             "$CMD_CPU_STR"
 

@@ -7,7 +7,7 @@ ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
 BUILD_DIR="$ROOT_DIR/build"
 MMSEQS_BIN="$BUILD_DIR/src/mmseqs"
 
-UNIREF_RANDOMIZED_TSV="${UNIREF_RANDOMIZED_FASTA:-$ROOT_DIR/examples/uniref50_randomized.tsv}"
+UNIREF_RANDOMIZED_TSV="${UNIREF_RANDOMIZED_TSV:-$ROOT_DIR/examples/uniref50_randomized.tsv}"
 QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY_uniref50_weak.fasta}"
 TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB_uniref50_weak.fasta}"
 
@@ -95,6 +95,6 @@ for multiplier in "${MULTIPLIERS[@]}"; do
 
     echo "[BENCHMARK] Succeeded benchmarking. Saved result to $BENCHMARK_RESULT"
 
-    rm -f "${CPU_DB}"* "${TARGET_DB}"* "${QUERY_DB}"*
+    echo rm -f "${CPU_DB}"* "${TARGET_DB}"* "${QUERY_DB}"*
 done
 
