@@ -17,10 +17,15 @@ RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
 QUERY_DB="$RESULTS_DIR/query_db"
 TARGET_DB="$RESULTS_DIR/target_db"
 
+HOOK_SCRIPT="$SCRIPT_DIR/dram_energy_hook.sh"
+MERGE_SCRIPT="$SCRIPT_DIR/merge_results.py"
+ENERGY_LOG="energy_captures.txt"
+
 # Ensure MMseqs2 is built
 check_mmseqs() {
     if [ ! -x "$MMSEQS_BIN" ]; then
         echo "MMseqs2 binary not found at $MMSEQS_BIN. Please build it first."
+        exit 1
     fi
 }
 
@@ -44,6 +49,8 @@ mkdir -p "$OUT_DIR"
 
 prepare_dbs
 
+rm -f "$ENERGY_LOG"
+
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="1000"
 # Max results per query (default high to not truncate results during validation)
@@ -60,6 +67,7 @@ CMD_DPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$O
 2>&1 | tee \"$OUT_DIR/ungapped_dpu-{dpus}.log\""
 
 BENCHMARK_RESULT="$OUT_DIR/bench_dpu_ungapped_params_dpus.json"
+BENCHMARK_RAW="$OUT_DIR/bench_dpu_raw.json"
 
 if [ -f "$BENCHMARK_RESULT" ]; then
     echo "[BENCHMARK] File $BENCHMARK_RESULT exists, will rename to $BENCHMARK_RESULT.old"
@@ -68,13 +76,19 @@ fi
 
 hyperfine --warmup 0 \
             --runs 1 \
-            --export-json "$BENCHMARK_RESULT" \
+            --export-json "$BENCHMARK_RAW" \
             --parameter-list dpus "$DPU_COUNTS" --show-output \
+            --prepare "\"$HOOK_SCRIPT\" start" \
+            --cleanup "\"$HOOK_SCRIPT\" stop" \
             --command-name "Ungapped prefilter on {dpus} DPUs" \
             "$CMD_DPU_STR"
 
 for dpu_count in "${DPU_COUNTS_FOR_LOOP[@]}"; do
     "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$OUT_DIR/ungapped_dpu_db-${dpu_count}" "$OUT_DIR/ungapped_dpu-${dpu_count}.tsv"
 done
+
+echo "[BENCHMARK] Merging DRAM Energy Data..."
+
+python3 "$MERGE_SCRIPT" "$BENCHMARK_RAW" "$ENERGY_LOG" > "$BENCHMARK_RESULT"
 
 echo "[BENCHMARK] Succeeded benchmarking. Saved result to $BENCHMARK_RESULT"
