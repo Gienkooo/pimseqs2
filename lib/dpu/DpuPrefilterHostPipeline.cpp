@@ -933,7 +933,7 @@ namespace mmseqs::dpu
         // Pre-calculate max query sizes for layout
         const uint32_t max_query_len = qdbr->getMaxSeqLen();
         const uint32_t max_pssm_per_query = max_query_len * 32 + 1024;
-        const uint32_t max_queries_per_batch = 8u;
+        const uint32_t max_queries_per_batch = 64u;
 
         BatchLimits q_limits{};
         q_limits.max_queries = max_queries_per_batch;
