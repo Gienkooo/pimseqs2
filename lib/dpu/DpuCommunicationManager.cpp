@@ -6,6 +6,7 @@
 #include <string>
 #include <cstring>
 #include <stdexcept>
+#include "Debug.h"
 
 namespace mmseqs::dpu {
 
@@ -32,7 +33,7 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     if (!has_hardware) {
       profile = "backend=simulator";
       is_simulator_ = true;
-      fprintf(stderr, "[DPU] No DPU hardware detected. Using simulator profile.\n");
+      Debug(Debug::INFO) << "[DPU] No DPU hardware detected. Using simulator profile." << "\n";
     }
   } else {
     // Check if env var specifies simulator
@@ -47,7 +48,7 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
   const bool allocate_all = (num_dpus_requested == DPU_ALLOCATE_ALL);
   uint32_t remaining = allocate_all ? 0 : num_dpus_requested;
 
-  fprintf(stderr, "[DPU] Incremental rank discovery (profile=%s)\n", base_profile.c_str());
+  Debug(Debug::INFO) << "[DPU] Incremental rank discovery (profile=" << base_profile << ")\n";
 
   for (uint32_t r = 0; r < ranks_to_scan; ++r) {
     if (!allocate_all && remaining == 0) {
@@ -55,19 +56,42 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     }
 
     std::string rank_profile = base_profile + ",rank=" + std::to_string(r);
-    uint32_t request_for_rank = allocate_all ? DPU_ALLOCATE_ALL : std::min<uint32_t>(remaining, 64);
-    struct dpu_set_t rank_set;
-    dpu_error_t status = dpu_alloc(request_for_rank, rank_profile.c_str(), &rank_set);
+
+    // Probe: ask for all DPUs in this rank to learn how many are healthy.
+    struct dpu_set_t probe_set;
+    dpu_error_t status = dpu_alloc(DPU_ALLOCATE_ALL, rank_profile.c_str(), &probe_set);
     if (status != DPU_OK) {
+      Debug(Debug::INFO) << "[DPU] Info: Skipping rank " << r << " - Probe allocation failed (" << dpu_error_to_string(status) << ")\n";
       continue; // rank not present or unavailable
     }
 
     uint32_t rank_dpus = 0;
-    status = dpu_get_nr_dpus(rank_set, &rank_dpus);
+    status = dpu_get_nr_dpus(probe_set, &rank_dpus);
     if (status != DPU_OK || rank_dpus == 0) {
-      dpu_free(rank_set);
+      Debug(Debug::WARNING) << "[DPU] Warning: Skipping rank " << r << " - Probe returned " << rank_dpus << " DPUs (status: " << dpu_error_to_string(status) << ")\n";
+      dpu_free(probe_set);
       continue;
     }
+
+    // Decide how many to keep from this rank.
+    uint32_t needed = allocate_all ? rank_dpus : std::min<uint32_t>(remaining, rank_dpus);
+    struct dpu_set_t rank_set = probe_set;
+
+    if (!allocate_all && needed < rank_dpus) {
+      // We need fewer than the rank has; free probe and allocate exact count.
+      dpu_free(probe_set);
+      status = dpu_alloc(needed, rank_profile.c_str(), &rank_set);
+      if (status != DPU_OK) {
+        Debug(Debug::WARNING) << "[DPU] Warning: Skipping rank " << r << " - Exact allocation " << needed << " failed (" << dpu_error_to_string(status) << ")\n";
+        continue;
+      }
+      rank_dpus = needed;
+    } else {
+      // Keep the probe allocation as-is (either allocate_all or we need all healthy DPUs).
+      rank_dpus = needed;
+    }
+
+    Debug(Debug::INFO) << "[DPU] Success: Rank " << r << " allocated with " << rank_dpus << " DPUs\n";
 
     rank_sets_.push_back(rank_set);
 
@@ -88,18 +112,16 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
   }
 
   if (num_dpus_requested != DPU_ALLOCATE_ALL && num_dpus_active_ < num_dpus_requested) {
-    fprintf(stderr, "[DPU ERROR] Unable to allocate requested DPUs (%u requested, %u acquired)\n",
-            num_dpus_requested, num_dpus_active_);
+    Debug(Debug::ERROR) << "[DPU ERROR] Unable to allocate requested DPUs (" << num_dpus_requested << " requested, " << num_dpus_active_ << " acquired)\n";
     exit(EXIT_FAILURE);
   }
 
   if (num_dpus_active_ == 0) {
-    fprintf(stderr, "[DPU ERROR] No healthy DPUs found during incremental allocation.\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] No healthy DPUs found during incremental allocation." << "\n";
     exit(EXIT_FAILURE);
   }
 
-  fprintf(stderr, "[DPU] Allocated %u DPUs across %zu ranks (Profile: %s)\n",
-          num_dpus_active_, rank_sets_.size(), base_profile.c_str());
+  Debug(Debug::INFO) << "[DPU] Allocated " << num_dpus_active_ << " DPUs across " << rank_sets_.size() << " ranks (Profile: " << base_profile << ")\n";
 }
 
 DpuCommunicationManager::~DpuCommunicationManager() {
@@ -120,7 +142,7 @@ void DpuCommunicationManager::broadcastData(
   ScopedTimer timer(slot(ProfileSlot::Broadcast));
   
   if (dpu_mram_offset % MRAM_ALIGN != 0 || size_bytes % MRAM_ALIGN != 0) {
-    fprintf(stderr, "[DPU ERROR] MRAM offset/size not 8-byte aligned\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] MRAM offset/size not 8-byte aligned" << "\n";
     exit(EXIT_FAILURE);
   }
 
@@ -139,12 +161,12 @@ void DpuCommunicationManager::scatterDataToDPU(
   ScopedTimer timer(slot(ProfileSlot::ScatterSingle));
   
   if (dpu_id >= num_dpus_active_) {
-    fprintf(stderr, "[DPU ERROR] DPU ID %u out of range\n", dpu_id);
+    Debug(Debug::ERROR) << "[DPU ERROR] DPU ID " << dpu_id << " out of range" << "\n";
     exit(EXIT_FAILURE);
   }
 
   if (dpu_mram_offset % MRAM_ALIGN != 0 || size_bytes % MRAM_ALIGN != 0) {
-    fprintf(stderr, "[DPU ERROR] MRAM offset/size not 8-byte aligned\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] MRAM offset/size not 8-byte aligned" << "\n";
     exit(EXIT_FAILURE);
   }
 
@@ -161,12 +183,12 @@ void DpuCommunicationManager::scatterDataParallel(
   ScopedTimer timer(slot(ProfileSlot::ScatterParallel));
   
   if (per_dpu_data.size() != num_dpus_active_) {
-    fprintf(stderr, "[DPU ERROR] scatterDataParallel: data vector size mismatch\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] scatterDataParallel: data vector size mismatch" << "\n";
     exit(EXIT_FAILURE);
   }
 
   if (dpu_mram_offset % MRAM_ALIGN != 0) {
-    fprintf(stderr, "[DPU ERROR] MRAM offset not 8-byte aligned\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] MRAM offset not 8-byte aligned" << "\n";
     exit(EXIT_FAILURE);
   }
 
@@ -220,12 +242,12 @@ void DpuCommunicationManager::gatherDataFromDPU(
   ScopedTimer timer(slot(ProfileSlot::GatherSingle));
   
   if (dpu_id >= num_dpus_active_) {
-    fprintf(stderr, "[DPU ERROR] DPU ID %u out of range\n", dpu_id);
+    Debug(Debug::ERROR) << "[DPU ERROR] DPU ID " << dpu_id << " out of range" << "\n";
     exit(EXIT_FAILURE);
   }
 
   if (dpu_mram_offset % MRAM_ALIGN != 0 || size_bytes % MRAM_ALIGN != 0) {
-    fprintf(stderr, "[DPU ERROR] MRAM offset/size not 8-byte aligned\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] MRAM offset/size not 8-byte aligned" << "\n";
     exit(EXIT_FAILURE);
   }
 
@@ -242,7 +264,7 @@ void DpuCommunicationManager::gatherDataParallel(
   ScopedTimer timer(slot(ProfileSlot::GatherParallel));
   
   if (dpu_mram_offset % MRAM_ALIGN != 0 || size_per_dpu % MRAM_ALIGN != 0) {
-    fprintf(stderr, "[DPU ERROR] MRAM offset/size not 8-byte aligned\n");
+    Debug(Debug::ERROR) << "[DPU ERROR] MRAM offset/size not 8-byte aligned" << "\n";
     exit(EXIT_FAILURE);
   }
 
@@ -371,7 +393,7 @@ bool DpuCommunicationManager::isExecutionComplete() {
     dpu_error_t status = dpu_status(dpu_sets_[i], &done, &fault);
     checkStatus(status, "DPU status check (per-DPU)");
     if (fault) {
-      fprintf(stderr, "[DPU ERROR] DPU fault detected during async execution (dpu=%u)\n", i);
+      Debug(Debug::ERROR) << "[DPU ERROR] DPU fault detected during async execution (dpu=" << i << ")\n";
     }
     if (done) {
       async_per_dpu_[i] = false;
@@ -408,7 +430,7 @@ bool DpuCommunicationManager::isExecutionComplete(uint32_t dpu_id) {
   dpu_error_t status = dpu_status(dpu_sets_[dpu_id], &done, &fault);
   checkStatus(status, "DPU status check (single DPU)");
   if (fault) {
-    fprintf(stderr, "[DPU ERROR] DPU fault detected during async execution (dpu=%u)\n", dpu_id);
+    Debug(Debug::ERROR) << "[DPU ERROR] DPU fault detected during async execution (dpu=" << dpu_id << ")\n";
   }
   if (done) {
     async_per_dpu_[dpu_id] = false;
@@ -420,8 +442,7 @@ bool DpuCommunicationManager::isExecutionComplete(uint32_t dpu_id) {
 void DpuCommunicationManager::checkStatus(dpu_error_t status,
                                           const char* context) {
   if (status != DPU_OK) {
-    fprintf(stderr, "[DPU FATAL] %s failed: %s\n", context,
-            dpu_error_to_string(status));
+    Debug(Debug::ERROR) << "[DPU FATAL] " << context << " failed: " << dpu_error_to_string(status) << "\n";
     exit(EXIT_FAILURE);
   }
 }
@@ -430,7 +451,7 @@ void DpuCommunicationManager::readAndPrintLog() {
   for (auto &dpu_set : dpu_sets_) {
     dpu_error_t status = dpu_log_read(dpu_set, stderr);
     if (status != DPU_OK) {
-        fprintf(stderr, "[DPU WARNING] Failed to read log from a DPU: %s\n", dpu_error_to_string(status));
+      Debug(Debug::WARNING) << "[DPU WARNING] Failed to read log from a DPU: " << dpu_error_to_string(status) << "\n";
     }
     fflush(stderr);
   }
@@ -461,19 +482,15 @@ void DpuCommunicationManager::dumpProfile(const char* tag) const {
     "wait_async"
   };
 
-  fprintf(stderr, "[DPU PROFILE] %s\n", tag ? tag : "comm");
+  Debug(Debug::INFO) << "[DPU PROFILE] " << (tag ? tag : "comm") << "\n";
   for (size_t i = 0; i < static_cast<size_t>(ProfileSlot::Count); ++i) {
     const auto &e = profile_[i];
     if (e.count == 0) continue;
     double avg = e.total_ms / static_cast<double>(e.count);
     double mb = e.bytes / (1024.0 * 1024.0);
-    fprintf(stderr, "  %-17s count=%6llu total=%10.3f ms avg=%8.3f ms max=%8.3f ms bytes=%.2f MB\n",
-            kNames[i],
-            static_cast<unsigned long long>(e.count),
-            e.total_ms,
-            avg,
-            e.max_ms,
-            mb);
+    Debug(Debug::INFO) << "  " << kNames[i] << " count=" << static_cast<unsigned long long>(e.count)
+                       << " total=" << e.total_ms << " ms avg=" << avg << " ms max=" << e.max_ms
+                       << " ms bytes=" << mb << " MB\n";
   }
 }
 

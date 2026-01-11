@@ -844,49 +844,61 @@ namespace mmseqs::dpu
 
             std::vector<std::vector<GappedHit>> prev_hits(num_dpus);
             std::vector<bool> dpu_active(num_dpus, false);
+            std::vector<bool> dpu_ready(num_dpus, false);
             bool prev_active = false;
             uint32_t prev_qKey = 0;
             uint32_t prev_qLen = 0;
             size_t prev_qId_val = 0;
             size_t inflight_groups = 0;
 
-            auto gatherChecked = [&](uint32_t dpu_id) {
-                uint64_t hdr = 0;
-                dpu_comm_.gatherDataFromDPU(dpu_id, &hdr, 8, layouts[dpu_id].results_offset);
-                const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-                const uint32_t max_hits = maxHitsPerDpu[dpu_id];
-                if (hit_count > max_hits) {
-                    Debug(Debug::ERROR) << "[DPU] Gapped batch overflow detected for DPU " << dpu_id
-                                        << " (hits=" << hit_count << ", max=" << max_hits << ")";
-                    EXIT(EXIT_FAILURE);
-                }
-                if (hit_count == 0) return std::vector<GappedHit>{};
-
-                const uint32_t data_size = hit_count * static_cast<uint32_t>(sizeof(GappedHit));
-                const uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
-                std::vector<GappedHit> hits(hit_count);
-                if (aligned_size != data_size) {
-                    std::vector<uint8_t> buf(aligned_size);
-                    dpu_comm_.gatherDataFromDPU(dpu_id, buf.data(), aligned_size, layouts[dpu_id].results_offset + 8);
-                    memcpy(hits.data(), buf.data(), data_size);
-                } else {
-                    dpu_comm_.gatherDataFromDPU(dpu_id, hits.data(), aligned_size, layouts[dpu_id].results_offset + 8);
-                }
-                return hits;
-            };
-
             auto drainPrevResults = [&]() {
                 while (inflight_groups > 0) {
-                    size_t drained = dispatcher.drainCompleted([&](uint32_t d) {
+                    size_t drained_groups = dispatcher.drainCompleted([&](uint32_t d) {
                         if (!dpu_active[d]) return;
-                        prev_hits[d] = gatherChecked(d);
-                        dpu_active[d] = false;
+                        dpu_ready[d] = true;
                     });
-                    if (drained == 0) {
+                    if (drained_groups == 0) {
                         dispatcher.poll();
                         usleep(100);
                     } else {
-                        inflight_groups -= drained;
+                        inflight_groups -= drained_groups;
+
+                        // Parallel header gather for all ready DPUs
+                        std::vector<std::vector<uint8_t>> header_bufs(num_dpus);
+                        for (uint32_t d = 0; d < num_dpus; ++d) {
+                            if (dpu_ready[d]) header_bufs[d].resize(8);
+                        }
+                        dpu_comm_.gatherDataParallel(header_bufs, 8, layouts[0].results_offset);
+
+                        for (uint32_t d = 0; d < num_dpus; ++d) {
+                            if (!dpu_ready[d]) continue;
+
+                            uint64_t hdr = 0;
+                            memcpy(&hdr, header_bufs[d].data(), 8);
+                            const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+                            const uint32_t max_hits = maxHitsPerDpu[d];
+                            if (hit_count > max_hits) {
+                                Debug(Debug::ERROR) << "[DPU] Gapped batch overflow detected for DPU " << d
+                                                    << " (hits=" << hit_count << ", max=" << max_hits << ")";
+                                EXIT(EXIT_FAILURE);
+                            }
+                            if (hit_count > 0) {
+                                const uint32_t data_size = hit_count * static_cast<uint32_t>(sizeof(GappedHit));
+                                const uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
+                                std::vector<GappedHit> hits(hit_count);
+                                if (aligned_size != data_size) {
+                                    std::vector<uint8_t> buf(aligned_size);
+                                    dpu_comm_.gatherDataFromDPU(d, buf.data(), aligned_size, layouts[d].results_offset + 8);
+                                    memcpy(hits.data(), buf.data(), data_size);
+                                } else {
+                                    dpu_comm_.gatherDataFromDPU(d, hits.data(), aligned_size, layouts[d].results_offset + 8);
+                                }
+                                prev_hits[d] = std::move(hits);
+                            }
+
+                            dpu_active[d] = false;
+                            dpu_ready[d] = false;
+                        }
                     }
                 }
             };
