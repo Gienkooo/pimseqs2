@@ -21,6 +21,8 @@ HOOK_SCRIPT="$SCRIPT_DIR/dram_energy_hook.sh"
 MERGE_SCRIPT="$SCRIPT_DIR/merge_results.py"
 ENERGY_LOG="energy_captures.txt"
 
+ENABLE_ENERGY="${ENABLE_ENERGY:-false}"
+
 # Ensure MMseqs2 is built
 check_mmseqs() {
     if [ ! -x "$MMSEQS_BIN" ]; then
@@ -81,21 +83,34 @@ if [ -f "$BENCHMARK_RESULT" ]; then
     mv "$BENCHMARK_RESULT" "$BENCHMARK_RESULT.old"
 fi
 
-hyperfine --warmup 0 \
-            --runs 1 \
-            --export-json "$BENCHMARK_RAW" \
-            --parameter-list dpus "$DPU_COUNTS" --show-output \
-            --prepare "\"$HOOK_SCRIPT\" start" \
-            --cleanup "\"$HOOK_SCRIPT\" stop" \
-            --command-name "Mode $PREFILTER_MODE prefilter on {dpus} DPUs" \
-            "$CMD_DPU_STR"
+HF_ARGS=(
+    --warmup 0
+    --runs 1
+    --export-json "$BENCHMARK_RAW"
+    --parameter-list dpus "$DPU_COUNTS"
+    --show-output
+    --command-name "Mode $PREFILTER_MODE prefilter on {dpus} DPUs"
+)
+
+if [ "$ENABLE_ENERGY" == "true" ]; then
+    echo "[BENCHMARK] Energy Measurement ENABLED (DRAM)"
+    HF_ARGS+=(--prepare "\"$HOOK_SCRIPT\" start")
+    HF_ARGS+=(--cleanup "\"$HOOK_SCRIPT\" stop")
+else
+    echo "[BENCHMARK] Energy Measurement DISABLED (Time only)"
+fi
+
+hyperfine "${HF_ARGS[@]}" "$CMD_DPU_STR"
 
 for dpu_count in "${DPU_COUNTS_FOR_LOOP[@]}"; do
     "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$OUT_DIR/${PREFILTER_MODE_NAME}_dpu_db-${dpu_count}" "$OUT_DIR/${PREFILTER_MODE_NAME}_dpu-${dpu_count}.tsv"
 done
 
-echo "[BENCHMARK] Merging DRAM Energy Data..."
-
-python3 "$MERGE_SCRIPT" "$BENCHMARK_RAW" "$ENERGY_LOG" > "$BENCHMARK_RESULT"
+if [ "$ENABLE_ENERGY" == "true" ]; then
+    echo "[BENCHMARK] Merging DRAM Energy Data..."
+    python3 "$MERGE_SCRIPT" "$BENCHMARK_RAW" "$ENERGY_LOG" > "$BENCHMARK_RESULT"
+else
+    cp "$BENCHMARK_RAW" "$BENCHMARK_RESULT"
+fi
 
 echo "[BENCHMARK] Succeeded benchmarking. Saved result to $BENCHMARK_RESULT"
