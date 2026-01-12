@@ -44,7 +44,14 @@ prepare_dbs() {
     fi
 }
 
-OUT_DIR="$RESULTS_DIR/ungapped"
+PREFILTER_MODE="1"
+PREFILTER_MODE_NAME="ungapped"
+
+if [[ "$PREFILTER_MODE" == "3" ]]; then
+    PREFILTER_MODE_NAME="ungapped_gapped"
+fi
+
+OUT_DIR="$RESULTS_DIR/$PREFILTER_MODE_NAME"
 mkdir -p "$OUT_DIR"
 
 prepare_dbs
@@ -61,12 +68,12 @@ MIN_UNGAPPED="15"
 DPU_COUNTS="2048,1024,512,256,128,64,2496"
 DPU_COUNTS_FOR_LOOP=( 2048 1024 512 256 128 64 2496 )
 
-CMD_DPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/ungapped_dpu_db-{dpus}\" \
---prefilter-mode 1 --comp-bias-corr 0 --dpu 1 -v 3 \
+CMD_DPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/${PREFILTER_MODE_NAME}_dpu_db-{dpus}\" \
+--prefilter-mode \"$PREFILTER_MODE\" --comp-bias-corr 0 --dpu 1 -v 3 \
 -e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" --dpu-num-dpus \"{dpus}\" \
-2>&1 | tee \"$OUT_DIR/ungapped_dpu-{dpus}.log\""
+2>&1 | tee \"$OUT_DIR/${PREFILTER_MODE_NAME}_dpu-{dpus}.log\""
 
-BENCHMARK_RESULT="$OUT_DIR/bench_dpu_ungapped_params_dpus.json"
+BENCHMARK_RESULT="$OUT_DIR/bench_dpu_${PREFILTER_MODE_NAME}_params_dpus.json"
 BENCHMARK_RAW="$OUT_DIR/bench_dpu_raw.json"
 
 if [ -f "$BENCHMARK_RESULT" ]; then
@@ -80,11 +87,11 @@ hyperfine --warmup 0 \
             --parameter-list dpus "$DPU_COUNTS" --show-output \
             --prepare "\"$HOOK_SCRIPT\" start" \
             --cleanup "\"$HOOK_SCRIPT\" stop" \
-            --command-name "Ungapped prefilter on {dpus} DPUs" \
+            --command-name "Mode $PREFILTER_MODE prefilter on {dpus} DPUs" \
             "$CMD_DPU_STR"
 
 for dpu_count in "${DPU_COUNTS_FOR_LOOP[@]}"; do
-    "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$OUT_DIR/ungapped_dpu_db-${dpu_count}" "$OUT_DIR/ungapped_dpu-${dpu_count}.tsv"
+    "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$OUT_DIR/${PREFILTER_MODE_NAME}_dpu_db-${dpu_count}" "$OUT_DIR/${PREFILTER_MODE_NAME}_dpu-${dpu_count}.tsv"
 done
 
 echo "[BENCHMARK] Merging DRAM Energy Data..."
