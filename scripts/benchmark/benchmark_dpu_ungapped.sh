@@ -36,12 +36,12 @@ prepare_dbs() {
     check_mmseqs
     
     if [ ! -f "${QUERY_DB}.dbtype" ]; then
-        echo "Creating query database..."
+        echo "Creating query database from $QUERY_FASTA"
         "$MMSEQS_BIN" createdb "$QUERY_FASTA" "$QUERY_DB" --mask 0 > /dev/null || echo "Failed to create query DB"
     fi
 
     if [ ! -f "${TARGET_DB}.dbtype" ]; then
-        echo "Creating target database..."
+        echo "Creating target database from $TARGET_FASTA"
         "$MMSEQS_BIN" createdb "$TARGET_FASTA" "$TARGET_DB" --mask 0 > /dev/null || echo "Failed to create target DB"
     fi
 }
@@ -59,6 +59,9 @@ mkdir -p "$OUT_DIR"
 prepare_dbs
 
 rm -f "$ENERGY_LOG"
+
+QUERY_DB_SIZE=$(( $(wc -l < "$QUERY_FASTA") / 2 ))
+TARGET_DB_SIZE=$(( $(wc -l < "$TARGET_FASTA") / 2 ))
 
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="1000"
@@ -89,13 +92,13 @@ HF_ARGS=(
     --export-json "$BENCHMARK_RAW"
     --parameter-list dpus "$DPU_COUNTS"
     --show-output
-    --command-name "Mode $PREFILTER_MODE prefilter on {dpus} DPUs"
+    --command-name "Mode $PREFILTER_MODE prefilter on {dpus} DPUs (db sizes: query $QUERY_DB_SIZE, target $TARGET_DB_SIZE)"
 )
 
 if [ "$ENABLE_ENERGY" == "true" ]; then
     echo "[BENCHMARK] Energy Measurement ENABLED (DRAM)"
-    HF_ARGS+=(--prepare "\"$HOOK_SCRIPT\" start")
-    HF_ARGS+=(--cleanup "\"$HOOK_SCRIPT\" stop")
+    HF_ARGS+=(--prepare "sudo \"$HOOK_SCRIPT\" start")
+    HF_ARGS+=(--cleanup "sudo \"$HOOK_SCRIPT\" stop")
 else
     echo "[BENCHMARK] Energy Measurement DISABLED (Time only)"
 fi
