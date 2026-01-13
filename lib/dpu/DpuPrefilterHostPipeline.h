@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <vector>
+#include <future>
 
 class SequenceLookup;
 class Sequence;
@@ -22,6 +23,8 @@ class EvalueComputation;
 class QueryMatcherTaxonomyHook;
 
 namespace mmseqs::dpu {
+
+struct DpuIndexBuffer;
 
 class DpuPrefilterHostPipeline {
  public:
@@ -167,6 +170,40 @@ class DpuPrefilterHostPipeline {
       ScoreMatrix* extMatThree,
       const std::string& spacedPatternStr,
       bool takeOnlyBestKmer);
+  
+  // K-mer batch helpers
+  struct KmerRunContext;
+  
+  // Double-buffered batch data for async pipeline
+  struct KmerBatchData {
+      std::vector<KmerQueryPacket> packets;
+      std::vector<size_t> query_indices;  // Queries present in this batch
+      size_t packet_count;
+      bool valid;  // Indicates if this batch has data to process
+      
+      KmerBatchData() : packet_count(0), valid(false) {}
+  };
+  
+  std::vector<std::vector<uint8_t>> prepareKmerDescriptors(
+      const KmerRunContext& ctx,
+      const std::vector<DpuIndexBuffer>& wave_indices,
+      const std::vector<std::vector<uint32_t>>& splits,
+      uint32_t num_packets,
+      size_t wave_start,
+      size_t wave_size);
+  
+  std::vector<std::vector<KmerDoubleHit>> executeKmerBatchWithOverflow(
+      const KmerRunContext& ctx,
+      const std::vector<std::vector<uint8_t>>& descriptors);
+  
+  // Async pipeline helper: sends batch to DPUs and executes kernel
+  std::vector<std::vector<KmerDoubleHit>> processBatchOnDpu(
+      const KmerRunContext& ctx,
+      const KmerBatchData& batch,
+      const std::vector<DpuIndexBuffer>& wave_indices,
+      const std::vector<std::vector<uint32_t>>& splits,
+      size_t wave_start,
+      size_t wave_size);
   
   void runDpuUngappedBatch(
       Parameters& par,

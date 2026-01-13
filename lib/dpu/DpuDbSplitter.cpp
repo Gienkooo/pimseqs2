@@ -2,131 +2,100 @@
 #include "Debug.h"
 #include <algorithm>
 #include <cmath>
-#include <queue>
+#include <vector> 
 
 namespace mmseqs::dpu {
 
-std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabase(
-    DBReader<unsigned int>* tdbr,
-    uint32_t num_dpus,
-    size_t mram_limit_bytes,
-    uint32_t max_seqs_per_dpu
-) {
-    size_t total_seqs = tdbr->getSize();
-    size_t total_estimated_bytes = 0;
-    
-    // 1. Gather Metadata and Sort
-    std::vector<SequenceMetadata> seqs;
-    seqs.reserve(total_seqs);
-    
-    for (size_t i = 0; i < total_seqs; ++i) {
-        uint32_t key = tdbr->getDbKey(i);
-        uint32_t len = tdbr->getSeqLen(i);
-        size_t size = estimateSequenceSizeBytes(len);
+    std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabase(
+        DBReader<unsigned int>* tdbr,
+        uint32_t num_dpus,
+        size_t mram_limit_bytes,
+        uint32_t max_seqs_per_dpu
+    ) {
+        size_t total_seqs = tdbr->getSize();
         
-        // Safety check
-        if (size > mram_limit_bytes) {
-            Debug(Debug::ERROR) << "[DPU] Sequence " << key << " is too large (" 
-                                << size/1024/1024 << "MB) for DPU MRAM limit (" 
-                                << mram_limit_bytes/1024/1024 << "MB)\n";
-            return {};
-        }
+        // 1. Gather Metadata
+        std::vector<SequenceMetadata> seqs;
+        seqs.reserve(total_seqs);
         
-        seqs.push_back({key, len, size});
-        total_estimated_bytes += size;
-    }
-
-    // Sort Descending (Longest Processing Time first)
-    std::sort(seqs.begin(), seqs.end(), [](const SequenceMetadata& a, const SequenceMetadata& b) {
-        return a.estimated_size > b.estimated_size;
-    });
-
-    // 2. Calculate Theoretical Minimum Waves
-    size_t min_chunks_by_seq = (total_seqs + max_seqs_per_dpu - 1) / max_seqs_per_dpu;
-    size_t min_chunks_by_ram = (total_estimated_bytes + mram_limit_bytes - 1) / mram_limit_bytes;
-    size_t min_chunks = std::max(min_chunks_by_seq, min_chunks_by_ram);
-
-    // Round up to multiple of DPUs to minimize idle DPUs in the final wave
-    size_t num_waves = (min_chunks + num_dpus - 1) / num_dpus;
-    
-    // We start with this optimal number of waves. 
-    // If packing fails (fragmentation), we increment waves.
-    while (true) {
-        size_t num_chunks = num_waves * num_dpus;
-        
-        // Priority Queue to keep track of the "emptiest" chunk
-        // Min-heap based on current_estimated_bytes
-        auto cmp = [](const DpuChunk* a, const DpuChunk* b) {
-            return a->current_estimated_bytes > b->current_estimated_bytes;
-        };
-        std::priority_queue<DpuChunk*, std::vector<DpuChunk*>, decltype(cmp)> pq(cmp);
-        
-        // Allocate chunks
-        std::vector<DpuChunk> chunks(num_chunks);
-        for (size_t i = 0; i < num_chunks; ++i) {
-            chunks[i].sequence_ids.reserve(total_seqs / num_chunks); // heuristic reserve
-            pq.push(&chunks[i]);
+        for (size_t i = 0; i < total_seqs; ++i) {
+            uint32_t key = tdbr->getDbKey(i);
+            uint32_t len = tdbr->getSeqLen(i);
+            size_t size = estimateSequenceSizeBytes(len);
+            
+            if (size > mram_limit_bytes) {
+                Debug(Debug::ERROR) << "[DPU] Sequence " << key << " is too large (" 
+                                    << size/1024/1024 << "MB) for DPU MRAM limit (" 
+                                    << mram_limit_bytes/1024/1024 << "MB)\n";
+                return {};
+            }
+            
+            seqs.push_back({key, len, size});
         }
 
-        bool fit_successful = true;
+        // Sort Descending 
+        std::sort(seqs.begin(), seqs.end(), [](const SequenceMetadata& a, const SequenceMetadata& b) {
+            return a.estimated_size > b.estimated_size;
+        });
 
-        // 3. Distribute Sequences
+        // 2. Greedy Linear Packing
+        std::vector<DpuChunk> chunks;
+        if (!seqs.empty()) {
+            chunks.emplace_back(); 
+        }
+
         for (const auto& seq : seqs) {
-            // Get the least loaded chunk
-            DpuChunk* best_chunk = pq.top();
-            pq.pop();
-
-            // Check Hard Constraints
-            bool size_ok = (best_chunk->current_estimated_bytes + seq.estimated_size) <= mram_limit_bytes;
-            bool count_ok = (best_chunk->current_seq_count + 1) <= max_seqs_per_dpu;
+            DpuChunk& current = chunks.back();
+            
+            bool size_ok = (current.current_estimated_bytes + seq.estimated_size) <= mram_limit_bytes;
+            bool count_ok = (current.current_seq_count + 1) <= max_seqs_per_dpu;
 
             if (size_ok && count_ok) {
-                // Add to chunk
-                best_chunk->sequence_ids.push_back(seq.db_key);
-                best_chunk->current_seq_count++;
-                best_chunk->current_estimated_bytes += seq.estimated_size;
-                best_chunk->current_total_length += seq.length;
-                pq.push(best_chunk);
+                // Fits in current chunk
+                current.sequence_ids.push_back(seq.db_key);
+                current.current_seq_count++;
+                current.current_estimated_bytes += seq.estimated_size;
+                current.current_total_length += seq.length;
             } else {
-                // The least loaded chunk cannot fit this sequence.
-                // This implies NO chunk can fit it (since we picked the emptiest).
-                // We need more capacity (more waves).
-                fit_successful = false;
-                break;
+                // Must start a new chunk
+                chunks.emplace_back();
+                DpuChunk& next = chunks.back();
+                
+                // We already validated that the seq fits in an empty chunk in step 1
+                next.sequence_ids.push_back(seq.db_key);
+                next.current_seq_count++;
+                next.current_estimated_bytes += seq.estimated_size;
+                next.current_total_length += seq.length;
             }
         }
 
-        if (fit_successful) {
-            // Convert to output format
-            std::vector<std::vector<uint32_t>> result;
-            result.reserve(num_chunks);
-            
-            size_t min_load = SIZE_MAX, max_load = 0;
-            
-            for (const auto& chunk : chunks) {
-                // We filter out completely empty chunks if we allocated too many
-                // (Though usually we want to keep them to maintain wave alignment, 
-                // but empty chunks in a wave just mean idle DPUs, which is unavoidable if total data is small)
-                if (!chunk.sequence_ids.empty()) {
-                    result.push_back(chunk.sequence_ids);
-                    min_load = std::min(min_load, chunk.current_estimated_bytes);
-                    max_load = std::max(max_load, chunk.current_estimated_bytes);
-                }
+        // 3. Convert to output format
+        std::vector<std::vector<uint32_t>> result;
+        result.reserve(chunks.size());
+        
+        size_t min_load = 0;
+        size_t max_load = 0;
+        if (!chunks.empty()) min_load = SIZE_MAX;
+        
+        for (const auto& chunk : chunks) {
+            if (!chunk.sequence_ids.empty()) {
+                result.push_back(chunk.sequence_ids);
+                size_t bytes = chunk.current_estimated_bytes;
+                if (bytes < min_load) min_load = bytes;
+                if (bytes > max_load) max_load = bytes;
             }
-            
-            Debug(Debug::INFO) << "[DPU] Database split into " << result.size() 
-                               << " chunks (" << num_waves << " waves)." 
-                               << " Load Balance (Bytes): Min=" << min_load/1024 
-                               << "KB Max=" << max_load/1024 << "KB\n";
-            return result;
         }
-
-        // 4. Retry Logic 
-        // If we failed, it means fragmentation prevented perfect packing.
-        // Add exactly one wave of capacity.
-        num_waves++;
-        Debug(Debug::INFO) << "[DPU] Packing constraints triggered. Increasing to " << num_waves << " waves...\n";
+        
+        size_t num_waves = 0;
+        if (num_dpus > 0) {
+            num_waves = (result.size() + num_dpus - 1) / num_dpus;
+        }
+        
+        Debug(Debug::INFO) << "[DPU] Database split into " << result.size() 
+                        << " chunks (" << num_waves << " waves)." 
+                        << " Load Balance (Bytes): Min=" << min_load/1024 
+                        << "KB Max=" << max_load/1024 << "KB\n";
+        return result;
     }
-}
 
 } // namespace mmseqs::dpu
