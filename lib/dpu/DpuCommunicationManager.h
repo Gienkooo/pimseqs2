@@ -88,6 +88,8 @@ class DpuCommunicationManager {
   bool async_in_progress_ = false;
   bool is_simulator_ = false;
   bool profile_enabled_ = false;
+  bool allocated_from_system_ = false;
+  struct dpu_set_t system_set_;
 
   struct ProfileEntry {
     uint64_t count = 0;
