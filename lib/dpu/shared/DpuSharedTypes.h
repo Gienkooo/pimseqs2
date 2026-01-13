@@ -273,7 +273,8 @@ typedef struct {
     uint32_t query_id;
     uint32_t query_len;
     uint32_t pssm_offset_in_batch;
-    uint32_t padding;
+    uint8_t  bias;
+    uint8_t  pad[3];
 } __attribute__((packed)) QueryMetadata;
 
 DPU_STATIC_ASSERT(sizeof(QueryMetadata) == 16, "QueryMetadata must be 16 bytes");

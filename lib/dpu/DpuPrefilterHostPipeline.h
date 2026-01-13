@@ -13,9 +13,11 @@
 #include "Matcher.h"
 #include "QueryMatcher.h"
 
+#include <memory>
 #include <vector>
 
 class SequenceLookup;
+class Sequence;
 class EvalueComputation;
 class QueryMatcherTaxonomyHook;
 
@@ -49,6 +51,27 @@ class DpuPrefilterHostPipeline {
   DpuWorkflow workflow_;
   DpuKernelManager kernel_mgr_; 
 
+  // Shared batch container for query packing across gapped/combined modes.
+  struct BatchData {
+      std::vector<QueryMetadata> meta;
+      std::vector<uint8_t> pssm;
+      std::vector<uint32_t> keys;
+      std::vector<uint32_t> lens;
+            std::vector<size_t> qids; // global query indices
+      uint32_t max_q_len = 0;
+      int16_t min_score = 32767;
+      uint32_t common_size = 0;
+      size_t next_q_idx = 0;
+      bool empty = true;
+            std::shared_ptr<std::vector<uint8_t>> common_buffer;
+  };
+
+  struct BatchLimits {
+      uint32_t max_queries;
+      uint32_t max_pssm_bytes;
+      uint32_t max_common_bytes;
+  };
+
   struct TargetChunk {
       bool valid = false;
       size_t count = 0;
@@ -69,6 +92,27 @@ class DpuPrefilterHostPipeline {
       uint32_t scratch_bytes,
       size_t descriptor_size,
       size_t result_size);
+
+  BatchData buildQueryBatch(
+      size_t start_q_idx,
+      DBReader<unsigned int>* qdbr,
+      BaseMatrix* subMat,
+      const Parameters& par,
+      std::vector<float>& compBiasBuffer,
+      const BatchLimits& limits,
+      EvalueComputation* evaluer,
+    int16_t minScoreThr,
+    Sequence* seqMapper);
+
+  void processDpuHits(
+      const std::vector<std::vector<GappedHit>>& dpu_hits,
+      const BatchData& batch,
+      DBReader<unsigned int>* tdbr,
+      const Parameters& par,
+      EvalueComputation* evaluer,
+      bool sameDB,
+      QueryMatcherTaxonomyHook* taxonomyHook,
+      std::vector<std::vector<Matcher::result_t>>& out_results);
 
   bool canFitAtLeastOneTarget(
       uint32_t num_dpus,
@@ -156,6 +200,11 @@ class DpuPrefilterHostPipeline {
       QueryMatcherTaxonomyHook* taxonomyHook,
       bool sameDB,
       DBWriter& resultWriter);
+
+  std::vector<int8_t> extractPSSMFromProfile(
+      const char* profileData,
+      uint32_t seqlen,
+      BaseMatrix* subMat);
 
   std::vector<int8_t> buildPSSMFromSequence(
       const char* sequence, uint32_t seq_len, BaseMatrix* subMat,
