@@ -7,7 +7,7 @@
 #include <string>
 #include <cstring>
 #include <stdexcept>
-#include <unistd.h>
+#include <chrono>
 #include "Debug.h"
 
 namespace mmseqs::dpu {
@@ -60,8 +60,13 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
   }
   allocated_from_system_ = true;
 
+  const char* health_check_env = getenv("DPU_HEALTH_CHECK");
+  bool do_health_check = health_check_env && std::strcmp(health_check_env, "1") == 0;
+  double health_check_time = 0.0;
+
   // Diagnostic health check
-  if (!is_simulator_) {
+  if (!is_simulator_ && do_health_check) {
+    auto start = std::chrono::high_resolution_clock::now();
     std::string boot_kernel_path = DpuKernelManager::resolvePath(DpuKernelManager::KernelType::BOOT);
     status = dpu_load(system_set_, boot_kernel_path.c_str(), NULL);
     if (status != DPU_OK) {
@@ -69,6 +74,8 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
       dpu_free(system_set_);
       exit(EXIT_FAILURE);
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    health_check_time += std::chrono::duration<double>(end - start).count();
   }
 
   struct dpu_set_t rank;
@@ -76,8 +83,11 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     if (!allocate_all && num_dpus_active_ >= num_dpus_requested) break;
 
     bool healthy = true;
-    if (!is_simulator_) {
+    if (!is_simulator_ && do_health_check) {
+      auto start = std::chrono::high_resolution_clock::now();
       status = dpu_launch(rank, DPU_SYNCHRONOUS);
+      auto end = std::chrono::high_resolution_clock::now();
+      health_check_time += std::chrono::duration<double>(end - start).count();
       if (status != DPU_OK) {
         Debug(Debug::WARNING) << "[DPU] Warning: Rank failed diagnostics (" << dpu_error_to_string(status) << ") -> EXCLUDED\n";
         healthy = false;
@@ -106,6 +116,10 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
   if (num_dpus_active_ == 0) {
     Debug(Debug::ERROR) << "[DPU ERROR] No healthy DPUs found during incremental allocation." << "\n";
     exit(EXIT_FAILURE);
+  }
+
+  if (!is_simulator_ && do_health_check) {
+    Debug(Debug::INFO) << "[DPU] Health check completed in " << health_check_time << " s\n";
   }
 
   Debug(Debug::INFO) << "[DPU] Allocated " << num_dpus_active_ << " DPUs across " << rank_sets_.size() << " ranks (Profile: " << base_profile << ")\n";
