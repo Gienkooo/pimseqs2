@@ -44,3 +44,5 @@ build.old/
 .vscode/
 vsc.code-workspace
 scripts/validation/results/
+scripts/benchmark/results/
+scripts/tmp_compare/

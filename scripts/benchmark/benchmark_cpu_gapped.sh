@@ -40,23 +40,40 @@ prepare_dbs() {
     fi
 }
 
-OUT_DIR="$RESULTS_DIR/ungapped"
+OUT_DIR="$RESULTS_DIR/gapped"
 mkdir -p "$OUT_DIR"
+
+E_VALUE="${E_VALUE:-1000}"
+# Max results per query (default high to not truncate results during validation)
+MAX_SEQS="${MAX_SEQS:-10000}"
+
+echo "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS"
 
 prepare_dbs
 
-# E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
-E_VALUE="1000"
-# Max results per query (default high to not truncate results during validation)
-MAX_SEQS="10000"
-# Minimum ungapped score threshold (default 15, override with MIN_UNGAPPED env var)
-MIN_UNGAPPED="15"
+QUERY_DB_SIZE=$(( $(wc -l < "$QUERY_FASTA") / 2 ))
+TARGET_DB_SIZE=$(( $(wc -l < "$TARGET_FASTA") / 2 ))
 
-THREADS_COUNT="8,6,4,2,1"
 
-CMD_CPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/ungapped_cpu_db-{threads}\" --prefilter-mode 1 --comp-bias-corr 0 --threads {threads} -v 3 -e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" 2>&1 | tee \"$OUT_DIR/ungapped_cpu.log\""
+CANDIDATE_DB="$OUT_DIR/candidate_db"
+rm -f "${CANDIDATE_DB}"*
 
-BENCHMARK_RESULT="$ROOT_DIR/bench_cpu_ungapped_params_threads.json"
+CPU_DB="$OUT_DIR/gapped_cpu_db-{threads}"
+
+echo "Generating candidate pairs with CPU prefilter..."
+"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$CANDIDATE_DB" \
+    --threads "$(nproc)" --prefilter-mode 2 --dpu 0 -v 3 \
+    > "$OUT_DIR/candidate_gen.log" 2>&1
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    cat "$OUT_DIR/candidate_gen.log"
+    error "Candidate generation failed"
+fi
+
+THREADS_COUNT="16,12,8,6,4,2,1"
+
+CMD_CPU_STR="\"$MMSEQS_BIN\" align \"$QUERY_DB\" \"$TARGET_DB\" \"$CANDIDATE_DB\" \"$CPU_DB\" --threads {threads} -v 3 -e \"$E_VALUE\" --comp-bias-corr 0 2>&1 | tee \"$OUT_DIR/gapped_cpu.log\""
+    
+BENCHMARK_RESULT="$ROOT_DIR/bench_cpu_gapped_params_threads.json"
 
 if [ -f "$BENCHMARK_RESULT" ]; then
     echo "[BENCHMARK] File $BENCHMARK_RESULT exists, will rename to $BENCHMARK_RESULT.old"
@@ -68,9 +85,9 @@ echo "[BENCHMARK] Result will be saved to $BENCHMARK_RESULT"
 hyperfine --warmup 0 \
             --runs 2 \
             --export-json "$BENCHMARK_RESULT" \
-            --parameter-list threads "$THREADS_COUNT" --show-output \
-            --prepare "rm -f \"$OUT_DIR/ungapped_cpu_db-{threads}\"*" \
-            --command-name "Ungapped prefilter on CPU with {threads} threads" \
+            --parameter-list threads "$THREADS_COUNT" \
+            --show-output \
+            --command-name "Gapped align on CPU with {threads} threads (db sizes: query $QUERY_DB_SIZE, target $TARGET_DB_SIZE)" \
             "$CMD_CPU_STR"
 
 echo "[BENCHMARK] Succeeded benchmarking. Saved result to $BENCHMARK_RESULT"
