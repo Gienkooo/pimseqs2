@@ -7,7 +7,7 @@ namespace mmseqs::dpu {
 
 class DpuKernelManager {
 public:
-    enum class KernelType { KMER, UNGAPPED, GAPPED, COMBINED, NONE };
+    enum class KernelType { KMER, UNGAPPED, GAPPED, COMBINED, BOOT, NONE };
 
     explicit DpuKernelManager(DpuCommunicationManager& comm) 
         : comm_(comm), lastLoadedKernel_(KernelType::NONE) {}
@@ -24,17 +24,14 @@ public:
         lastLoadedKernel_ = type;
     }
 
-private:
-    DpuCommunicationManager& comm_;
-    KernelType lastLoadedKernel_;
-
-    std::string resolvePath(KernelType type) {
+    static std::string resolvePath(KernelType type) {
         std::string name;
         switch (type) {
             case KernelType::KMER:     name = "kmer_prefilter"; break;
             case KernelType::UNGAPPED: name = "ungapped_prefilter"; break;
             case KernelType::GAPPED:   name = "gapped_prefilter"; break;
             case KernelType::COMBINED: name = "ungapped_gapped_prefilter"; break;
+            case KernelType::BOOT:     name = "boot"; break;
             default: return "";
         }
 
@@ -45,5 +42,9 @@ private:
         std::string buildPath = std::string("build/lib/dpu/kernels/") + name;
         return (access(buildPath.c_str(), F_OK) != -1) ? buildPath : std::string("lib/mmseqs/dpu/") + name;
     }
+
+private:
+    DpuCommunicationManager& comm_;
+    KernelType lastLoadedKernel_;
 };
 }

@@ -1,4 +1,5 @@
 #include "DpuCommunicationManager.h"
+#include "DpuKernelManager.h"
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <string>
 #include <cstring>
 #include <stdexcept>
+#include <chrono>
 #include "Debug.h"
 
 namespace mmseqs::dpu {
@@ -14,7 +16,8 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
   : num_dpus_available_(0),
     num_dpus_active_(0),
     async_in_progress_(false),
-    is_simulator_(false) {
+    is_simulator_(false),
+    allocated_from_system_(false) {
   const char* profile = nullptr;
 
   const char* prof_env = getenv("DPU_PROFILE");
@@ -48,68 +51,62 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
   const bool allocate_all = (num_dpus_requested == DPU_ALLOCATE_ALL);
   uint32_t remaining = allocate_all ? 0 : num_dpus_requested;
 
-  Debug(Debug::INFO) << "[DPU] Incremental rank discovery (profile=" << base_profile << ")\n";
+  Debug(Debug::INFO) << "[DPU] Allocating system (DPU_ALLOCATE_ALL) with profile: " << base_profile << "\n";
 
-  for (uint32_t r = 0; r < ranks_to_scan; ++r) {
-    if (!allocate_all && remaining == 0) {
-      break;
-    }
+  dpu_error_t status = dpu_alloc(DPU_ALLOCATE_ALL, base_profile.c_str(), &system_set_);
+  if (status != DPU_OK) {
+    Debug(Debug::ERROR) << "[DPU ERROR] System alloc failed: " << dpu_error_to_string(status) << "\n";
+    exit(EXIT_FAILURE);
+  }
+  allocated_from_system_ = true;
 
-    std::string rank_profile = base_profile + ",rank=" + std::to_string(r);
+  const char* health_check_env = getenv("DPU_HEALTH_CHECK");
+  bool do_health_check = health_check_env && std::strcmp(health_check_env, "1") == 0;
+  double health_check_time = 0.0;
 
-    // Probe: ask for all DPUs in this rank to learn how many are healthy.
-    struct dpu_set_t probe_set;
-    dpu_error_t status = dpu_alloc(DPU_ALLOCATE_ALL, rank_profile.c_str(), &probe_set);
+  // Diagnostic health check
+  if (!is_simulator_ && do_health_check) {
+    auto start = std::chrono::high_resolution_clock::now();
+    std::string boot_kernel_path = DpuKernelManager::resolvePath(DpuKernelManager::KernelType::BOOT);
+    status = dpu_load(system_set_, boot_kernel_path.c_str(), NULL);
     if (status != DPU_OK) {
-      Debug(Debug::INFO) << "[DPU] Info: Skipping rank " << r << " - Probe allocation failed (" << dpu_error_to_string(status) << ")\n";
-      continue; // rank not present or unavailable
+      Debug(Debug::ERROR) << "[DPU ERROR] Failed to load diagnostic kernel '" << boot_kernel_path << "': " << dpu_error_to_string(status) << "\n";
+      dpu_free(system_set_);
+      exit(EXIT_FAILURE);
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    health_check_time += std::chrono::duration<double>(end - start).count();
+  }
 
-    uint32_t rank_dpus = 0;
-    status = dpu_get_nr_dpus(probe_set, &rank_dpus);
-    if (status != DPU_OK || rank_dpus == 0) {
-      Debug(Debug::WARNING) << "[DPU] Warning: Skipping rank " << r << " - Probe returned " << rank_dpus << " DPUs (status: " << dpu_error_to_string(status) << ")\n";
-      dpu_free(probe_set);
-      continue;
-    }
+  struct dpu_set_t rank;
+  DPU_RANK_FOREACH(system_set_, rank) {
+    if (!allocate_all && num_dpus_active_ >= num_dpus_requested) break;
 
-    // Decide how many to keep from this rank.
-    uint32_t needed = allocate_all ? rank_dpus : std::min<uint32_t>(remaining, rank_dpus);
-    struct dpu_set_t rank_set = probe_set;
-
-    if (!allocate_all && needed < rank_dpus) {
-      // We need fewer than the rank has; free probe and allocate exact count.
-      dpu_free(probe_set);
-      status = dpu_alloc(needed, rank_profile.c_str(), &rank_set);
+    bool healthy = true;
+    if (!is_simulator_ && do_health_check) {
+      auto start = std::chrono::high_resolution_clock::now();
+      status = dpu_launch(rank, DPU_SYNCHRONOUS);
+      auto end = std::chrono::high_resolution_clock::now();
+      health_check_time += std::chrono::duration<double>(end - start).count();
       if (status != DPU_OK) {
-        Debug(Debug::WARNING) << "[DPU] Warning: Skipping rank " << r << " - Exact allocation " << needed << " failed (" << dpu_error_to_string(status) << ")\n";
-        continue;
-      }
-      rank_dpus = needed;
-    } else {
-      // Keep the probe allocation as-is (either allocate_all or we need all healthy DPUs).
-      rank_dpus = needed;
-    }
-
-    Debug(Debug::INFO) << "[DPU] Success: Rank " << r << " allocated with " << rank_dpus << " DPUs\n";
-
-    rank_sets_.push_back(rank_set);
-
-    struct dpu_set_t dpu;
-    DPU_FOREACH(rank_set, dpu) {
-      dpu_sets_.push_back(dpu);
-      async_per_dpu_.push_back(false);
-      ++num_dpus_active_;
-      if (!allocate_all && num_dpus_active_ >= num_dpus_requested) {
-        break;
+        Debug(Debug::WARNING) << "[DPU] Warning: Rank failed diagnostics (" << dpu_error_to_string(status) << ") -> EXCLUDED\n";
+        healthy = false;
       }
     }
 
-    num_dpus_available_ = num_dpus_active_;
-    if (!allocate_all) {
-      remaining = (num_dpus_active_ >= num_dpus_requested) ? 0 : (num_dpus_requested - num_dpus_active_);
+    if (healthy) {
+      rank_sets_.push_back(rank);
+      struct dpu_set_t dpu;
+      DPU_FOREACH(rank, dpu) {
+        dpu_sets_.push_back(dpu);
+        async_per_dpu_.push_back(false);
+        ++num_dpus_active_;
+        if (!allocate_all && num_dpus_active_ >= num_dpus_requested) break;
+      }
     }
   }
+  
+  num_dpus_available_ = num_dpus_active_;
 
   if (num_dpus_requested != DPU_ALLOCATE_ALL && num_dpus_active_ < num_dpus_requested) {
     Debug(Debug::ERROR) << "[DPU ERROR] Unable to allocate requested DPUs (" << num_dpus_requested << " requested, " << num_dpus_active_ << " acquired)\n";
@@ -121,6 +118,10 @@ DpuCommunicationManager::DpuCommunicationManager(uint32_t num_dpus_requested)
     exit(EXIT_FAILURE);
   }
 
+  if (!is_simulator_ && do_health_check) {
+    Debug(Debug::INFO) << "[DPU] Health check completed in " << health_check_time << " s\n";
+  }
+
   Debug(Debug::INFO) << "[DPU] Allocated " << num_dpus_active_ << " DPUs across " << rank_sets_.size() << " ranks (Profile: " << base_profile << ")\n";
 }
 
@@ -128,8 +129,12 @@ DpuCommunicationManager::~DpuCommunicationManager() {
   if (async_in_progress_) {
     waitForKernels();
   }
-  for (auto &rank_set : rank_sets_) {
-    dpu_free(rank_set);
+  if (allocated_from_system_) {
+    dpu_free(system_set_);
+  } else {
+    for (auto &rank_set : rank_sets_) {
+      dpu_free(rank_set);
+    }
   }
 }
 
