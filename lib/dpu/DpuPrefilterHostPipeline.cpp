@@ -541,8 +541,7 @@ namespace mmseqs::dpu
                 
                 resultWriter.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
                 
-                DPU_DEBUG_LOG << "[CPU] Query " << q << " (key=" << queryKey << "): " 
-                              << final_query_hits.size() << " aggregated hits\n";
+                // DPU_DEBUG_LOG << "[CPU] Query " << q << " (key=" << queryKey << "): " << final_query_hits.size() << " aggregated hits\n";
             }
             
             DPU_DEBUG_LOG << "\n[CPU] Wave " << (wave_idx + 1) << " complete! Processed " << qdbr->getSize() << " queries\n"; 

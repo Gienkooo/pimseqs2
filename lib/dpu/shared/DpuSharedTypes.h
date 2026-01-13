@@ -61,11 +61,11 @@ extern "C" {
 #define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
 
 #define MAX_DPU_SEQS 8192       
-#define MAX_DPU_INDEX_SIZE (32 * 1024 * 1024) /* 32 MB max index size per DPU */
+#define MAX_DPU_INDEX_SIZE (34 * 1024 * 1024) /* 32 MB max index size per DPU */
 #define PACKET_READ_BATCH_SIZE 32
 
 /* Buffer Size Configuration */
-#define KMER_QUERY_BUFFER_SIZE (30 * 1024 * 1024)     /* query packet buffer */
+#define KMER_QUERY_BUFFER_SIZE (12 * 1024 * 1024)     /* query packet buffer */
 #define KMER_MIN_OUTPUT_BUFFER_SIZE (1 * 1024 * 1024) /* 1 MB minimum output */
 
 #define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))
