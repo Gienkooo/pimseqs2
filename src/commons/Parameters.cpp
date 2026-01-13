@@ -472,6 +472,7 @@ Parameters::Parameters():
     prefilter.push_back(&PARAM_SPACED_KMER_PATTERN);
     prefilter.push_back(&PARAM_LOCAL_TMP);
     prefilter.push_back(&PARAM_DPU);
+    prefilter.push_back(&PARAM_DPU_NUM_DPUS);
     prefilter.push_back(&PARAM_THREADS);
     prefilter.push_back(&PARAM_COMPRESSED);
     prefilter.push_back(&PARAM_V);
