@@ -26,6 +26,9 @@ __host uint32_t g_hit_count;
 __host uint32_t g_hit_write_offset;
 __host uint32_t g_overflow;
 
+#define MAX_BATCH_QUERIES 128
+__dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
+
 /* * Compute diagonal with CPU-exact 8-bit saturation.
  * The CPU uses unsigned 8-bit arithmetic which caps scores at 255.
  * We emulate this behavior to ensure validation matches.
@@ -41,9 +44,15 @@ static void compute_ungapped_diagonal_with_diag(
     int16_t global_max_score = 0;
     int32_t global_best_diag = 0;
     
-    // Reset diagonal buffer
-    uint32_t num_diags = t_len + q_len; 
-    for (uint32_t i = 0; i < num_diags; ++i) diag_buffer[i] = 0;
+    // Reset diagonal buffer using 64-bit writes for efficiency
+    uint32_t num_diags = t_len + q_len;
+    uint64_t *diag64 = (uint64_t *)diag_buffer;
+    uint32_t num_diags_64 = (num_diags * sizeof(int16_t)) / sizeof(uint64_t);
+    for (uint32_t i = 0; i < num_diags_64; ++i)
+        diag64[i] = 0;
+    /* Handle remainder */
+    for (uint32_t i = num_diags_64 * 4; i < num_diags; ++i)
+        diag_buffer[i] = 0;
     
     // Iterate PSSM in chunks to fit in WRAM heap cache
     for (uint32_t q_start = 0; q_start < q_len; ) {
@@ -109,6 +118,12 @@ int main() {
         g_hit_count = 0;
         g_hit_write_offset = 8; 
         g_overflow = 0;
+
+        // Cache Query Metadata for faster access
+        uint32_t num_q = g_bd.header.num_queries;
+        if (num_q > MAX_BATCH_QUERIES) num_q = MAX_BATCH_QUERIES;
+        uintptr_t qmeta_base_init = mram_base + g_bd.header.queries_metadata_offset;
+        mram_read((__mram_ptr void*)qmeta_base_init, g_query_meta, MRAM_ALIGN_SIZE(num_q * sizeof(QueryMetadata)));
     }
     barrier_wait(&my_barrier);
 
@@ -140,6 +155,31 @@ int main() {
     uintptr_t pssm_base_start = mram_base + g_bd.header.pssm_data_offset;
     uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
     uintptr_t results_base = mram_base + g_bd.header.results_offset;
+
+    /* Buffered hit output to reduce mutex contention */
+    const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(Hit));
+    Hit local_hits[32];
+    uint32_t local_count = 0;
+
+#define FLUSH_LOCAL_HITS()                                                                 \
+    do {                                                                                   \
+        if (local_count) {                                                                 \
+            uint32_t bytes = local_count * HIT_STRIDE;                                     \
+            mutex_lock(hit_mutex);                                                         \
+            if (g_hit_write_offset + bytes > g_bd.header.results_buffer_size) {            \
+                g_overflow = 1;                                                            \
+                mutex_unlock(hit_mutex);                                                   \
+                local_count = 0;                                                           \
+            } else {                                                                       \
+                uint32_t offset = g_hit_write_offset;                                      \
+                g_hit_write_offset += bytes;                                               \
+                g_hit_count += local_count;                                                \
+                mutex_unlock(hit_mutex);                                                   \
+                mram_write(local_hits, (__mram_ptr void *)(results_base + offset), bytes); \
+                local_count = 0;                                                           \
+            }                                                                              \
+        }                                                                                  \
+    } while (0)
     
     for (uint32_t t = tasklet_id; t < g_bd.header.num_targets; t += NR_TASKLETS) {
         __dma_aligned TargetMetadata meta;
@@ -152,8 +192,13 @@ int main() {
         mram_read((__mram_ptr void*)seq_addr, task_target_seq, MRAM_ALIGN_SIZE(meta.target_len));
         
         for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
-            __dma_aligned QueryMetadata qmeta;
-            mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
+            // Use cached metadata if available, else read from MRAM
+            QueryMetadata qmeta;
+            if (q_idx < MAX_BATCH_QUERIES) {
+                qmeta = g_query_meta[q_idx];
+            } else {
+                mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
+            }
 
             if (qmeta.query_len > max_query_len) continue; 
 
@@ -167,7 +212,7 @@ int main() {
             );
             
             if (score >= min_score) {
-                __dma_aligned Hit hit;
+                Hit hit;
                 hit.target_id = meta.target_id;
                 hit.query_id = (uint16_t)q_idx; 
                 hit.score = score;
@@ -175,23 +220,17 @@ int main() {
                 hit.pad1 = 0;
                 hit.pad2 = 0;
                 
-                mutex_lock(hit_mutex);
-                uint32_t next = g_hit_write_offset + sizeof(Hit);
-                if (next > g_bd.header.results_buffer_size) {
-                    g_overflow = 1;
-                    mutex_unlock(hit_mutex);
-                    continue; 
-                }
-                uint32_t offset = g_hit_write_offset;
-                g_hit_write_offset = next;
-                g_hit_count++;
-                mutex_unlock(hit_mutex);
-
-                mram_write(&hit, (__mram_ptr void*)(results_base + offset), sizeof(Hit));
+                local_hits[local_count++] = hit;
+                if (local_count == 32)
+                    FLUSH_LOCAL_HITS();
             }
         }
     }
     
+    FLUSH_LOCAL_HITS();
+
+#undef FLUSH_LOCAL_HITS
+
     barrier_wait(&my_barrier);
     if (tasklet_id == 0) {
         __dma_aligned uint32_t count_buf[2];

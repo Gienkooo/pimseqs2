@@ -20,12 +20,12 @@
 #define ALPHA_SIZE 21
 
 #define Q_TILE_SIZE 64
-#define T_TILE_SIZE 64
+#define T_TILE_SIZE 128  /* Increased from 64 to improve arithmetic intensity */
 
 #define GAP_OPEN 11
 #define GAP_EXTEND 1
 
-#define SCRATCH_SIZE 2560
+#define SCRATCH_SIZE 3500  /* Increased to accommodate larger tile size */
 
 /* Macros */
 #define ALIGN8(x) (((x) + 7) & ~7U)
@@ -61,6 +61,43 @@ static inline void mram_read_unaligned_bytes(uintptr_t src, void *dst, uint32_t 
     memcpy((uint8_t *)dst, tmp + off, len);
 }
 
+/* Bulk unaligned MRAM read for larger payloads - more efficient than multiple small reads */
+static inline void mram_read_unaligned_bulk(uintptr_t src, void *dst, uint32_t len)
+{
+    uint32_t off = (uint32_t)(src & 7U);
+    uintptr_t aligned = src & ~7U;
+    uint8_t *out = (uint8_t *)dst;
+
+    if (off != 0)
+    {
+        uint32_t head = 8U - off;
+        if (head > len)
+            head = len;
+        __dma_aligned uint8_t tmp[8];
+        mram_read((__mram_ptr void *)aligned, tmp, 8);
+        memcpy(out, tmp + off, head);
+        aligned += 8;
+        out += head;
+        len -= head;
+    }
+
+    uint32_t mid = len & ~7U;
+    if (mid)
+    {
+        mram_read((__mram_ptr void *)aligned, out, mid);
+        aligned += mid;
+        out += mid;
+        len -= mid;
+    }
+
+    if (len)
+    {
+        __dma_aligned uint8_t tmp[8];
+        mram_read((__mram_ptr void *)aligned, tmp, 8);
+        memcpy(out, tmp, len);
+    }
+}
+
 /* -------------------------------------------------------------------------
  * UNGAPPED HEURISTIC
  * ------------------------------------------------------------------------- */
@@ -74,14 +111,31 @@ static bool compute_ungapped_diagonal(
     if (diag_buf_bytes >= scratch_size) return false;
 
     int16_t *diag_buffer = (int16_t *)scratch_buffer;
-    for (uint32_t i = 0; i < num_diags; ++i)
+    /* Zero-initialize using 64-bit writes for efficiency */
+    uint64_t *diag64 = (uint64_t *)diag_buffer;
+    uint32_t num_diags_64 = (num_diags * sizeof(int16_t)) / sizeof(uint64_t);
+    for (uint32_t i = 0; i < num_diags_64; ++i)
+        diag64[i] = 0;
+    /* Handle remainder */
+    for (uint32_t i = num_diags_64 * 4; i < num_diags; ++i)
         diag_buffer[i] = 0;
 
+    /* Initial target buffer - will be recalculated after PSSM cache allocation */
     uint8_t *t_buf = scratch_buffer + diag_buf_bytes;
     uint32_t t_buf_size = scratch_size - diag_buf_bytes;
-    if (t_buf_size < 16) return false;
 
-    __dma_aligned int8_t temp_pssm_buf[32];
+    /* Pre-allocate PSSM cache for bulk loading - much more efficient than row-by-row */
+    uint32_t pssm_bytes = q_len * ALPHA_SIZE;
+    uint32_t pssm_buf_bytes = ALIGN8(pssm_bytes + 8);
+    if (diag_buf_bytes + pssm_buf_bytes >= scratch_size) return false;
+    
+    int8_t *pssm_cache = (int8_t *)(scratch_buffer + diag_buf_bytes);
+    mram_read_unaligned_bulk(pssm_mram_base, pssm_cache, pssm_bytes);
+    
+    /* Recompute available target buffer space after PSSM cache */
+    t_buf = scratch_buffer + diag_buf_bytes + pssm_buf_bytes;
+    t_buf_size = scratch_size - diag_buf_bytes - pssm_buf_bytes;
+    if (t_buf_size < 16) return false;
 
     for (uint32_t t_start = 0; t_start < t_len; )
     {
@@ -102,9 +156,8 @@ static bool compute_ungapped_diagonal(
         
         for (uint32_t q = 0; q < q_len; ++q)
         {
-            uintptr_t row_addr = pssm_mram_base + (q * ALPHA_SIZE);
-            mram_read((__mram_ptr void *)(row_addr & ~7U), temp_pssm_buf, 32);
-            int8_t *pssm_vals = &temp_pssm_buf[row_addr & 7U];
+            /* Use cached PSSM row - pointer arithmetic for speed */
+            int8_t *pssm_vals = &pssm_cache[q * ALPHA_SIZE];
 
             for (uint32_t i = 0; i < chunk_len; ++i)
             {
@@ -124,8 +177,23 @@ static bool compute_ungapped_diagonal(
         t_start += chunk_len;
     }
 
+    /* Find max score with loop unrolling for better pipeline utilization */
     int16_t global_max_score = 0;
-    for (uint32_t i = 0; i < num_diags; ++i) {
+    uint32_t i = 0;
+    /* Unrolled loop - process 4 elements at a time */
+    for (; i + 3 < num_diags; i += 4) {
+        int16_t m0 = diag_buffer[i];
+        int16_t m1 = diag_buffer[i + 1];
+        int16_t m2 = diag_buffer[i + 2];
+        int16_t m3 = diag_buffer[i + 3];
+        int16_t max01 = (m0 > m1) ? m0 : m1;
+        int16_t max23 = (m2 > m3) ? m2 : m3;
+        int16_t local_max = (max01 > max23) ? max01 : max23;
+        if (local_max > global_max_score)
+            global_max_score = local_max;
+    }
+    /* Handle remainder */
+    for (; i < num_diags; ++i) {
         if (diag_buffer[i] > global_max_score)
             global_max_score = diag_buffer[i];
     }
@@ -223,6 +291,7 @@ static SwResult compute_sw_tiled(
 
         // At the start of each target tile, the top boundary (row 0) is the DP row at the
         // query-tile boundary, initialized to 0/NEG_INF for the very first query tile.
+        #pragma unroll 4
         for (uint32_t col = 0; col <= t_size; col++)
         {
             H_top[col] = 0;
@@ -238,6 +307,7 @@ static SwResult compute_sw_tiled(
             uint32_t vec_bytes = ALIGN8((q_size + 1) * sizeof(int16_t));
             if (t_tile_idx == 0)
             {
+                #pragma unroll 4
                 for (uint32_t i = 0; i <= q_size; i++)
                 {
                     H_col[i] = 0;
@@ -250,12 +320,10 @@ static SwResult compute_sw_tiled(
                 mram_read((__mram_ptr void *)(mram_E_vec + q_start * sizeof(int16_t)), E_col, vec_bytes);
             }
 
-            // Load PSSM rows for this query tile: pssm_tile[(i)*ALPHA + aa], i=0..q_size-1
-            for (uint32_t i = 0; i < q_size; i++)
-            {
-                uintptr_t rowaddr = pssm_mram_base + (uintptr_t)(q_start + i) * ALPHA_SIZE;
-                mram_read_unaligned_bytes(rowaddr, pssm_tile + i * ALPHA_SIZE, ALPHA_SIZE);
-            }
+            // Load PSSM rows for this query tile in a single bulk read (much faster than row-by-row)
+            uintptr_t tile_addr = pssm_mram_base + (uintptr_t)q_start * ALPHA_SIZE;
+            uint32_t tile_bytes = q_size * ALPHA_SIZE;
+            mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
 
             // Ensure column 0 boundary for this query tile
             H_bot[0] = H_col[q_size];
@@ -273,13 +341,18 @@ static SwResult compute_sw_tiled(
                 int16_t f_up = F_top[col];       // F(0,col)
                 int16_t h_diag = H_top[col - 1]; // H(0,col-1)
 
+                // Optimized PSSM access: pointer to column for this amino acid
+                int8_t *pssm_ptr = &pssm_tile[aa];
+
                 // Sweep i = 1..q_size, update H_col/E_col in place (column-major)
                 for (uint32_t i = 1; i <= q_size; i++)
                 {
                     int16_t h_left = H_col[i]; // old H(i,col-1)
                     int16_t e_left = E_col[i]; // old E(i,col-1)
 
-                    int8_t sub = pssm_tile[(i - 1) * ALPHA_SIZE + aa];
+                    // Optimized: pointer arithmetic instead of multiply+add
+                    int8_t sub = *pssm_ptr;
+                    pssm_ptr += ALPHA_SIZE;
 
                     // E(i,col) from left (gap in target / horizontal gap) — saturating
                     int16_t e_ext = sat_sub(e_left, gap_extend);
@@ -435,6 +508,30 @@ int main() {
 
     const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(GappedHit));
 
+    /* Buffered hit output to reduce mutex contention */
+    GappedHit local_hits[32];
+    uint32_t local_count = 0;
+
+#define FLUSH_LOCAL_HITS()                                                                 \
+    do {                                                                                   \
+        if (local_count) {                                                                 \
+            uint32_t bytes = local_count * HIT_STRIDE;                                     \
+            mutex_lock(hit_mutex);                                                         \
+            if (g_hit_write_offset + bytes > hits_area_size) {                             \
+                g_overflow = 1;                                                            \
+                mutex_unlock(hit_mutex);                                                   \
+                local_count = 0;                                                           \
+            } else {                                                                       \
+                uint32_t offset = g_hit_write_offset;                                      \
+                g_hit_write_offset += bytes;                                               \
+                g_hit_count += local_count;                                                \
+                mutex_unlock(hit_mutex);                                                   \
+                mram_write(local_hits, (__mram_ptr void *)(results_base + offset), bytes); \
+                local_count = 0;                                                           \
+            }                                                                              \
+        }                                                                                  \
+    } while (0)
+
     while (1)
     {
         mutex_lock(job_mutex);
@@ -508,20 +605,15 @@ int main() {
             hit.padding[1] = 0;
             hit.padding[2] = 0;
 
-            mutex_lock(hit_mutex);
-            if (g_hit_write_offset + HIT_STRIDE > hits_area_size) {
-                g_overflow = 1;
-                mutex_unlock(hit_mutex);
-            } else {
-                uint32_t offset = g_hit_write_offset;
-                g_hit_write_offset += HIT_STRIDE;
-                g_hit_count++;
-                mutex_unlock(hit_mutex);
-
-                mram_write(&hit, (__mram_ptr void *)(results_base + offset), HIT_STRIDE);
-            }
+            local_hits[local_count++] = hit;
+            if (local_count == 32)
+                FLUSH_LOCAL_HITS();
         }
     }
+
+    FLUSH_LOCAL_HITS();
+
+#undef FLUSH_LOCAL_HITS
 
     barrier_wait(&my_barrier);
     if (tasklet_id == 0)

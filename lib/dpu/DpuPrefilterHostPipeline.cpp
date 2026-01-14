@@ -271,6 +271,101 @@ namespace mmseqs::dpu
             targetBatches[wave][slot] = std::move(chunks[idx]);
         }
 
+        // Detailed batching diagnostics
+        DPU_DEBUG_LOG << "[DPU] === Batching Diagnostics ==="  << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Total DB sequences: " << tdbr->getSize() << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Available DPUs: " << num_dpus << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Generated chunks: " << chunks.size() << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Target waves: " << num_waves << "\n";
+        
+        // Per-wave statistics
+        for (size_t wave = 0; wave < num_waves; ++wave) {
+            size_t active_dpus = 0;
+            size_t total_seqs = 0;
+            size_t min_seqs = SIZE_MAX;
+            size_t max_seqs = 0;
+            
+            for (uint32_t d = 0; d < num_dpus; ++d) {
+                size_t n = targetBatches[wave][d].size();
+                if (n > 0) {
+                    active_dpus++;
+                    total_seqs += n;
+                    if (n < min_seqs) min_seqs = n;
+                    if (n > max_seqs) max_seqs = n;
+                }
+            }
+            
+            if (active_dpus == 0) min_seqs = 0;
+            
+            DPU_DEBUG_LOG << "[DPU]   Wave " << (wave + 1) << "/" << num_waves 
+                          << ": active_dpus=" << active_dpus
+                          << ", total_seqs=" << total_seqs
+                          << ", seqs_per_dpu=[" << min_seqs << ".." << max_seqs << "]\n";
+        }
+        DPU_DEBUG_LOG << "[DPU] ==============================\n";
+
+        return targetBatches;
+    }
+
+    // ============================================================================
+    // HELPER: Partition Targets for MAXIMUM PARALLELISM (ungapped/gapped modes)
+    // Uses LPT algorithm to spread work across ALL DPUs
+    // ============================================================================
+    static std::vector<std::vector<std::vector<uint32_t>>> partitionTargetsForParallelism(
+        DBReader<unsigned int> *tdbr, uint32_t num_dpus)
+    {
+        // Use LPT distribution to maximize parallelism across all DPUs
+        // Simpler MRAM limit (no k-mer index overhead)
+        constexpr size_t MRAM_LIMIT_PARALLEL = 40 * 1024 * 1024; // 40MB for sequences
+        
+        auto chunks = DpuDbSplitter::distributeForParallelism(tdbr, num_dpus, MRAM_LIMIT_PARALLEL, MAX_DPU_SEQS);
+        if (chunks.empty()) {
+            return {};
+        }
+
+        // For parallel distribution, we typically get num_dpus chunks (one wave)
+        // But if DB is huge, we might get multiple waves
+        const size_t num_waves = (chunks.size() + num_dpus - 1) / num_dpus;
+        std::vector<std::vector<std::vector<uint32_t>>> targetBatches(num_waves, std::vector<std::vector<uint32_t>>(num_dpus));
+
+        for (size_t idx = 0; idx < chunks.size(); ++idx) {
+            const size_t wave = idx / num_dpus;
+            const size_t slot = idx % num_dpus;
+            targetBatches[wave][slot] = std::move(chunks[idx]);
+        }
+
+        // Detailed batching diagnostics
+        DPU_DEBUG_LOG << "[DPU] === Parallel Batching Diagnostics ===\n";
+        DPU_DEBUG_LOG << "[DPU]   Total DB sequences: " << tdbr->getSize() << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Available DPUs: " << num_dpus << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Generated chunks: " << chunks.size() << "\n";
+        DPU_DEBUG_LOG << "[DPU]   Target waves: " << num_waves << "\n";
+        
+        for (size_t wave = 0; wave < num_waves; ++wave) {
+            size_t active_dpus = 0;
+            size_t total_seqs = 0;
+            size_t min_seqs = SIZE_MAX;
+            size_t max_seqs = 0;
+            
+            for (uint32_t d = 0; d < num_dpus; ++d) {
+                size_t n = targetBatches[wave][d].size();
+                if (n > 0) {
+                    active_dpus++;
+                    total_seqs += n;
+                    if (n < min_seqs) min_seqs = n;
+                    if (n > max_seqs) max_seqs = n;
+                }
+            }
+            
+            if (active_dpus == 0) min_seqs = 0;
+            
+            DPU_DEBUG_LOG << "[DPU]   Wave " << (wave + 1) << "/" << num_waves 
+                          << ": active_dpus=" << active_dpus
+                          << ", total_seqs=" << total_seqs
+                          << ", seqs_per_dpu=[" << min_seqs << ".." << max_seqs << "]\n";
+        }
+        DPU_DEBUG_LOG << "[DPU] ==========================================\n";
+
         return targetBatches;
     }
 
@@ -946,7 +1041,8 @@ namespace mmseqs::dpu
             }
         }
 
-        auto targetBatches = partitionTargetsIntoBatches(tdbr, num_dpus);
+        // Use parallel distribution for maximum DPU utilization (not dense packing)
+        auto targetBatches = partitionTargetsForParallelism(tdbr, num_dpus);
         if (targetBatches.empty()) {
             Debug(Debug::ERROR) << "[DPU] Database splitting failed for gapped path\n";
             return;
@@ -1597,7 +1693,8 @@ namespace mmseqs::dpu
 
         const CombinedLimits limits = makeLimits(32u, 4u * 1024u * 1024u);
 
-        auto targetBatches = partitionTargetsIntoBatches(tdbr, num_dpus);
+        // Use parallel distribution for maximum DPU utilization (not dense packing)
+        auto targetBatches = partitionTargetsForParallelism(tdbr, num_dpus);
         bool accumulate_results = (targetBatches.size() > 1);
         std::vector<std::vector<Matcher::result_t>> allResults;
         if (accumulate_results) {
@@ -1658,22 +1755,21 @@ namespace mmseqs::dpu
             }
 
             std::vector<DpuWorkflow::MramLayout> layouts(num_dpus);
+            std::vector<CombinedBatchDescriptor> bds(num_dpus);
             std::vector<uint32_t> maxHitsPerDpu(num_dpus, 0);
             std::vector<uint32_t> active_dpus;
+
+            // Calculate fixed layout for parallel transfer (same pattern as gapped path)
+            // MAX_SEQS_PER_DPU = 16384, TARGET_BUDGET_BYTES = 40MB
+            uint32_t max_tdata_size = DpuCommunicationManager::alignToMram(40 * 1024 * 1024);
+            DpuWorkflow::MramLayout max_layout = workflow_.calculateLayout(
+                sizeof(CombinedBatchDescriptor), limits.reserved_common, 16384, limits.max_batch_queries, max_tdata_size, sizeof(GappedHit), 0);
+
             for (uint32_t d = 0; d < num_dpus; ++d) {
-                const uint32_t bd_size = DpuCommunicationManager::alignToMram(static_cast<uint32_t>(sizeof(CombinedBatchDescriptor)));
-                const uint32_t tmeta_size = DpuCommunicationManager::alignToMram(static_cast<uint32_t>(perDpuTargetMeta[d].size() * sizeof(TargetMetadata)));
-                const uint32_t tdata_size = DpuCommunicationManager::alignToMram(static_cast<uint32_t>(perDpuTargetData[d].size()));
+                layouts[d] = max_layout; // Use fixed layout for everyone
 
-                layouts[d].common_data_offset = bd_size;
-                layouts[d].target_meta_offset = layouts[d].common_data_offset + limits.reserved_common;
-                layouts[d].target_data_offset = layouts[d].target_meta_offset + tmeta_size;
-                layouts[d].results_offset     = layouts[d].target_data_offset + tdata_size;
-                layouts[d].results_capacity   = DpuCommunicationManager::alignToMram(limits.combined_results_bytes);
-                layouts[d].total_mram_used    = layouts[d].results_offset + layouts[d].results_capacity;
-
-                const uint32_t usable_results = (layouts[d].results_capacity > limits.result_header_bytes)
-                    ? (layouts[d].results_capacity - limits.result_header_bytes)
+                const uint32_t usable_results = (max_layout.results_capacity > limits.result_header_bytes)
+                    ? (max_layout.results_capacity - limits.result_header_bytes)
                     : 0u;
                 maxHitsPerDpu[d] = usable_results / static_cast<uint32_t>(sizeof(GappedHit));
 
@@ -1681,8 +1777,22 @@ namespace mmseqs::dpu
                     active_dpus.push_back(d);
                 }
 
-                if (layouts[d].total_mram_used > DPU_MRAM_TOTAL_SIZE) {
-                    Debug(Debug::ERROR) << "[DPU] Combined layout exceeds MRAM for DPU " << d << " (" << layouts[d].total_mram_used << " > " << DPU_MRAM_TOTAL_SIZE << ")";
+                // Initialize descriptor placeholder
+                CombinedBatchDescriptor init_bd{};
+                init_bd.header.num_targets = static_cast<uint32_t>(perDpuTargetMeta[d].size());
+                init_bd.header.num_active_tasklets = limits.tasklet_limit;
+
+                const uint32_t qmeta_aligned = DpuCommunicationManager::alignToMram(sizeof(QueryMetadata));
+                init_bd.header.queries_metadata_offset = max_layout.common_data_offset;
+                init_bd.header.pssm_data_offset = init_bd.header.queries_metadata_offset + qmeta_aligned;
+                init_bd.header.targets_metadata_offset = max_layout.target_meta_offset;
+                init_bd.header.targets_data_offset = max_layout.target_data_offset;
+                init_bd.header.results_offset = max_layout.results_offset;
+                init_bd.header.results_buffer_size = max_layout.results_capacity;
+                bds[d] = init_bd;
+
+                if (max_layout.total_mram_used > DPU_MRAM_TOTAL_SIZE) {
+                    Debug(Debug::ERROR) << "[DPU] Combined layout exceeds MRAM for DPU " << d << " (" << max_layout.total_mram_used << " > " << DPU_MRAM_TOTAL_SIZE << ")";
                     EXIT(EXIT_FAILURE);
                 }
             }
@@ -1693,8 +1803,8 @@ namespace mmseqs::dpu
                 for (uint32_t d = 0; d < num_dpus; ++d) {
                     if (perDpuTargetMeta[d].empty()) continue;
                     const uint32_t targets = static_cast<uint32_t>(perDpuTargetMeta[d].size());
-                    const uint32_t max_hits = (layouts[d].results_capacity > limits.result_header_bytes)
-                        ? (layouts[d].results_capacity - limits.result_header_bytes) / static_cast<uint32_t>(sizeof(GappedHit))
+                    const uint32_t max_hits = (max_layout.results_capacity > limits.result_header_bytes)
+                        ? (max_layout.results_capacity - limits.result_header_bytes) / static_cast<uint32_t>(sizeof(GappedHit))
                         : 0u;
                     const uint32_t qcap = (targets == 0 || max_hits == 0) ? 1u : std::max<uint32_t>(1u, max_hits / targets);
                     cap_by_results = std::min(cap_by_results, qcap);
@@ -1702,30 +1812,11 @@ namespace mmseqs::dpu
                 max_batch_queries_limit = std::max<size_t>(1u, std::min<size_t>(max_batch_queries_limit, cap_by_results));
             }
 
-            // Upload target metadata and data once per target batch (descriptor will be scattered per query batch)
-            for (uint32_t d = 0; d < num_dpus; ++d) {
-                if (perDpuTargetMeta[d].empty()) continue;
-
-                uint32_t tmeta_size_bytes = static_cast<uint32_t>(perDpuTargetMeta[d].size() * sizeof(TargetMetadata));
-                uint32_t tmeta_aligned = DpuCommunicationManager::alignToMram(tmeta_size_bytes);
-                if (tmeta_size_bytes == tmeta_aligned) {
-                    dpu_comm_.scatterDataToDPU(d, perDpuTargetMeta[d].data(), tmeta_aligned, layouts[d].target_meta_offset);
-                } else {
-                    std::vector<uint8_t> buf(tmeta_aligned, 0);
-                    memcpy(buf.data(), perDpuTargetMeta[d].data(), tmeta_size_bytes);
-                    dpu_comm_.scatterDataToDPU(d, buf.data(), tmeta_aligned, layouts[d].target_meta_offset);
-                }
-
-                uint32_t tdata_size_bytes = static_cast<uint32_t>(perDpuTargetData[d].size());
-                uint32_t tdata_aligned = DpuCommunicationManager::alignToMram(tdata_size_bytes);
-                if (tdata_size_bytes == tdata_aligned) {
-                    dpu_comm_.scatterDataToDPU(d, perDpuTargetData[d].data(), tdata_aligned, layouts[d].target_data_offset);
-                } else {
-                    std::vector<uint8_t> buf(tdata_aligned, 0);
-                    memcpy(buf.data(), perDpuTargetData[d].data(), tdata_size_bytes);
-                    dpu_comm_.scatterDataToDPU(d, buf.data(), tdata_aligned, layouts[d].target_data_offset);
-                }
-            }
+            // DATA-RESIDENT PATTERN: Scatter targets ONCE at start of wave
+            // Targets stay resident in DPU MRAM while we broadcast multiple query batches
+            DPU_DEBUG_LOG << "[DPU] Wave " << (bIdx + 1) << "/" << targetBatches.size() 
+                          << ": Scattering " << active_dpus.size() << " target batches (data-resident)\\n";
+            workflow_.scatterTargetsOnly(perDpuTargetMeta, perDpuTargetData, max_layout);
 
             auto gatherChecked = [&](uint32_t dpu_id, const DpuWorkflow::MramLayout& layout) {
                 uint64_t hdr = 0;
@@ -1767,6 +1858,7 @@ namespace mmseqs::dpu
             std::vector<bool> dpu_ready(num_dpus, false);
 
             size_t q_cursor = 0;
+            size_t query_batch_num = 0;
             while (q_cursor < qdbr->getSize()) {
                 auto batch = buildQueryBatch(q_cursor, qdbr, subMat, par, compBias, batch_limits, evaluer, minUngappedThr, nullptr);
                 if (batch.empty) {
@@ -1774,17 +1866,20 @@ namespace mmseqs::dpu
                     break;
                 }
                 q_cursor = batch.next_q_idx;
+                query_batch_num++;
 
                 for (auto &v : dpu_hits) v.clear();
 
-                workflow_.broadcastCommon(batch.common_buffer->data(), batch.common_size, layouts[0].common_data_offset);
+                // DATA-RESIDENT: Only broadcast queries (targets already in MRAM)
+                workflow_.broadcastCommon(batch.common_buffer->data(), batch.common_size, max_layout.common_data_offset);
 
-                std::vector<std::vector<uint8_t>> bd_bufs(num_dpus);
+                // Build descriptors (one per DPU) with updated query batch info
+                std::vector<CombinedBatchDescriptor> query_descriptors(num_dpus);
                 const uint32_t qmeta_size = static_cast<uint32_t>(batch.meta.size() * sizeof(QueryMetadata));
                 const uint32_t pssm_size = static_cast<uint32_t>(batch.pssm.size());
 
                 for (uint32_t d : active_dpus) {
-                    const uint32_t qmeta_off = layouts[d].common_data_offset;
+                    const uint32_t qmeta_off = max_layout.common_data_offset;
                     const uint32_t pssm_off = qmeta_off + DpuCommunicationManager::alignToMram(qmeta_size);
 
                     DpuBatchHeader hdr(
@@ -1793,15 +1888,15 @@ namespace mmseqs::dpu
                         batch.max_q_len,
                         qmeta_off,
                         pssm_off,
-                        layouts[d].target_meta_offset,
-                        layouts[d].target_data_offset,
-                        layouts[d].results_offset,
-                        layouts[d].results_capacity,
+                        max_layout.target_meta_offset,
+                        max_layout.target_data_offset,
+                        max_layout.results_offset,
+                        max_layout.results_capacity,
                         pssm_size,
                         static_cast<uint32_t>(perDpuTargetData[d].size()),
                         0,
                         limits.tasklet_limit);
-                    hdr.batch_id = 0;
+                    hdr.batch_id = static_cast<uint32_t>(query_batch_num);
 
                     CombinedBatchDescriptor bd(
                         hdr,
@@ -1816,14 +1911,14 @@ namespace mmseqs::dpu
                         static_cast<uint8_t>(std::min(par.alnLenThr, 255)),
                         static_cast<uint8_t>(par.seqIdThr * 100.0f));
 
-                    bd_bufs[d].resize(sizeof(CombinedBatchDescriptor));
-                    memcpy(bd_bufs[d].data(), &bd, sizeof(CombinedBatchDescriptor));
+                    query_descriptors[d] = bd;
                 }
 
-                dpu_comm_.scatterDataParallel(bd_bufs, 0);
+                // DATA-RESIDENT: Only scatter descriptors (targets already in MRAM)
+                workflow_.scatterDescriptorsOnly(query_descriptors);
 
                 uint64_t zero_hdr = 0;
-                dpu_comm_.broadcastData(&zero_hdr, 8, layouts[0].results_offset);
+                dpu_comm_.broadcastData(&zero_hdr, 8, max_layout.results_offset);
 
                 std::fill(dpu_active.begin(), dpu_active.end(), false);
                 std::fill(dpu_ready.begin(), dpu_ready.end(), false);
@@ -1851,7 +1946,7 @@ namespace mmseqs::dpu
                         inflight_groups -= drained;
                         for (uint32_t d = 0; d < num_dpus; ++d) {
                             if (!dpu_ready[d]) continue;
-                            dpu_hits[d] = gatherChecked(d, layouts[d]);
+                            dpu_hits[d] = gatherChecked(d, max_layout);
                             dpu_ready[d] = false;
                             dpu_active[d] = false;
                         }

@@ -20,12 +20,12 @@
 #define MAX_TARGET_LEN 5000
 
 #define Q_TILE_SIZE 64
-#define T_TILE_SIZE 64
+#define T_TILE_SIZE 128  /* Increased from 64 to improve arithmetic intensity */
 
 #define GAP_OPEN 11
 #define GAP_EXTEND 1
 
-#define SCRATCH_SIZE 2560
+#define SCRATCH_SIZE 3500  /* Increased to accommodate larger tile size */
 
 /* Macros */
 #define ALIGN8(x) (((x) + 7) & ~7U)
@@ -183,6 +183,7 @@ static SwResult compute_sw_tiled(
 
         // At the start of each target tile, the top boundary (row 0) is the DP row at the
         // query-tile boundary, initialized to 0/NEG_INF for the very first query tile.
+        #pragma unroll 4
         for (uint32_t col = 0; col <= t_size; col++)
         {
             H_top[col] = 0;
@@ -198,6 +199,7 @@ static SwResult compute_sw_tiled(
             uint32_t vec_bytes = ALIGN8((q_size + 1) * sizeof(int16_t));
             if (t_tile_idx == 0)
             {
+                #pragma unroll 4
                 for (uint32_t i = 0; i <= q_size; i++)
                 {
                     H_col[i] = 0;
@@ -231,13 +233,18 @@ static SwResult compute_sw_tiled(
                 int16_t f_up = F_top[col];       // F(0,col)
                 int16_t h_diag = H_top[col - 1]; // H(0,col-1)
 
+                // Optimized PSSM access: pointer to column for this amino acid
+                int8_t *pssm_ptr = &pssm_tile[aa];
+
                 // Sweep i = 1..q_size, update H_col/E_col in place (column-major)
                 for (uint32_t i = 1; i <= q_size; i++)
                 {
                     int16_t h_left = H_col[i]; // old H(i,col-1)
                     int16_t e_left = E_col[i]; // old E(i,col-1)
 
-                    int8_t sub = pssm_tile[(i - 1) * ALPHA_SIZE + aa];
+                    // Optimized: pointer arithmetic instead of multiply+add
+                    int8_t sub = *pssm_ptr;
+                    pssm_ptr += ALPHA_SIZE;
 
                     // E(i,col) from left (gap in target / horizontal gap) — saturating
                     int16_t e_ext = sat_sub(e_left, gap_extend);
@@ -367,7 +374,7 @@ int main() {
     uintptr_t mram_scratch_vectors = scratch_base + task_offset;
 
     const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(GappedHit));
-    GappedHit local_hits[8];
+    GappedHit local_hits[32];  /* Increased from 8 to reduce mutex contention */
     uint32_t local_count = 0;
 
 #define FLUSH_LOCAL_HITS()                                                                 \
@@ -467,7 +474,7 @@ int main() {
             hit.padding[2] = 0;
 
             local_hits[local_count++] = hit;
-            if (local_count == (sizeof(local_hits) / sizeof(local_hits[0])))
+            if (local_count == 32)  /* Flush when buffer is full */
                 FLUSH_LOCAL_HITS();
         }
     }
