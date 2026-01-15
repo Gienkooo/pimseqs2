@@ -26,6 +26,8 @@
 #define GAP_EXTEND 1
 
 #define SCRATCH_SIZE 3500  /* Increased to accommodate larger tile size */
+/* Limit number of active tasklets to a safe WRAM footprint */
+#define MAX_SAFE_TASKLETS 8
 
 /* Macros */
 #define ALIGN8(x) (((x) + 7) & ~7U)
@@ -41,6 +43,8 @@ __host uint32_t g_hit_count;
 __host uint32_t g_hit_write_offset;
 __host uint32_t g_next_target_idx;
 __host uint32_t g_overflow;
+/* Launch control: set to 0 by tasklet 0 if this launch cannot proceed safely */
+volatile uint8_t g_launch_ok = 1;
 
 #define MAX_BATCH_QUERIES 128
 __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
@@ -430,8 +434,16 @@ int main() {
     }
     barrier_wait(&my_barrier);
 
-    /* DYNAMIC TASKLET CHECK: exit immediately if this tasklet is not active */
-    if (!is_tasklet_active(g_bd.header.num_active_tasklets)) return 0;
+    /* Respect WRAM-safe limit: clamp num_active_tasklets to MAX_SAFE_TASKLETS */
+    uint8_t effective_tasklets = g_bd.header.num_active_tasklets;
+    if (effective_tasklets == 0 || effective_tasklets > MAX_SAFE_TASKLETS) {
+        effective_tasklets = MAX_SAFE_TASKLETS;
+    }
+
+    /* DYNAMIC TASKLET CHECK: do not exit early; inactive tasklets must still
+     * participate in all barriers to avoid deadlock. Use `is_active` to skip
+     * work while still hitting barrier_wait() calls. */
+    bool is_active = (tasklet_id < effective_tasklets);
 
     if (tasklet_id == 0) {
         __dma_aligned uint32_t hdr[2] = {0, 0};
@@ -459,11 +471,16 @@ int main() {
 
         // Ensure results buffer has space for at least an 8-byte header plus scratch
         if (g_bd.header.results_buffer_size <= (scratch_needed + 8)) {
-            // not enough space to run safely
-            return 0;
+            // not enough space to run safely; request abort so all tasklets
+            // still participate in barriers before exiting.
+            g_launch_ok = 0;
         }
     }
     barrier_wait(&my_barrier);
+
+    /* If tasklet 0 determined the launch is unsafe, all tasklets should exit
+     * after the barrier to avoid deadlock and avoid partially-initialized state. */
+    if (!g_launch_ok) return 0;
 
     if (tasklet_id == 0) {
         // Reset WRAM allocator so per-launch allocations start from a clean state
@@ -473,8 +490,15 @@ int main() {
     }
     barrier_wait(&my_barrier);
 
-    uint8_t *scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
-    uint8_t *scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
+    uint8_t *scratch_buffer_raw  = NULL;
+    uint8_t *scratch_buffer      = NULL;
+
+    /* Only active tasklets allocate WRAM scratch; inactive tasklets skip
+     * allocations but continue to participate in barriers. */
+    if (is_active) {
+        scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
+        scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
+    }
 
     if (tasklet_id == 0) {
         if (!scratch_buffer_raw) {
@@ -485,7 +509,8 @@ int main() {
         }
     }
 
-    if (!scratch_buffer_raw) return 0;
+    /* If an active tasklet failed to allocate, abort kernel for safety. */
+    if (is_active && !scratch_buffer_raw) return 0;
 
     // header.query_len is now MAX query len in batch
     uint32_t max_query_len = g_bd.header.query_len;

@@ -315,8 +315,10 @@ int main() {
         effective_tasklets = MAX_SAFE_TASKLETS;
     }
     
-    /* DYNAMIC TASKLET CHECK: exit immediately if this tasklet is not active */
-    if (tasklet_id >= effective_tasklets) return 0;
+    /* DYNAMIC TASKLET CHECK: do not exit early; inactive tasklets must still
+     * participate in all barriers to avoid deadlock. Use `is_active` to skip
+     * work while still hitting barrier_wait() calls. */
+    bool is_active = (tasklet_id < effective_tasklets);
 
     if (tasklet_id == 0) {
         __dma_aligned uint32_t hdr[2] = {0, 0};
@@ -342,10 +344,18 @@ int main() {
     }
     barrier_wait(&my_barrier);
 
-    uint8_t *scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
-    uint8_t *scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
+    uint8_t *scratch_buffer_raw = NULL;
+    uint8_t *scratch_buffer = NULL;
 
-    if (!scratch_buffer_raw) return 0;
+    /* Only active tasklets allocate WRAM scratch; inactive tasklets skip
+     * allocations but continue to participate in barriers. */
+    if (is_active) {
+        scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
+        scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
+    }
+
+    /* If an active tasklet failed to allocate, abort the kernel for safety. */
+    if (is_active && !scratch_buffer_raw) return 0;
 
     // header.query_len is now MAX query len in batch
     uint32_t max_query_len = g_bd.header.query_len;
@@ -385,89 +395,93 @@ int main() {
         }                                                                                  \
     } while (0)
     
-    while (1) {
-        mutex_lock(job_mutex);
-        uint32_t t = g_next_target_idx++;
-        mutex_unlock(job_mutex);
+    /* Only active tasklets perform the work loop; inactive ones skip straight
+     * to the final barrier to avoid deadlock. */
+    if (is_active) {
+        while (1) {
+            mutex_lock(job_mutex);
+            uint32_t t = g_next_target_idx++;
+            mutex_unlock(job_mutex);
 
-        if (t >= g_bd.header.num_targets) break;
+            if (t >= g_bd.header.num_targets) break;
 
-        __dma_aligned TargetMetadata meta;
-        uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
-        mram_read((__mram_ptr void*)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
-        
-        if (meta.target_len == 0 || meta.target_len > MAX_TARGET_LEN) {
-            continue;
+            __dma_aligned TargetMetadata meta;
+            uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
+            mram_read((__mram_ptr void*)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
+            
+            if (meta.target_len == 0 || meta.target_len > MAX_TARGET_LEN) {
+                continue;
+            }
+            
+            /* FILTER 1: canBeCovered - skip pairs that can never achieve coverage */
+            if (!can_be_covered(max_query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
+                continue;
+            }
+            
+            // Loop over all queries in the batch
+            for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
+                // Use cached metadata if available, else read from MRAM
+                QueryMetadata qmeta;
+                if (q_idx < MAX_BATCH_QUERIES) {
+                    qmeta = g_query_meta[q_idx];
+                } else {
+                    uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
+                    mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
+                }
+
+                uintptr_t pssm_addr = pssm_base_start + qmeta.pssm_offset_in_batch;
+
+                SwResult sw = compute_sw_tiled(
+                    mram_base,
+                    g_bd.header.targets_data_offset + meta.offset_in_data, 
+                    meta.target_len,
+                    qmeta.query_len,
+                    pssm_addr,
+                    mram_scratch_vectors,
+                    scratch_buffer,
+                    SCRATCH_SIZE,
+                    g_bd.gap_open_cost,
+                    g_bd.gap_extend_cost);
+                
+                /* FILTER 2: min_score threshold */
+                if (sw.score < min_score) {
+                    continue;
+                }
+                
+                /* FILTER 3: minimum alignment length */
+                uint16_t aln_len = (sw.q_end > sw.t_end) ? sw.q_end : sw.t_end;
+                if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len) {
+                    continue;
+                }
+                
+                /* FILTER 4: hasCoverage - check actual coverage from alignment */
+                if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
+                    continue;
+                }
+                
+                /* FILTER 5: estimated sequence identity (NO DIVISION!) */
+                if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct)) {
+                    continue;
+                }
+                
+                /* All filters passed - write hit */
+                __dma_aligned GappedHit hit;
+                hit.target_id = meta.target_id;
+                hit.score = sw.score;
+                hit.q_end = sw.q_end;
+                hit.t_end = sw.t_end;
+                hit.padding[0] = (uint16_t)q_idx;
+                hit.padding[1] = 0;
+                hit.padding[2] = 0;
+
+                local_hits[local_count++] = hit;
+                if (local_count == (sizeof(local_hits) / sizeof(local_hits[0])))
+                    FLUSH_LOCAL_HITS();
+            }
         }
         
-        /* FILTER 1: canBeCovered - skip pairs that can never achieve coverage */
-        if (!can_be_covered(max_query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
-            continue;
-        }
-        
-        // Loop over all queries in the batch
-        for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
-            // Use cached metadata if available, else read from MRAM
-            QueryMetadata qmeta;
-            if (q_idx < MAX_BATCH_QUERIES) {
-                qmeta = g_query_meta[q_idx];
-            } else {
-                uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
-                mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
-            }
-
-            uintptr_t pssm_addr = pssm_base_start + qmeta.pssm_offset_in_batch;
-
-            SwResult sw = compute_sw_tiled(
-                mram_base,
-                g_bd.header.targets_data_offset + meta.offset_in_data, 
-                meta.target_len,
-                qmeta.query_len,
-                pssm_addr,
-                mram_scratch_vectors,
-                scratch_buffer,
-                SCRATCH_SIZE,
-                g_bd.gap_open_cost,
-                g_bd.gap_extend_cost);
-            
-            /* FILTER 2: min_score threshold */
-            if (sw.score < min_score) {
-                continue;
-            }
-            
-            /* FILTER 3: minimum alignment length */
-            uint16_t aln_len = (sw.q_end > sw.t_end) ? sw.q_end : sw.t_end;
-            if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len) {
-                continue;
-            }
-            
-            /* FILTER 4: hasCoverage - check actual coverage from alignment */
-            if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
-                continue;
-            }
-            
-            /* FILTER 5: estimated sequence identity (NO DIVISION!) */
-            if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct)) {
-                continue;
-            }
-            
-            /* All filters passed - write hit */
-            __dma_aligned GappedHit hit;
-            hit.target_id = meta.target_id;
-            hit.score = sw.score;
-            hit.q_end = sw.q_end;
-            hit.t_end = sw.t_end;
-            hit.padding[0] = (uint16_t)q_idx;
-            hit.padding[1] = 0;
-            hit.padding[2] = 0;
-
-            local_hits[local_count++] = hit;
-            if (local_count == (sizeof(local_hits) / sizeof(local_hits[0])))
-                FLUSH_LOCAL_HITS();
-        }
+        FLUSH_LOCAL_HITS();
     }
-    
-    FLUSH_LOCAL_HITS();
 
 #undef FLUSH_LOCAL_HITS
 
