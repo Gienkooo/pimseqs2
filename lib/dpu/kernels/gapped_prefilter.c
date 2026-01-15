@@ -20,12 +20,13 @@
 #define MAX_TARGET_LEN 5000
 
 #define Q_TILE_SIZE 64
-#define T_TILE_SIZE 128  /* Increased from 64 to improve arithmetic intensity */
+#define T_TILE_SIZE 64
 
 #define GAP_OPEN 11
 #define GAP_EXTEND 1
 
-#define SCRATCH_SIZE 3500  /* Increased to accommodate larger tile size */
+#define SCRATCH_SIZE 2560
+#define MAX_SAFE_TASKLETS 8  /* Maximum tasklets that fit safely in WRAM */
 
 /* Macros */
 #define ALIGN8(x) (((x) + 7) & ~7U)
@@ -183,7 +184,6 @@ static SwResult compute_sw_tiled(
 
         // At the start of each target tile, the top boundary (row 0) is the DP row at the
         // query-tile boundary, initialized to 0/NEG_INF for the very first query tile.
-        #pragma unroll 4
         for (uint32_t col = 0; col <= t_size; col++)
         {
             H_top[col] = 0;
@@ -199,7 +199,6 @@ static SwResult compute_sw_tiled(
             uint32_t vec_bytes = ALIGN8((q_size + 1) * sizeof(int16_t));
             if (t_tile_idx == 0)
             {
-                #pragma unroll 4
                 for (uint32_t i = 0; i <= q_size; i++)
                 {
                     H_col[i] = 0;
@@ -233,18 +232,13 @@ static SwResult compute_sw_tiled(
                 int16_t f_up = F_top[col];       // F(0,col)
                 int16_t h_diag = H_top[col - 1]; // H(0,col-1)
 
-                // Optimized PSSM access: pointer to column for this amino acid
-                int8_t *pssm_ptr = &pssm_tile[aa];
-
                 // Sweep i = 1..q_size, update H_col/E_col in place (column-major)
                 for (uint32_t i = 1; i <= q_size; i++)
                 {
                     int16_t h_left = H_col[i]; // old H(i,col-1)
                     int16_t e_left = E_col[i]; // old E(i,col-1)
 
-                    // Optimized: pointer arithmetic instead of multiply+add
-                    int8_t sub = *pssm_ptr;
-                    pssm_ptr += ALPHA_SIZE;
+                    int8_t sub = pssm_tile[(i - 1) * ALPHA_SIZE + aa];
 
                     // E(i,col) from left (gap in target / horizontal gap) — saturating
                     int16_t e_ext = sat_sub(e_left, gap_extend);
@@ -315,8 +309,14 @@ int main() {
     }
     barrier_wait(&my_barrier);
 
+    /* Respect WRAM-safe limit: clamp num_active_tasklets to MAX_SAFE_TASKLETS */
+    uint8_t effective_tasklets = g_bd.header.num_active_tasklets;
+    if (effective_tasklets == 0 || effective_tasklets > MAX_SAFE_TASKLETS) {
+        effective_tasklets = MAX_SAFE_TASKLETS;
+    }
+    
     /* DYNAMIC TASKLET CHECK: exit immediately if this tasklet is not active */
-    if (!is_tasklet_active(g_bd.header.num_active_tasklets)) return 0;
+    if (tasklet_id >= effective_tasklets) return 0;
 
     if (tasklet_id == 0) {
         __dma_aligned uint32_t hdr[2] = {0, 0};
@@ -333,18 +333,6 @@ int main() {
         if (num_q > MAX_BATCH_QUERIES) num_q = MAX_BATCH_QUERIES; // Safety
         uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
         mram_read((__mram_ptr void*)qmeta_base, g_query_meta, MRAM_ALIGN_SIZE(num_q * sizeof(QueryMetadata)));
-    }
-    barrier_wait(&my_barrier);
-    if (tasklet_id == 0) {
-        uint32_t hitsArea = MRAM_ALIGN_SIZE(g_bd.header.num_targets * g_bd.header.num_queries * sizeof(GappedHit) + 64);
-        uint32_t vecBytes = MRAM_ALIGN_SIZE((g_bd.header.query_len + 1) * sizeof(int16_t));
-        // Use active_tasklets for check, matching host allocation
-        uint32_t needed = hitsArea + (2 * vecBytes) * (g_bd.header.num_active_tasklets);
-
-        if (needed > g_bd.header.results_buffer_size) {
-            // hitCount already set to 0, so host gather is safe
-            return 0;
-        }
     }
     barrier_wait(&my_barrier);
 
@@ -374,7 +362,7 @@ int main() {
     uintptr_t mram_scratch_vectors = scratch_base + task_offset;
 
     const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(GappedHit));
-    GappedHit local_hits[32];  /* Increased from 8 to reduce mutex contention */
+    GappedHit local_hits[8];
     uint32_t local_count = 0;
 
 #define FLUSH_LOCAL_HITS()                                                                 \
@@ -474,7 +462,7 @@ int main() {
             hit.padding[2] = 0;
 
             local_hits[local_count++] = hit;
-            if (local_count == 32)  /* Flush when buffer is full */
+            if (local_count == (sizeof(local_hits) / sizeof(local_hits[0])))
                 FLUSH_LOCAL_HITS();
         }
     }

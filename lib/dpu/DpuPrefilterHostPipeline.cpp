@@ -1054,12 +1054,10 @@ namespace mmseqs::dpu
         std::vector<float> compBias(qdbr->getMaxSeqLen() + 1, 0.0f);
 
         // DYNAMIC TASKLET CALCULATION
-        // Tiled implementation uses fixed WRAM per tasklet regardless of sequence length
-        // Stack (~2KB) + Heap (3 * 128 * 4 + 128 + 128 = 1792 bytes) -> ~4KB
-        uint32_t wram_per_tasklet = 4096; 
-        uint8_t allowed_tasklets = calculateActiveTasklets(wram_per_tasklet);
-        const uint8_t DESIRED_TASKLETS = 14;
-        uint8_t active_tasklets = std::min<uint8_t>(DESIRED_TASKLETS, allowed_tasklets);
+        // Kernel MAX_SAFE_TASKLETS=8 due to WRAM constraints (stack + SW buffers + scratch)
+        // Host matches kernel limit for optimal resource usage
+        const uint8_t MAX_KERNEL_TASKLETS = 8;
+        uint8_t active_tasklets = MAX_KERNEL_TASKLETS;
 
         // Pre-calculate max query sizes for layout
         const uint32_t max_query_len = qdbr->getMaxSeqLen();
@@ -1659,11 +1657,10 @@ namespace mmseqs::dpu
         }
 
         // DYNAMIC TASKLET CALCULATION
-        // Reduced WRAM usage allows for more tasklets (approx 4KB per tasklet)
-        uint32_t wram_per_tasklet = 4000u;
-        uint8_t allowed_tasklets_comb = calculateActiveTasklets(wram_per_tasklet); 
-        const uint8_t DESIRED_TASKLETS = 14;
-        uint8_t tasklet_limit = std::min<uint8_t>(DESIRED_TASKLETS, allowed_tasklets_comb);
+        // Kernel MAX_SAFE_TASKLETS=8 due to WRAM constraints (stack + SW buffers + scratch)
+        // Host matches kernel limit for optimal resource usage
+        const uint8_t MAX_KERNEL_TASKLETS = 8;
+        uint8_t tasklet_limit = MAX_KERNEL_TASKLETS;
 
         struct CombinedLimits {
             uint32_t max_batch_queries;
