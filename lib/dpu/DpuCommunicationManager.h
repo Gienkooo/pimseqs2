@@ -85,26 +85,11 @@ class DpuCommunicationManager {
   std::vector<struct dpu_set_t> getRankSets();
   const std::vector<struct dpu_set_t>& getDpuSets() const { return dpu_sets_; }
 
- private:
-  std::vector<struct dpu_set_t> rank_sets_; // one set per rank
-  std::vector<struct dpu_set_t> dpu_sets_; // one set per DPU for independent control
-  std::vector<bool> async_per_dpu_;
-  uint32_t num_dpus_available_;
-  uint32_t num_dpus_active_;
-  bool async_in_progress_ = false;
-  bool is_simulator_ = false;
-  bool profile_enabled_ = false;
-  bool allocated_from_system_ = false;
-  struct dpu_set_t system_set_;
-
-  struct ProfileEntry {
-    uint64_t count = 0;
-    uint64_t bytes = 0;
-    double total_ms = 0.0;
-    double max_ms = 0.0;
-  };
-
+  // ============== PUBLIC PROFILING INTERFACE ==============
+  
+  // All profile slots - DPU communication AND host processing
   enum class ProfileSlot {
+    // DPU Communication
     Broadcast = 0,
     ScatterSingle,
     ScatterParallel,
@@ -115,13 +100,27 @@ class DpuCommunicationManager {
     LaunchAsync,
     WaitSync,
     WaitAsync,
+    // Host Processing
+    HostBuildQueryBatch,    // Building query batches (PSSM generation)
+    HostBuildTargetBatch,   // Assembling target data for DPUs
+    HostProcessHits,        // processDpuHits() - the suspected bottleneck
+    HostResultWrite,        // Writing results to disk
+    HostDispatcherWait,     // Time spent in dispatcher polling loop
+    HostTotalBatch,         // Total time per query batch (end-to-end)
     Count
   };
 
-  std::array<ProfileEntry, static_cast<size_t>(ProfileSlot::Count)> profile_{};
+  struct ProfileEntry {
+    uint64_t count = 0;
+    uint64_t bytes = 0;
+    uint64_t items = 0;      // For counting hits, queries, etc.
+    double total_ms = 0.0;
+    double max_ms = 0.0;
+  };
 
   using Clock = std::chrono::steady_clock;
 
+  // RAII timer - automatically records duration on destruction
   struct ScopedTimer {
     Clock::time_point start;
     ProfileEntry* entry;
@@ -134,7 +133,46 @@ class DpuCommunicationManager {
       entry->total_ms += ms;
       if (ms > entry->max_ms) entry->max_ms = ms;
     }
+    // Disable copy, enable move
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+    ScopedTimer(ScopedTimer&& other) noexcept : start(other.start), entry(other.entry) {
+      other.entry = nullptr;  // Prevent double recording
+    }
+    ScopedTimer& operator=(ScopedTimer&&) = delete;
   };
+
+  // Public access for host-side profiling
+  inline ProfileEntry* getProfileSlot(ProfileSlot s) {
+    return profile_enabled_ ? &profile_[static_cast<size_t>(s)] : nullptr;
+  }
+  
+  // Convenience: create a scoped timer for a slot
+  inline ScopedTimer timeSlot(ProfileSlot s) {
+    return ScopedTimer(getProfileSlot(s));
+  }
+  
+  // Record additional metrics (bytes, items) for a slot
+  inline void recordSlotMetrics(ProfileSlot s, uint64_t bytes, uint64_t items = 0) {
+    if (!profile_enabled_) return;
+    auto& e = profile_[static_cast<size_t>(s)];
+    e.bytes += bytes;
+    e.items += items;
+  }
+
+ private:
+  std::vector<struct dpu_set_t> rank_sets_; // one set per rank
+  std::vector<struct dpu_set_t> dpu_sets_; // one set per DPU for independent control
+  std::vector<bool> async_per_dpu_;
+  uint32_t num_dpus_available_;
+  uint32_t num_dpus_active_;
+  bool async_in_progress_ = false;
+  bool is_simulator_ = false;
+  bool profile_enabled_ = false;
+  bool allocated_from_system_ = false;
+  struct dpu_set_t system_set_;
+
+  std::array<ProfileEntry, static_cast<size_t>(ProfileSlot::Count)> profile_{};
 
   inline ProfileEntry* slot(ProfileSlot s) {
     return profile_enabled_ ? &profile_[static_cast<size_t>(s)] : nullptr;
