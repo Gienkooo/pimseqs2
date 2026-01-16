@@ -7,118 +7,29 @@
 #include <mutex.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "dpu_common.h"
 
-#ifndef NR_TASKLETS
-#define NR_TASKLETS 1
-#endif
-
-#define ALPHA_SIZE 21
+/* Kernel-specific constants */
 #define MAX_TARGET_LEN 5000
 
-#define Q_TILE_SIZE 64
-#define T_TILE_SIZE 64
-
-#define GAP_OPEN 11
-#define GAP_EXTEND 1
-
-#define SCRATCH_SIZE 2560
-#define MAX_SAFE_TASKLETS 8  /* Maximum tasklets that fit safely in WRAM */
-
-/* Macros */
-#define ALIGN8(x) (((x) + 7) & ~7U)
-#define ALIGN8_PTR(p) ((void*)(((uintptr_t)(p) + 7) & ~((uintptr_t)7)))
+/* Dynamic scratch size based on tasklet count.
+ * Gapped-only kernel needs less scratch than combined kernel.
+ * WRAM budget: ~3KB per tasklet with 11 tasklets. */
+#define SCRATCH_SIZE SCRATCH_PER_TASKLET(MAX_SAFE_TASKLETS)
 
 __dma_aligned GappedBatchDescriptor g_bd;
 BARRIER_INIT(my_barrier, NR_TASKLETS);
 MUTEX_INIT(hit_mutex);
-MUTEX_INIT(job_mutex);
 
 __host uint32_t g_hit_count;
 __host uint32_t g_hit_write_offset;
-__host uint32_t g_next_target_idx;
 __host uint32_t g_overflow;
 
-#define MAX_BATCH_QUERIES 128
+__host uint8_t g_effective_tasklets;
+
 __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
-
-typedef struct {
-    int16_t score;
-    uint16_t q_end;
-    uint16_t t_end;
-} SwResult;
-
-/* Safe unaligned MRAM read helper (uses 32-byte temp buffer). */
-static inline void mram_read_unaligned_bytes(uintptr_t src, void *dst, uint32_t len)
-{
-    uint32_t off = (uint32_t)(src & 7U);
-    uintptr_t aligned_src = src & ~7U;
-    uint32_t need = ALIGN8(len + off);
-
-    __dma_aligned uint8_t tmp[32];
-
-    // Read aligned region into temp buffer.
-    mram_read((__mram_ptr void *)aligned_src, tmp, need);
-
-    // Copy requested payload into destination.
-    memcpy((uint8_t *)dst, tmp + off, len);
-}
-
-/* Unaligned MRAM read for larger payloads without oversized WRAM temps. */
-static inline void mram_read_unaligned_bulk(uintptr_t src, void *dst, uint32_t len)
-{
-    uint32_t off = (uint32_t)(src & 7U);
-    uintptr_t aligned = src & ~7U;
-    uint8_t *out = (uint8_t *)dst;
-
-    if (off != 0)
-    {
-        uint32_t head = 8U - off;
-        if (head > len)
-            head = len;
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp + off, head);
-        aligned += 8;
-        out += head;
-        len -= head;
-    }
-
-    uint32_t mid = len & ~7U;
-    if (mid)
-    {
-        mram_read((__mram_ptr void *)aligned, out, mid);
-        aligned += mid;
-        out += mid;
-        len -= mid;
-    }
-
-    if (len)
-    {
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp, len);
-    }
-}
-
-static void mram_fill_i16(uintptr_t mram_addr, uint32_t num_elems, int16_t value)
-{
-    __dma_aligned int16_t buf[8];
-    for (int i = 0; i < 8; i++)
-        buf[i] = value;
-
-    uint32_t total_bytes = ALIGN8(num_elems * sizeof(int16_t));
-    for (uint32_t off = 0; off < total_bytes; off += 16)
-    {
-        uint32_t chunk = (total_bytes - off > 16) ? 16 : (total_bytes - off);
-        if (chunk < 8)
-            chunk = 8;
-        mram_write(buf, (__mram_ptr void *)(mram_addr + off), ALIGN8(chunk));
-    }
-}
 
 static SwResult compute_sw_tiled(
     uintptr_t mram_base,
@@ -212,9 +123,14 @@ static SwResult compute_sw_tiled(
             }
 
             // Load PSSM rows for this query tile in a single block read
+            // Use aligned path when possible (host pads PSSM to 32-byte boundaries)
             uintptr_t tile_addr = pssm_mram_base + (uintptr_t)q_start * ALPHA_SIZE;
             uint32_t tile_bytes = q_size * ALPHA_SIZE;
-            mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            if ((tile_addr & 7U) == 0) {
+                mram_read_aligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            } else {
+                mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            }
 
             // Ensure column 0 boundary for this query tile
             H_bot[0] = H_col[q_size];
@@ -306,19 +222,18 @@ int main() {
     
     if (tasklet_id == 0) {
         mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(GappedBatchDescriptor)));
+        
+        /* Compute effective tasklets into SHARED global */
+        uint8_t eff = g_bd.header.num_active_tasklets;
+        if (eff == 0 || eff > MAX_SAFE_TASKLETS) {
+            eff = MAX_SAFE_TASKLETS;
+        }
+        g_effective_tasklets = eff;
     }
     barrier_wait(&my_barrier);
 
-    /* Respect WRAM-safe limit: clamp num_active_tasklets to MAX_SAFE_TASKLETS */
-    uint8_t effective_tasklets = g_bd.header.num_active_tasklets;
-    if (effective_tasklets == 0 || effective_tasklets > MAX_SAFE_TASKLETS) {
-        effective_tasklets = MAX_SAFE_TASKLETS;
-    }
-    
-    /* DYNAMIC TASKLET CHECK: do not exit early; inactive tasklets must still
-     * participate in all barriers to avoid deadlock. Use `is_active` to skip
-     * work while still hitting barrier_wait() calls. */
-    bool is_active = (tasklet_id < effective_tasklets);
+    /* Now ALL tasklets can safely read the shared g_effective_tasklets */
+    bool is_active = (tasklet_id < g_effective_tasklets);
 
     if (tasklet_id == 0) {
         __dma_aligned uint32_t hdr[2] = {0, 0};
@@ -328,7 +243,6 @@ int main() {
         g_hit_count = 0;
         g_hit_write_offset = 8; // hits start right after the 8-byte [count+pad] header
         g_overflow = 0;
-        g_next_target_idx = 0;
 
         // Cache Query Metadata
         uint32_t num_q = g_bd.header.num_queries;
@@ -395,16 +309,12 @@ int main() {
         }                                                                                  \
     } while (0)
     
-    /* Only active tasklets perform the work loop; inactive ones skip straight
-     * to the final barrier to avoid deadlock. */
+    // Only active tasklets should enter the work loop
+    // All the other ones jump straight to the final barrier
     if (is_active) {
-        while (1) {
-            mutex_lock(job_mutex);
-            uint32_t t = g_next_target_idx++;
-            mutex_unlock(job_mutex);
-
-            if (t >= g_bd.header.num_targets) break;
-
+        // Static round-robin work distribution
+        for (uint32_t t = tasklet_id; t < g_bd.header.num_targets; t += g_effective_tasklets)
+        {
             __dma_aligned TargetMetadata meta;
             uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
             mram_read((__mram_ptr void*)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));

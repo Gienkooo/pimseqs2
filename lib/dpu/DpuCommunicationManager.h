@@ -42,6 +42,12 @@ class DpuCommunicationManager {
   void gatherDataParallel(std::vector<std::vector<uint8_t>>& per_dpu_buffers,
                           uint32_t size_per_dpu, uint32_t dpu_mram_offset);
 
+  // Optimized gather that reads variable sizes per DPU using provided size vector
+  // More efficient when DPUs have different result sizes (avoids wasted bandwidth)
+  void gatherDataParallelVariable(std::vector<std::vector<uint8_t>>& per_dpu_buffers,
+                                   const std::vector<uint32_t>& sizes_per_dpu,
+                                   uint32_t dpu_mram_offset);
+
   void loadKernel(const char* kernel_binary_path);
   void executeKernels(); 
   void executeKernelsAsync();  // Non-blocking launch

@@ -7,100 +7,33 @@
 #include <mutex.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "dpu_common.h"
 
-#ifndef NR_TASKLETS
-#define NR_TASKLETS 1
-#endif
+/* Kernel-specific constants - override defaults from dpu_common.h */
+#undef T_TILE_SIZE
+#define T_TILE_SIZE 128   /* Larger tile for combined kernel */
 
-/* Configuration */
-#define ALPHA_SIZE 21
-
-#define Q_TILE_SIZE 64
-#define T_TILE_SIZE 128  /* Increased from 64 to improve arithmetic intensity */
-
-#define GAP_OPEN 11
-#define GAP_EXTEND 1
-
-#define SCRATCH_SIZE 3500  /* Increased to accommodate larger tile size */
-/* Limit number of active tasklets to a safe WRAM footprint */
-#define MAX_SAFE_TASKLETS 8
-
-/* Macros */
-#define ALIGN8(x) (((x) + 7) & ~7U)
-#define ALIGN8_PTR(p) ((void*)(((uintptr_t)(p) + 7) & ~((uintptr_t)7)))
+/* Dynamic scratch size based on tasklet count.
+ * With 11 tasklets: ~3.5KB per tasklet (SCRATCH_PER_TASKLET(11) ≈ 3600)
+ * With 8 tasklets:  ~5KB per tasklet   (SCRATCH_PER_TASKLET(8) ≈ 5500)
+ * Use conservative default that works for up to MAX_SAFE_TASKLETS. */
+#define SCRATCH_SIZE SCRATCH_PER_TASKLET(MAX_SAFE_TASKLETS)
 
 /* Globals */
 __dma_aligned CombinedBatchDescriptor g_bd;
 BARRIER_INIT(my_barrier, NR_TASKLETS);
 MUTEX_INIT(hit_mutex);
-MUTEX_INIT(job_mutex);
 
 __host uint32_t g_hit_count;
 __host uint32_t g_hit_write_offset;
-__host uint32_t g_next_target_idx;
 __host uint32_t g_overflow;
-/* Launch control: set to 0 by tasklet 0 if this launch cannot proceed safely */
-volatile uint8_t g_launch_ok = 1;
 
-#define MAX_BATCH_QUERIES 128
+/* Shared tasklet limit - set by tasklet 0, read by all after barrier */
+__host uint8_t g_effective_tasklets;
+
 __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
-
-/* Safe unaligned MRAM read helper (uses 32-byte temp buffer). */
-static inline void mram_read_unaligned_bytes(uintptr_t src, void *dst, uint32_t len)
-{
-    uint32_t off = (uint32_t)(src & 7U);
-    uintptr_t aligned_src = src & ~7U;
-    uint32_t need = ALIGN8(len + off);
-
-    __dma_aligned uint8_t tmp[32];
-
-    // Read aligned region into temp buffer.
-    mram_read((__mram_ptr void *)aligned_src, tmp, need);
-
-    // Copy requested payload into destination.
-    memcpy((uint8_t *)dst, tmp + off, len);
-}
-
-/* Bulk unaligned MRAM read for larger payloads - more efficient than multiple small reads */
-static inline void mram_read_unaligned_bulk(uintptr_t src, void *dst, uint32_t len)
-{
-    uint32_t off = (uint32_t)(src & 7U);
-    uintptr_t aligned = src & ~7U;
-    uint8_t *out = (uint8_t *)dst;
-
-    if (off != 0)
-    {
-        uint32_t head = 8U - off;
-        if (head > len)
-            head = len;
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp + off, head);
-        aligned += 8;
-        out += head;
-        len -= head;
-    }
-
-    uint32_t mid = len & ~7U;
-    if (mid)
-    {
-        mram_read((__mram_ptr void *)aligned, out, mid);
-        aligned += mid;
-        out += mid;
-        len -= mid;
-    }
-
-    if (len)
-    {
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp, len);
-    }
-}
 
 /* -------------------------------------------------------------------------
  * UNGAPPED HEURISTIC
@@ -128,13 +61,19 @@ static bool compute_ungapped_diagonal(
     uint8_t *t_buf = scratch_buffer + diag_buf_bytes;
     uint32_t t_buf_size = scratch_size - diag_buf_bytes;
 
-    /* Pre-allocate PSSM cache for bulk loading - much more efficient than row-by-row */
+    /* Pre-allocate PSSM cache for bulk loading - much more efficient than row-by-row.
+     * Host guarantees PSSM blocks are 32-byte aligned, so use fast aligned read path. */
     uint32_t pssm_bytes = q_len * ALPHA_SIZE;
     uint32_t pssm_buf_bytes = ALIGN8(pssm_bytes + 8);
     if (diag_buf_bytes + pssm_buf_bytes >= scratch_size) return false;
     
     int8_t *pssm_cache = (int8_t *)(scratch_buffer + diag_buf_bytes);
-    mram_read_unaligned_bulk(pssm_mram_base, pssm_cache, pssm_bytes);
+    /* Use aligned bulk read since host pads PSSM to 32-byte boundaries */
+    if ((pssm_mram_base & 7U) == 0) {
+        mram_read_aligned_bulk(pssm_mram_base, pssm_cache, pssm_bytes);
+    } else {
+        mram_read_unaligned_bulk(pssm_mram_base, pssm_cache, pssm_bytes);
+    }
     
     /* Recompute available target buffer space after PSSM cache */
     t_buf = scratch_buffer + diag_buf_bytes + pssm_buf_bytes;
@@ -184,7 +123,7 @@ static bool compute_ungapped_diagonal(
     /* Find max score with loop unrolling for better pipeline utilization */
     int16_t global_max_score = 0;
     uint32_t i = 0;
-    /* Unrolled loop - process 4 elements at a time */
+    /* Unrolled loop - process 4 elements at a time. Simulates vectorization */
     for (; i + 3 < num_diags; i += 4) {
         int16_t m0 = diag_buffer[i];
         int16_t m1 = diag_buffer[i + 1];
@@ -208,28 +147,6 @@ static bool compute_ungapped_diagonal(
 /* -------------------------------------------------------------------------
  * GAPPED ALIGNMENT (Tiled SW)
  * ------------------------------------------------------------------------- */
-typedef struct
-{
-    int16_t score;
-    uint16_t q_end;
-    uint16_t t_end;
-} SwResult;
-
-static void mram_fill_i16(uintptr_t mram_addr, uint32_t num_elems, int16_t value)
-{
-    __dma_aligned int16_t buf[8];
-    for (int i = 0; i < 8; i++)
-        buf[i] = value;
-
-    uint32_t total_bytes = ALIGN8(num_elems * sizeof(int16_t));
-    for (uint32_t off = 0; off < total_bytes; off += 16)
-    {
-        uint32_t chunk = (total_bytes - off > 16) ? 16 : (total_bytes - off);
-        if (chunk < 8)
-            chunk = 8;
-        mram_write(buf, (__mram_ptr void *)(mram_addr + off), ALIGN8(chunk));
-    }
-}
 
 static SwResult compute_sw_tiled(
     uintptr_t mram_base,
@@ -325,9 +242,14 @@ static SwResult compute_sw_tiled(
             }
 
             // Load PSSM rows for this query tile in a single bulk read (much faster than row-by-row)
+            // Use aligned path when possible (host pads PSSM to 32-byte boundaries)
             uintptr_t tile_addr = pssm_mram_base + (uintptr_t)q_start * ALPHA_SIZE;
             uint32_t tile_bytes = q_size * ALPHA_SIZE;
-            mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            if ((tile_addr & 7U) == 0) {
+                mram_read_aligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            } else {
+                mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            }
 
             // Ensure column 0 boundary for this query tile
             H_bot[0] = H_col[q_size];
@@ -418,32 +340,27 @@ static SwResult compute_sw_tiled(
     return result;
 }
 
-/* -------------------------------------------------------------------------
- * MAIN
- * ------------------------------------------------------------------------- */
 int main() {
     uint32_t tasklet_id = me();
     uintptr_t mram_base = (uintptr_t)DPU_MRAM_HEAP_POINTER;
 
-    printf("[DPU] Tasklet %u started, MRAM base at %p\n", tasklet_id, (void*)mram_base);
-    printf("[DPU] NR_TASKLETS=%u, SCRATCH_SIZE=%u\n",
+    DEBUG_PRINT("[DPU] Tasklet %u started, MRAM base at %p\n", tasklet_id, (void*)mram_base);
+    DEBUG_PRINT("[DPU] NR_TASKLETS=%u, SCRATCH_SIZE=%u\n",
            NR_TASKLETS, SCRATCH_SIZE);
 
     if (tasklet_id == 0) {
         mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(CombinedBatchDescriptor)));
+        // Read batch descriptor and compute effective tasklets into SHARED global
+        uint8_t eff = g_bd.header.num_active_tasklets;
+        if (eff == 0 || eff > MAX_SAFE_TASKLETS) {
+            eff = MAX_SAFE_TASKLETS;
+        }
+        g_effective_tasklets = eff;
     }
     barrier_wait(&my_barrier);
-
-    /* Respect WRAM-safe limit: clamp num_active_tasklets to MAX_SAFE_TASKLETS */
-    uint8_t effective_tasklets = g_bd.header.num_active_tasklets;
-    if (effective_tasklets == 0 || effective_tasklets > MAX_SAFE_TASKLETS) {
-        effective_tasklets = MAX_SAFE_TASKLETS;
-    }
-
-    /* DYNAMIC TASKLET CHECK: do not exit early; inactive tasklets must still
-     * participate in all barriers to avoid deadlock. Use `is_active` to skip
-     * work while still hitting barrier_wait() calls. */
-    bool is_active = (tasklet_id < effective_tasklets);
+    
+    /* Now ALL tasklets can safely read the shared g_effective_tasklets */
+    bool is_active = (tasklet_id < g_effective_tasklets);
 
     if (tasklet_id == 0) {
         __dma_aligned uint32_t hdr[2] = {0, 0};
@@ -452,40 +369,23 @@ int main() {
         // Reset per-launch hit bookkeeping so the first write is well-defined
         g_hit_count = 0;
         g_hit_write_offset = 8; // hits start right after the 8-byte [count+pad] header
-            g_overflow = 0;
-        g_next_target_idx = 0;
+        g_overflow = 0;
 
         // Cache Query Metadata
         uint32_t num_q = g_bd.header.num_queries;
         if (num_q > MAX_BATCH_QUERIES) num_q = MAX_BATCH_QUERIES; // Safety
         uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
         mram_read((__mram_ptr void*)qmeta_base, g_query_meta, MRAM_ALIGN_SIZE(num_q * sizeof(QueryMetadata)));
-    }
-    barrier_wait(&my_barrier);
-    if (tasklet_id == 0) {
+
         uint32_t vecBytes = MRAM_ALIGN_SIZE((g_bd.header.query_len + 1) * sizeof(int16_t));
         uint32_t scratch_needed = (2 * vecBytes) * (g_bd.header.num_active_tasklets);
 
-        printf("[DPU] results_buffer_size=%u scratch_needed=%u vecBytes=%u active=%u\n",
+        DEBUG_PRINT("[DPU] results_buffer_size=%u scratch_needed=%u vecBytes=%u active=%u\n",
                g_bd.header.results_buffer_size, scratch_needed, vecBytes, g_bd.header.num_active_tasklets);
 
-        // Ensure results buffer has space for at least an 8-byte header plus scratch
-        if (g_bd.header.results_buffer_size <= (scratch_needed + 8)) {
-            // not enough space to run safely; request abort so all tasklets
-            // still participate in barriers before exiting.
-            g_launch_ok = 0;
-        }
-    }
-    barrier_wait(&my_barrier);
-
-    /* If tasklet 0 determined the launch is unsafe, all tasklets should exit
-     * after the barrier to avoid deadlock and avoid partially-initialized state. */
-    if (!g_launch_ok) return 0;
-
-    if (tasklet_id == 0) {
         // Reset WRAM allocator so per-launch allocations start from a clean state
         mem_reset();
-        printf("[DPU] Tasklet %u mem_reset done; allocating WRAM: SCRATCH_SIZE=%u\n",
+        DEBUG_PRINT("[DPU] Tasklet %u mem_reset done; allocating WRAM: SCRATCH_SIZE=%u\n",
                tasklet_id, SCRATCH_SIZE);
     }
     barrier_wait(&my_barrier);
@@ -502,15 +402,12 @@ int main() {
 
     if (tasklet_id == 0) {
         if (!scratch_buffer_raw) {
-            printf("[DPU] Tasklet %u mem_alloc failed: scratch=%p\n",
+            DEBUG_PRINT("[DPU] Tasklet %u mem_alloc failed: scratch=%p\n",
                    tasklet_id, scratch_buffer_raw);
         } else {
-            printf("[DPU] Tasklet %u mem_alloc OK\n", tasklet_id);
+            DEBUG_PRINT("[DPU] Tasklet %u mem_alloc OK\n", tasklet_id);
         }
     }
-
-    /* If an active tasklet failed to allocate, abort kernel for safety. */
-    if (is_active && !scratch_buffer_raw) return 0;
 
     // header.query_len is now MAX query len in batch
     uint32_t max_query_len = g_bd.header.query_len;
@@ -519,16 +416,14 @@ int main() {
     bool force_gapped = (g_bd.header.flags & 1);
 
     uintptr_t pssm_base_start = mram_base + g_bd.header.pssm_data_offset;
-    // uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset; // Cached now
     uintptr_t results_base = mram_base + g_bd.header.results_offset;
 
-    // Derive hits area from header.results_buffer_size and reserve tail for per-tasklet scratch vectors
     uint32_t vec_size_bytes = MRAM_ALIGN_SIZE((max_query_len + 1) * sizeof(int16_t));
-    uint32_t scratch_bytes = (2 * vec_size_bytes) * (g_bd.header.num_active_tasklets);
+    uint32_t scratch_bytes = MUL_2(vec_size_bytes) * (g_bd.header.num_active_tasklets);
     uint32_t hits_area_size = MRAM_ALIGN_SIZE(g_bd.header.results_buffer_size - scratch_bytes);
     uintptr_t scratch_base = results_base + hits_area_size;
 
-    uint32_t task_offset = tasklet_id * (2 * vec_size_bytes);
+    uint32_t task_offset = tasklet_id * MUL_2(vec_size_bytes);
     uintptr_t mram_scratch_vectors = scratch_base + task_offset;
 
     const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(GappedHit));
@@ -557,90 +452,92 @@ int main() {
         }                                                                                  \
     } while (0)
 
-    while (1)
-    {
-        mutex_lock(job_mutex);
-        uint32_t t = g_next_target_idx++;
-        mutex_unlock(job_mutex);
+    // Only active tasklets should enter the work loop
+    // All the other ones jump straight to the final barrier
+    if (is_active) {
 
-        if (t >= g_bd.header.num_targets) break;
+        // Static round-robin work distribution
+        for (uint32_t t = tasklet_id; t < g_bd.header.num_targets; t += g_effective_tasklets)
+        {
+            __dma_aligned TargetMetadata meta;
+            uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
+            mram_read((__mram_ptr void *)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
 
-        __dma_aligned TargetMetadata meta;
-        uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
-        mram_read((__mram_ptr void *)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
-
-        if (meta.target_len == 0)
-            continue;
-
-        for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
-            // Use cached metadata if available, else read from MRAM
-            QueryMetadata qmeta;
-            if (q_idx < MAX_BATCH_QUERIES) {
-                qmeta = g_query_meta[q_idx];
-            } else {
-                uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
-                mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
-            }
-
-            if (!can_be_covered(qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct))
+            if (meta.target_len == 0)
                 continue;
 
-            int16_t ungapped_score = 0;
-            uintptr_t pssm_addr = pssm_base_start + qmeta.pssm_offset_in_batch;
+            for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
+                // Use cached metadata if available, else read from MRAM
+                QueryMetadata qmeta;
+                if (q_idx < MAX_BATCH_QUERIES) {
+                    qmeta = g_query_meta[q_idx];
+                } else {
+                    uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
+                    mram_read((__mram_ptr void*)(qmeta_base + q_idx * sizeof(QueryMetadata)), &qmeta, MRAM_ALIGN_SIZE(sizeof(QueryMetadata)));
+                }
 
-            bool ran_prefilter = compute_ungapped_diagonal(
-                mram_base + g_bd.header.targets_data_offset + meta.offset_in_data,
-                meta.target_len, qmeta.query_len, pssm_addr,
-                scratch_buffer, SCRATCH_SIZE, &ungapped_score);
-
-            if (ran_prefilter) {
-                if (!force_gapped && ungapped_score < min_ungapped_score)
+                if (!can_be_covered(qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct))
                     continue;
+
+                int16_t ungapped_score = 0;
+                uintptr_t pssm_addr = pssm_base_start + qmeta.pssm_offset_in_batch;
+
+                bool ran_prefilter = compute_ungapped_diagonal(
+                    mram_base + g_bd.header.targets_data_offset + meta.offset_in_data,
+                    meta.target_len, qmeta.query_len, pssm_addr,
+                    scratch_buffer, SCRATCH_SIZE, &ungapped_score);
+
+                if (ran_prefilter) {
+                    if (!force_gapped && ungapped_score < min_ungapped_score)
+                        continue;
+                }
+
+                SwResult sw = compute_sw_tiled(
+                    mram_base,
+                    g_bd.header.targets_data_offset + meta.offset_in_data, 
+                    meta.target_len,
+                    qmeta.query_len,
+                    pssm_addr,
+                    mram_scratch_vectors,
+                    scratch_buffer,
+                    SCRATCH_SIZE,
+                    g_bd.gap_open_cost,
+                    g_bd.gap_extend_cost);
+
+                if (sw.score < min_score)
+                    continue;
+
+                uint16_t aln_len = max_u32((uint32_t)sw.q_end, (uint32_t)sw.t_end);
+                if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len)
+                    continue;
+                if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct))
+                    continue;
+                if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct))
+                    continue;
+
+                __dma_aligned GappedHit hit;
+                hit.target_id = meta.target_id;
+                hit.score = sw.score;
+                hit.q_end = sw.q_end;
+                hit.t_end = sw.t_end;
+                hit.padding[0] = (uint16_t)q_idx;
+                hit.padding[1] = 0;
+                hit.padding[2] = 0;
+
+                local_hits[local_count++] = hit;
+                if (local_count == 32)
+                    FLUSH_LOCAL_HITS();
             }
-
-            SwResult sw = compute_sw_tiled(
-                mram_base,
-                g_bd.header.targets_data_offset + meta.offset_in_data, 
-                meta.target_len,
-                qmeta.query_len,
-                pssm_addr,
-                mram_scratch_vectors,
-                scratch_buffer,
-                SCRATCH_SIZE,
-                g_bd.gap_open_cost,
-                g_bd.gap_extend_cost);
-
-            if (sw.score < min_score)
-                continue;
-
-            uint16_t aln_len = max_u32((uint32_t)sw.q_end, (uint32_t)sw.t_end);
-            if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len)
-                continue;
-            if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct))
-                continue;
-            if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct))
-                continue;
-
-            __dma_aligned GappedHit hit;
-            hit.target_id = meta.target_id;
-            hit.score = sw.score;
-            hit.q_end = sw.q_end;
-            hit.t_end = sw.t_end;
-            hit.padding[0] = (uint16_t)q_idx;
-            hit.padding[1] = 0;
-            hit.padding[2] = 0;
-
-            local_hits[local_count++] = hit;
-            if (local_count == 32)
-                FLUSH_LOCAL_HITS();
         }
-    }
 
-    FLUSH_LOCAL_HITS();
+        FLUSH_LOCAL_HITS();
+
+    }
 
 #undef FLUSH_LOCAL_HITS
 
     barrier_wait(&my_barrier);
+
     if (tasklet_id == 0)
     {
         __dma_aligned uint32_t count_buf[2];

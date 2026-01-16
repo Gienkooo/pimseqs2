@@ -1054,9 +1054,9 @@ namespace mmseqs::dpu
         std::vector<float> compBias(qdbr->getMaxSeqLen() + 1, 0.0f);
 
         // DYNAMIC TASKLET CALCULATION
-        // Kernel MAX_SAFE_TASKLETS=8 due to WRAM constraints (stack + SW buffers + scratch)
+        // Kernel MAX_SAFE_TASKLETS=11 due to WRAM constraints (stack + SW buffers + scratch)
         // Host matches kernel limit for optimal resource usage
-        const uint8_t MAX_KERNEL_TASKLETS = 8;
+        const uint8_t MAX_KERNEL_TASKLETS = 11;
         uint8_t active_tasklets = MAX_KERNEL_TASKLETS;
 
         // Pre-calculate max query sizes for layout
@@ -1235,6 +1235,9 @@ namespace mmseqs::dpu
                         }
                         dpu_comm_.gatherDataParallel(header_bufs, 8, layouts[0].results_offset);
 
+                        // Parse headers and find max hits for parallel gather
+                        std::vector<uint32_t> hit_counts(num_dpus, 0);
+                        uint32_t max_hit_count = 0;
                         for (uint32_t d = 0; d < num_dpus; ++d) {
                             if (!dpu_ready[d]) continue;
 
@@ -1247,24 +1250,37 @@ namespace mmseqs::dpu
                                                     << " (hits=" << hit_count << ", max=" << max_hits << ")";
                                 EXIT(EXIT_FAILURE);
                             }
-                            if (hit_count > 0) {
-                                const uint32_t data_size = hit_count * static_cast<uint32_t>(sizeof(GappedHit));
-                                const uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
-                                std::vector<GappedHit> hits(hit_count);
-                                if (aligned_size != data_size) {
-                                    std::vector<uint8_t> buf(aligned_size);
-                                    dpu_comm_.gatherDataFromDPU(d, buf.data(), aligned_size, layouts[d].results_offset + 8);
-                                    memcpy(hits.data(), buf.data(), data_size);
-                                } else {
-                                    dpu_comm_.gatherDataFromDPU(d, hits.data(), aligned_size, layouts[d].results_offset + 8);
-                                }
-                                dpu_hits[d] = std::move(hits);
-                            } else {
-                                dpu_hits[d].clear();
-                            }
+                            hit_counts[d] = hit_count;
+                            if (hit_count > max_hit_count) max_hit_count = hit_count;
+                        }
 
-                            dpu_active[d] = false;
-                            dpu_ready[d] = false;
+                        // Parallel gather all hits using max size (reference pattern: single bulk transfer)
+                        if (max_hit_count > 0) {
+                            const uint32_t transfer_size = DpuCommunicationManager::alignToMram(
+                                max_hit_count * static_cast<uint32_t>(sizeof(GappedHit)));
+                            std::vector<std::vector<uint8_t>> hit_bufs;
+                            dpu_comm_.gatherDataParallel(hit_bufs, transfer_size, layouts[0].results_offset + 8);
+
+                            // Parse hits from buffers
+                            for (uint32_t d = 0; d < num_dpus; ++d) {
+                                if (!dpu_ready[d] || hit_counts[d] == 0) {
+                                    dpu_hits[d].clear();
+                                } else {
+                                    dpu_hits[d].resize(hit_counts[d]);
+                                    memcpy(dpu_hits[d].data(), hit_bufs[d].data(), 
+                                           hit_counts[d] * sizeof(GappedHit));
+                                }
+                                dpu_active[d] = false;
+                                dpu_ready[d] = false;
+                            }
+                        } else {
+                            for (uint32_t d = 0; d < num_dpus; ++d) {
+                                if (dpu_ready[d]) {
+                                    dpu_hits[d].clear();
+                                    dpu_active[d] = false;
+                                    dpu_ready[d] = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -1634,6 +1650,11 @@ namespace mmseqs::dpu
                 }
             }
         }
+
+        if (dpu_comm_.isProfilingEnabled()) {
+            dpu_comm_.dumpProfile("ungapped_prefilter");
+            dpu_comm_.resetProfile();
+        }
     }
 
     // ============================================================================
@@ -1657,9 +1678,9 @@ namespace mmseqs::dpu
         }
 
         // DYNAMIC TASKLET CALCULATION
-        // Kernel MAX_SAFE_TASKLETS=8 due to WRAM constraints (stack + SW buffers + scratch)
+        // Kernel MAX_SAFE_TASKLETS=11 due to WRAM constraints (stack + SW buffers + scratch)
         // Host matches kernel limit for optimal resource usage
-        const uint8_t MAX_KERNEL_TASKLETS = 8;
+        const uint8_t MAX_KERNEL_TASKLETS = 11;
         uint8_t tasklet_limit = MAX_KERNEL_TASKLETS;
 
         struct CombinedLimits {
@@ -1815,36 +1836,6 @@ namespace mmseqs::dpu
                           << ": Scattering " << active_dpus.size() << " target batches (data-resident)\\n";
             workflow_.scatterTargetsOnly(perDpuTargetMeta, perDpuTargetData, max_layout);
 
-            auto gatherChecked = [&](uint32_t dpu_id, const DpuWorkflow::MramLayout& layout) {
-                uint64_t hdr = 0;
-                dpu_comm_.gatherDataFromDPU(dpu_id, &hdr, 8, layout.results_offset);
-                const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-                const uint32_t overflow_flag = static_cast<uint32_t>(hdr >> 32);
-                const uint32_t max_hits = maxHitsPerDpu[dpu_id];
-                if (overflow_flag != 0) {
-                    Debug(Debug::ERROR) << "[DPU] Combined batch overflow flag set on DPU " << dpu_id
-                                        << " (hits=" << hit_count << ", capacity=" << max_hits << ")";
-                }
-                if (hit_count > max_hits) {
-                    Debug(Debug::ERROR) << "[DPU] Combined batch overflow detected for DPU " << dpu_id
-                                        << " (hits=" << hit_count << ", max=" << max_hits << ")";
-                    EXIT(EXIT_FAILURE);
-                }
-                if (hit_count == 0) return std::vector<GappedHit>{};
-
-                const uint32_t data_size = hit_count * static_cast<uint32_t>(sizeof(GappedHit));
-                const uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
-                std::vector<GappedHit> hits(hit_count);
-                if (aligned_size != data_size) {
-                    std::vector<uint8_t> buf(aligned_size);
-                    dpu_comm_.gatherDataFromDPU(dpu_id, buf.data(), aligned_size, layout.results_offset + 8);
-                    memcpy(hits.data(), buf.data(), data_size);
-                } else {
-                    dpu_comm_.gatherDataFromDPU(dpu_id, hits.data(), aligned_size, layout.results_offset + 8);
-                }
-                return hits;
-            };
-
             BatchLimits batch_limits{};
             batch_limits.max_queries = static_cast<uint32_t>(max_batch_queries_limit);
             batch_limits.max_pssm_bytes = limits.max_pssm_bytes;
@@ -1853,6 +1844,69 @@ namespace mmseqs::dpu
             std::vector<std::vector<GappedHit>> dpu_hits(num_dpus);
             std::vector<bool> dpu_active(num_dpus, false);
             std::vector<bool> dpu_ready(num_dpus, false);
+
+            // Parallel gather helper - collects results from all ready DPUs in one bulk transfer
+            // NOTE: Must be defined after dpu_hits so lambda capture works
+            auto parallelGatherCombinedResults = [&](const std::vector<bool>& ready_flags) {
+                // Step 1: Parallel gather all headers
+                std::vector<std::vector<uint8_t>> header_bufs(num_dpus);
+                for (uint32_t d = 0; d < num_dpus; ++d) {
+                    if (ready_flags[d]) header_bufs[d].resize(8);
+                }
+                dpu_comm_.gatherDataParallel(header_bufs, 8, max_layout.results_offset);
+
+                // Step 2: Parse headers and find max hit count
+                std::vector<uint32_t> hit_counts(num_dpus, 0);
+                uint32_t max_hit_count = 0;
+                for (uint32_t d = 0; d < num_dpus; ++d) {
+                    if (!ready_flags[d]) continue;
+
+                    uint64_t hdr = 0;
+                    memcpy(&hdr, header_bufs[d].data(), 8);
+                    const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+                    const uint32_t overflow_flag = static_cast<uint32_t>(hdr >> 32);
+                    const uint32_t max_hits = maxHitsPerDpu[d];
+                    if (overflow_flag != 0) {
+                        Debug(Debug::ERROR) << "[DPU] Combined batch overflow flag set on DPU " << d
+                                            << " (hits=" << hit_count << ", capacity=" << max_hits << ")";
+                    }
+                    if (hit_count > max_hits) {
+                        Debug(Debug::ERROR) << "[DPU] Combined batch overflow detected for DPU " << d
+                                            << " (hits=" << hit_count << ", max=" << max_hits << ")";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    hit_counts[d] = hit_count;
+                    if (hit_count > max_hit_count) max_hit_count = hit_count;
+                }
+
+                // Step 3: Parallel gather all hits using max size (reference pattern: single bulk transfer)
+                if (max_hit_count > 0) {
+                    const uint32_t transfer_size = DpuCommunicationManager::alignToMram(
+                        max_hit_count * static_cast<uint32_t>(sizeof(GappedHit)));
+                    std::vector<std::vector<uint8_t>> hit_bufs(num_dpus);
+                    for (uint32_t d = 0; d < num_dpus; ++d) {
+                        if (ready_flags[d]) hit_bufs[d].resize(transfer_size);
+                    }
+                    dpu_comm_.gatherDataParallel(hit_bufs, transfer_size, max_layout.results_offset + 8);
+
+                    // Parse hits from buffers
+                    for (uint32_t d = 0; d < num_dpus; ++d) {
+                        if (!ready_flags[d] || hit_counts[d] == 0) {
+                            dpu_hits[d].clear();
+                        } else {
+                            dpu_hits[d].resize(hit_counts[d]);
+                            memcpy(dpu_hits[d].data(), hit_bufs[d].data(),
+                                   hit_counts[d] * sizeof(GappedHit));
+                        }
+                    }
+                } else {
+                    for (uint32_t d = 0; d < num_dpus; ++d) {
+                        if (ready_flags[d]) {
+                            dpu_hits[d].clear();
+                        }
+                    }
+                }
+            };
 
             size_t q_cursor = 0;
             size_t query_batch_num = 0;
@@ -1941,11 +1995,16 @@ namespace mmseqs::dpu
                         usleep(100);
                     } else {
                         inflight_groups -= drained;
+                        
+                        // Parallel gather all ready DPUs at once (reference pattern: rank-level bulk transfer)
+                        parallelGatherCombinedResults(dpu_ready);
+                        
+                        // Clear ready/active flags for gathered DPUs
                         for (uint32_t d = 0; d < num_dpus; ++d) {
-                            if (!dpu_ready[d]) continue;
-                            dpu_hits[d] = gatherChecked(d, max_layout);
-                            dpu_ready[d] = false;
-                            dpu_active[d] = false;
+                            if (dpu_ready[d]) {
+                                dpu_ready[d] = false;
+                                dpu_active[d] = false;
+                            }
                         }
                     }
                 }
@@ -1994,7 +2053,7 @@ namespace mmseqs::dpu
         }
 
         if (dpu_comm_.isProfilingEnabled()) {
-            dpu_comm_.dumpProfile("ungapped_prefilter");
+            dpu_comm_.dumpProfile("combined_prefilter");
             dpu_comm_.resetProfile();
         }
     }

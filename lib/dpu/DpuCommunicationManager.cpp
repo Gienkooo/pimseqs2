@@ -294,6 +294,72 @@ void DpuCommunicationManager::gatherDataParallel(
   if (timer.entry) timer.entry->bytes += static_cast<uint64_t>(size_per_dpu) * num_dpus_active_;
 }
 
+void DpuCommunicationManager::gatherDataParallelVariable(
+    std::vector<std::vector<uint8_t>>& per_dpu_buffers,
+    const std::vector<uint32_t>& sizes_per_dpu,
+    uint32_t dpu_mram_offset) {
+  ScopedTimer timer(slot(ProfileSlot::GatherParallel));
+  
+  if (dpu_mram_offset % MRAM_ALIGN != 0) {
+    Debug(Debug::ERROR) << "[DPU ERROR] MRAM offset not 8-byte aligned" << "\n";
+    exit(EXIT_FAILURE);
+  }
+
+  if (sizes_per_dpu.size() != num_dpus_active_) {
+    Debug(Debug::ERROR) << "[DPU ERROR] gatherDataParallelVariable: sizes vector size mismatch" << "\n";
+    exit(EXIT_FAILURE);
+  }
+
+  per_dpu_buffers.resize(num_dpus_active_);
+
+  // Find max size per rank for efficient rank-level transfers
+  // Group DPUs by rank and find max size within each rank
+  size_t global_idx = 0;
+  uint64_t total_bytes = 0;
+  
+  for (auto &rank_set : rank_sets_) {
+    // Find max size in this rank
+    uint32_t max_size_in_rank = 0;
+    size_t rank_start = global_idx;
+    
+    struct dpu_set_t dpu;
+    DPU_FOREACH(rank_set, dpu) {
+      if (global_idx >= sizes_per_dpu.size()) break;
+      uint32_t aligned_size = alignToMram(sizes_per_dpu[global_idx]);
+      if (aligned_size > max_size_in_rank) max_size_in_rank = aligned_size;
+      ++global_idx;
+    }
+    
+    if (max_size_in_rank == 0) continue;
+    
+    // Prepare transfers for this rank using max size
+    global_idx = rank_start;
+    DPU_FOREACH(rank_set, dpu) {
+      if (global_idx >= per_dpu_buffers.size()) break;
+      per_dpu_buffers[global_idx].resize(max_size_in_rank);
+      dpu_error_t status = dpu_prepare_xfer(dpu, per_dpu_buffers[global_idx].data());
+      checkStatus(status, "Prepare xfer (variable gather)");
+      ++global_idx;
+    }
+
+    dpu_error_t status = dpu_push_xfer(rank_set, DPU_XFER_FROM_DPU, "__sys_used_mram_end",
+                                       dpu_mram_offset, max_size_in_rank, DPU_XFER_DEFAULT);
+    checkStatus(status, "Push xfer (variable gather rank)");
+    
+    total_bytes += static_cast<uint64_t>(max_size_in_rank) * (global_idx - rank_start);
+  }
+
+  // Resize buffers to actual requested sizes (trim padding)
+  for (size_t i = 0; i < num_dpus_active_; ++i) {
+    uint32_t actual_size = alignToMram(sizes_per_dpu[i]);
+    if (per_dpu_buffers[i].size() > actual_size) {
+      per_dpu_buffers[i].resize(actual_size);
+    }
+  }
+
+  if (timer.entry) timer.entry->bytes += total_bytes;
+}
+
 void DpuCommunicationManager::loadKernel(const char* kernel_binary_path) {
   ScopedTimer timer(slot(ProfileSlot::LoadKernel));
   if (async_in_progress_) {
@@ -323,13 +389,14 @@ void DpuCommunicationManager::executeKernels() {
   if (async_in_progress_) {
     waitForKernels();
   }
-  // Launch all per-DPU sets synchronously
-  for (uint32_t i = 0; i < num_dpus_active_; ++i) {
-    dpu_error_t status = dpu_launch(dpu_sets_[i], DPU_SYNCHRONOUS);
+  // Launch all ranks in parallel (reference pattern: dpu_launch on rank set)
+  // This is much faster than per-DPU launch as it uses rank-level parallelism
+  for (auto& rank_set : rank_sets_) {
+    dpu_error_t status = dpu_launch(rank_set, DPU_SYNCHRONOUS);
     if (status != DPU_OK) {
       readAndPrintLog();
     }
-    checkStatus(status, "Kernel launch (per-DPU)");
+    checkStatus(status, "Kernel launch (rank)");
   }
 }
 
@@ -338,10 +405,13 @@ void DpuCommunicationManager::executeKernelsAsync() {
   if (async_in_progress_) {
     waitForKernels();
   }
-  // Launch all per-DPU sets asynchronously
+  // Launch all ranks asynchronously in parallel (reference pattern)
+  for (auto& rank_set : rank_sets_) {
+    dpu_error_t status = dpu_launch(rank_set, DPU_ASYNCHRONOUS);
+    checkStatus(status, "Async kernel launch (rank)");
+  }
+  // Mark all DPUs as in-flight
   for (uint32_t i = 0; i < num_dpus_active_; ++i) {
-    dpu_error_t status = dpu_launch(dpu_sets_[i], DPU_ASYNCHRONOUS);
-    checkStatus(status, "Async kernel launch (per-DPU)");
     async_per_dpu_[i] = true;
   }
   async_in_progress_ = true;
@@ -350,13 +420,16 @@ void DpuCommunicationManager::executeKernelsAsync() {
 void DpuCommunicationManager::waitForKernels() {
   ScopedTimer timer(slot(ProfileSlot::WaitAsync));
   if (!async_in_progress_) return;
-  for (uint32_t i = 0; i < num_dpus_active_; ++i) {
-    if (!async_per_dpu_[i]) continue;
-    dpu_error_t status = dpu_sync(dpu_sets_[i]);
+  // Sync all ranks in parallel (reference pattern: dpu_sync on rank set)
+  for (auto& rank_set : rank_sets_) {
+    dpu_error_t status = dpu_sync(rank_set);
     if (status != DPU_OK) {
       readAndPrintLog();
     }
-    checkStatus(status, "Kernel sync (per-DPU)");
+    checkStatus(status, "Kernel sync (rank)");
+  }
+  // Clear all per-DPU flags
+  for (uint32_t i = 0; i < num_dpus_active_; ++i) {
     async_per_dpu_[i] = false;
   }
   async_in_progress_ = false;
