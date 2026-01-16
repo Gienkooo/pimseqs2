@@ -11,11 +11,11 @@
 
 #define AA_NUMBER 21
 #define MRAM_MAX 2048
-#define MAX_TARGET_LEN 1024
-#define MAX_QUERY_LEN 1024
+#define MAX_TARGET_LEN 2048
+#define MAX_QUERY_LEN 2048
 
 #ifndef NR_TASKLETS
-#define NR_TASKLETS 1
+#define NR_TASKLETS 12
 #endif
 
 #define MRAM_ALIGN_SIZE(x) (((x) + 7) & ~7U) // 8 * ceil(x/8)
@@ -39,7 +39,7 @@ typedef struct {
 TaskletResult tasklet_results[NR_TASKLETS];
 
 
-static void compute_diagonal_slice(uint32_t tasklet_id, uint32_t t_len, uint32_t q_len) {
+static void align_short(uint32_t tasklet_id, uint32_t t_len, uint32_t q_len) {
     int16_t max_score = 0;
     int16_t best_diag = 0;
     uint32_t num_diags = q_len + t_len - 1;
@@ -81,63 +81,9 @@ static void compute_diagonal_slice(uint32_t tasklet_id, uint32_t t_len, uint32_t
 }
 
 
-static int16_t compute_score_streaming(
-    uint8_t* target_seq,        // target sequence (aminoacids array)
-    uint32_t t_len,             // target length
-    uint32_t q_len,             // query length
-    uintptr_t pssm_mram_base,   // pointer to start of mram memory
-    int16_t* diag_buffer,       // scores
-    int16_t* out_diagonal)      // index of the best diagonal (SIGNED)
-{
-    // Initialize
-    uint32_t num_diags = q_len + t_len;
-    for (uint32_t i = 0; i < num_diags; ++i) diag_buffer[i] = 0;
-    int16_t max_score = 0;
-    int32_t best_diag_idx = 0;
-
-    // target debugging
-    // for (int32_t i = 0; i < t_len; ++i) printf("%d\t", target_seq[i]); printf("\n");
-
-    // Iterate over query
-    for (uint32_t q = 0; q < q_len; ++q) {
-        // Load PSSM
-        uintptr_t pssm_addr = pssm_mram_base + (q * AA_NUMBER);
-        uintptr_t aligned_pssm_addr = pssm_addr & ~7U; 
-        uint32_t offset = pssm_addr & 7U;
-        __dma_aligned int8_t temp_pssm_buf[32]; 
-        mram_read((__mram_ptr void*)aligned_pssm_addr, temp_pssm_buf, 32);
-        int8_t* pssm_vals = &temp_pssm_buf[offset];
-
-        // query debugging
-        // for(int32_t i = 0; i < 21; ++i) printf("%d\t", pssm_vals[i]); printf("\n");
-
-        // Iterate over target
-        for (uint32_t t = 0; t < t_len; ++t) {
-            uint8_t aa = target_seq[t];         // 0-19 - aminoacids, 20 - invalid
-            if (aa >= AA_NUMBER) aa = 20;       // handle invalid
-            int8_t score = pssm_vals[aa];       // cell score
-            int32_t diag_idx = (int32_t)t - (int32_t)q + (int32_t)(q_len - 1);
-            if (diag_idx >= 0 && diag_idx < num_diags) {
-                int16_t prev = diag_buffer[diag_idx];
-                int16_t curr = prev + score;
-                if (curr < 0) curr = 0;
-                diag_buffer[diag_idx] = curr;
-                if (curr > max_score) {
-                    max_score = curr;
-                    best_diag_idx = diag_idx;
-                }
-            }
-        }
-    }
-
-    if (out_diagonal) *out_diagonal = (int16_t)((int32_t)(q_len-1) - best_diag_idx);
-    return max_score;
-}
-
 int main() {
     uint32_t tasklet_id = me();
     uintptr_t mram_base = (uintptr_t)__sys_used_mram_end;
-    int16_t* task_diag_buf = (int16_t*)mem_alloc(2 * MAX_TARGET_LEN * sizeof(int16_t));
 
     // Load batch descriptor
     if (tasklet_id == 0) {
@@ -146,9 +92,9 @@ int main() {
         target_buffer = (uint8_t*)mem_alloc(MAX_TARGET_LEN);
         pssm_buffer = (int8_t*)mem_alloc(MAX_QUERY_LEN * AA_NUMBER);
     }
-    barrier_wait(&barrier);    
+    barrier_wait(&barrier);
 
-    if (target_buffer == NULL || task_diag_buf == NULL) return 0;
+    if (target_buffer == NULL) return 0;
 
     // Iterate over queries
     for (uint32_t i = 0; i < batch_descriptor.num_queries; ++i) {
@@ -170,7 +116,6 @@ int main() {
         barrier_wait(&barrier);
 
         // Iterate over targets
-        // for (uint32_t j = tasklet_id; j < batch_descriptor.num_targets; j += NR_TASKLETS) {
         for (uint32_t j = 0; j < batch_descriptor.num_targets; j += 1) {
 
             if(tasklet_id == 0) {
@@ -221,22 +166,7 @@ int main() {
 
             // Compute score and diagonal
 
-            // version 1: multiple query reads (coarse grained parallelism)
-            // int16_t diag = 0;
-            // int16_t score = compute_score_streaming(
-            //     target_buffer, 
-            //     target_meta.target_len,
-            //     query_meta.query_len,
-            //     mram_base + batch_descriptor.pssm_data_offset,
-            //     task_diag_buf,
-            //     &diag
-            // );
-            // tasklet_results[tasklet_id].score = score;
-            // tasklet_results[tasklet_id].diagonal = diag;
-
-            // version 2: single query reads (fine grained parallelism)
-            compute_diagonal_slice(tasklet_id, target_meta.target_len, query_meta.query_len);
-            
+            align_short(tasklet_id, target_meta.target_len, query_meta.query_len);
             barrier_wait(&barrier);
 
             // Store score and diagonal
