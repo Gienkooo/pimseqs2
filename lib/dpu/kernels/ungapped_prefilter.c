@@ -25,11 +25,21 @@
 #define PSSM_CACHE_SIZE 512     /* Safe cache for ~24 query residues */
 #define DIAG_TILE_SIZE 512      /* Process diagonals in tiles */
 
-/* Maximum diagonal entries per tasklet (2KB = 1024 int16 elements)
- * This limits max(target_len + query_len) to 1024 residues total.
- * Longer sequences should use the combined ungapped+gapped kernel 
- * which streams diagonals via MRAM scratch. */
-#define MAX_DIAG_ENTRIES 1024
+/* Maximum diagonal entries per tasklet.
+ * CONSTRAINT: max_query_len + max_target_len <= MAX_DIAG_ENTRIES
+ * 
+ * With MAX_DIAG_ENTRIES=8192:
+ *   - query=1000 -> max target = 7192 residues
+ *   - query=2000 -> max target = 6192 residues  
+ *   - query=4000 -> max target = 4192 residues
+ * 
+ * Sequences exceeding this limit are silently skipped.
+ * For very long sequences (>8K total), use gapped mode which
+ * streams diagonals via MRAM scratch space.
+ * 
+ * Memory: 8192 * 2 bytes = 16KB per tasklet diagonal buffer.
+ * With 3 active tasklets: 48KB diagonal buffers + overhead = ~58KB WRAM used. */
+#define MAX_DIAG_ENTRIES 8192
 
 /* Globals */
 __dma_aligned UngappedBatchDescriptor g_bd;
@@ -45,7 +55,8 @@ __host uint8_t g_effective_tasklets;
 
 __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
 
-/* Compute diagonal with CPU-exact 8-bit saturation.
+/* Compute diagonal scoring using signed PSSM values.
+ * Uses Smith-Waterman style local alignment scoring: scores cannot go negative.
  * The CPU uses unsigned 8-bit arithmetic which caps scores at 255.
  * We emulate this behavior to ensure validation matches.
  * NOTE: num_diags must fit in the allocated diag_buffer (max MAX_DIAG_ENTRIES).
@@ -53,7 +64,7 @@ __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
 static void compute_ungapped_diagonal_with_diag(
     uint8_t *target_seq, uint32_t t_len, uint32_t q_len, uintptr_t pssm_mram_base,
     int16_t *diag_buffer, uint8_t *pssm_cache, uint32_t diag_buffer_capacity,
-    int16_t *out_score, int16_t *out_diag, uint8_t dynamic_bias) 
+    int16_t *out_score, int16_t *out_diag) 
 {
     // CPU Logic Constants for BLOSUM62
     const int32_t MAX_CPU_SCORE = 255;
@@ -97,8 +108,8 @@ static void compute_ungapped_diagonal_with_diag(
         }
 
         for (uint32_t q = q_start; q < chunk_end; ++q) {
-            // Pointer to cached column
-            uint8_t *pssm_col = &pssm_cache[(q - q_start) * ALPHA_SIZE];
+            // Pointer to cached column (PSSM is SIGNED int8_t from host)
+            int8_t *pssm_col = (int8_t*)&pssm_cache[(q - q_start) * ALPHA_SIZE];
 
             for (uint32_t t = 0; t < t_len; ++t) {
                 uint8_t aa = target_seq[t];
@@ -108,16 +119,14 @@ static void compute_ungapped_diagonal_with_diag(
                 
                 if (diag_idx >= 0 && diag_idx < (int32_t)num_diags) {
                     int32_t prev = diag_buffer[diag_idx];
-                    uint8_t raw_val = pssm_col[aa];
-                    int32_t score_with_bias = (int32_t)raw_val;
+                    int8_t sub = pssm_col[aa];  // SIGNED substitution score
+                    int32_t score_with_sub = prev + (int32_t)sub;
 
-                    int32_t step1 = prev + score_with_bias;
-                    if (step1 > MAX_CPU_SCORE) step1 = MAX_CPU_SCORE;
-
-                    int32_t step2 = step1 - (int32_t)dynamic_bias;
-                    if (step2 < 0) step2 = 0;
+                    // Clamp to [0, MAX_CPU_SCORE] like CPU ungapped scoring
+                    if (score_with_sub < 0) score_with_sub = 0;
+                    if (score_with_sub > MAX_CPU_SCORE) score_with_sub = MAX_CPU_SCORE;
                     
-                    int16_t curr = (int16_t)step2;
+                    int16_t curr = (int16_t)score_with_sub;
                     
                     diag_buffer[diag_idx] = curr;
                     
@@ -278,7 +287,7 @@ int main() {
 
             compute_ungapped_diagonal_with_diag(
                 task_target_seq, meta.target_len, qmeta.query_len, pssm_addr, 
-                diag_buffer, pssm_cache, MAX_DIAG_ENTRIES, &score, &diagonal, qmeta.bias
+                diag_buffer, pssm_cache, MAX_DIAG_ENTRIES, &score, &diagonal
             );
             
             if (score >= min_score) {
