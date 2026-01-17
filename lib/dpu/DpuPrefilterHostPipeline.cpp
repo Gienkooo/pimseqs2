@@ -1393,13 +1393,14 @@ namespace mmseqs::dpu
         const uint32_t UNGAPPED_RESULTS_BYTES = 8 * 1024 * 1024;
 
         // Tasklet calculation for ungapped kernel
-        // Must match kernel constants: TARGET_TILE_SIZE=1024, PSSM_CACHE_SIZE=512, MAX_DIAG_ENTRIES=8192
+        // Must match kernel constants: TARGET_TILE_SIZE=1024, PSSM_CACHE_SIZE=512, MAX_DIAG_ENTRIES=4096
         const uint32_t TARGET_TILE_SIZE = 1024;
         const uint32_t PSSM_CACHE_SIZE = 512;
-        const uint32_t MAX_DIAG_ENTRIES = 8192;
-        uint32_t diag_bytes = MAX_DIAG_ENTRIES * 2; // int16_t per diagonal
+        const uint32_t MAX_DIAG_ENTRIES = 4096;
+        uint32_t diag_bytes = MAX_DIAG_ENTRIES * 2; // int16_t per diagonal (8KB)
         uint32_t wramPerTasklet = TARGET_TILE_SIZE + PSSM_CACHE_SIZE + diag_bytes + 1024; // +1024 for stack/misc
-        uint8_t active_tasklets = std::min<uint8_t>(14, calculateActiveTasklets(wramPerTasklet));
+        // ~10.5KB per tasklet -> 6 tasklets fit in 64KB WRAM
+        uint8_t active_tasklets = std::min<uint8_t>(6, calculateActiveTasklets(wramPerTasklet));
 
         // Guard: Check sequence length constraints
         // Diagonal buffer size limits: max_target_len = MAX_DIAG_ENTRIES - max_query_len

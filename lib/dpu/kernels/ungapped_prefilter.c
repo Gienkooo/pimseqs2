@@ -28,18 +28,18 @@
 /* Maximum diagonal entries per tasklet.
  * CONSTRAINT: max_query_len + max_target_len <= MAX_DIAG_ENTRIES
  * 
- * With MAX_DIAG_ENTRIES=8192:
- *   - query=1000 -> max target = 7192 residues
- *   - query=2000 -> max target = 6192 residues  
- *   - query=4000 -> max target = 4192 residues
+ * With MAX_DIAG_ENTRIES=4096:
+ *   - query=500  -> max target = 3596 residues
+ *   - query=1000 -> max target = 3096 residues  
+ *   - query=2000 -> max target = 2096 residues
  * 
+ * This covers 99%+ of proteins (average ~300, 99th percentile ~2000).
  * Sequences exceeding this limit are silently skipped.
- * For very long sequences (>8K total), use gapped mode which
- * streams diagonals via MRAM scratch space.
+ * For very long sequences, use gapped mode which streams via MRAM.
  * 
- * Memory: 8192 * 2 bytes = 16KB per tasklet diagonal buffer.
- * With 3 active tasklets: 48KB diagonal buffers + overhead = ~58KB WRAM used. */
-#define MAX_DIAG_ENTRIES 8192
+ * Memory: 4096 * 2 bytes = 8KB per tasklet diagonal buffer.
+ * With 6 active tasklets: 48KB diagonal buffers + 9KB tiles + 3KB cache = ~60KB WRAM. */
+#define MAX_DIAG_ENTRIES 4096
 
 /* Globals */
 __dma_aligned UngappedBatchDescriptor g_bd;
