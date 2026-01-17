@@ -165,97 +165,62 @@ namespace mmseqs::dpu {
             return a.length > b.length;
         });
 
-        // 3. Use heap-based LPT with multi-wave support
-        // When all DPUs in current wave are full, create a new wave
+        // 3. Simple O(n) greedy round-robin assignment
+        // For each sequence: try current DPU, if full move to next, if wave full start new wave
         struct DpuState {
             size_t total_bytes = 0;
             size_t seq_count = 0;
             std::vector<uint32_t> sequence_ids;
         };
         
-        // Wave-based storage: each wave has num_dpus DPU states
         std::vector<std::vector<DpuState>> waves;
         waves.emplace_back(num_dpus);  // First wave
         
-        // Min-heap tracks (load, wave_idx, dpu_idx) - prioritize least loaded DPU
-        auto cmp = [](const std::tuple<size_t, uint32_t, uint32_t>& a, 
-                      const std::tuple<size_t, uint32_t, uint32_t>& b) {
-            return std::get<0>(a) > std::get<0>(b); // Min-heap by load
-        };
-        std::priority_queue<std::tuple<size_t, uint32_t, uint32_t>,
-                           std::vector<std::tuple<size_t, uint32_t, uint32_t>>,
-                           decltype(cmp)> heap(cmp);
-        
-        // Initialize heap with first wave
-        for (uint32_t d = 0; d < num_dpus; ++d) {
-            heap.push({0, 0, d});
-        }
-
-        // 4. Assign sequences using heap-based LPT (O(n log n))
+        size_t current_wave = 0;
+        uint32_t current_dpu = 0;
         size_t assigned = 0;
         
         for (const auto& seq : seqs) {
             bool placed = false;
-            std::vector<std::tuple<size_t, uint32_t, uint32_t>> temp_storage;
             
-            while (!heap.empty()) {
-                auto [load, wave_idx, dpu_idx] = heap.top();
-                heap.pop();
+            // Try DPUs in current wave starting from current_dpu
+            for (uint32_t attempts = 0; attempts < num_dpus && !placed; ++attempts) {
+                DpuState& state = waves[current_wave][current_dpu];
                 
-                DpuState& state = waves[wave_idx][dpu_idx];
                 bool size_ok = (state.total_bytes + seq.estimated_size) <= mram_limit_bytes;
                 bool count_ok = (state.seq_count + 1) <= max_seqs_per_dpu;
                 
                 if (size_ok && count_ok) {
-                    // Assign to this DPU
                     state.sequence_ids.push_back(seq.db_key);
                     state.total_bytes += seq.estimated_size;
                     state.seq_count++;
-                    
-                    // Push back with updated load
-                    heap.push({state.total_bytes, wave_idx, dpu_idx});
                     placed = true;
                     assigned++;
-                    
-                    // Restore temporarily removed entries
-                    for (auto& p : temp_storage) {
-                        heap.push(p);
-                    }
-                    break;
+                    // Round-robin to next DPU for load balance
+                    current_dpu = (current_dpu + 1) % num_dpus;
                 } else {
-                    // This DPU is full, try next
-                    temp_storage.push_back({load, wave_idx, dpu_idx});
+                    // This DPU can't fit it, try next
+                    current_dpu = (current_dpu + 1) % num_dpus;
                 }
             }
             
             if (!placed) {
-                // All DPUs in all waves are full - create new wave
-                uint32_t new_wave_idx = waves.size();
+                // All DPUs in current wave are full, start new wave
                 waves.emplace_back(num_dpus);
-                
-                // Add new wave's DPUs to heap
-                for (uint32_t d = 0; d < num_dpus; ++d) {
-                    heap.push({0, new_wave_idx, d});
-                }
-                
-                // Restore temporarily removed entries
-                for (auto& p : temp_storage) {
-                    heap.push(p);
-                }
+                current_wave++;
+                current_dpu = 0;
                 
                 // Place in first DPU of new wave
-                DpuState& state = waves[new_wave_idx][0];
+                DpuState& state = waves[current_wave][0];
                 state.sequence_ids.push_back(seq.db_key);
                 state.total_bytes += seq.estimated_size;
                 state.seq_count++;
-                
-                // Update heap entry for this DPU
-                heap.push({state.total_bytes, new_wave_idx, 0});
                 assigned++;
+                current_dpu = 1 % num_dpus;
             }
         }
 
-        // 5. Build result (flatten waves, only include non-empty chunks)
+        // 4. Build result (flatten waves, only include non-empty chunks)
         std::vector<std::vector<uint32_t>> result;
         result.reserve(waves.size() * num_dpus);
         
