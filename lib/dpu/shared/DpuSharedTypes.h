@@ -166,14 +166,15 @@ typedef struct {
     uint32_t num_index_entries;     /* Total index entries */
     
     /* MRAM Offsets */
-    uint32_t state_table_offset;    /* State table for diagonal tracking */
+    uint32_t state_table_offset;    /* State table for diagonal tracking (MRAM backing store) */
     uint32_t query_packets_offset;  /* Query packet buffer */
     uint32_t buckets_offset;        /* Start of bucket array */
     uint32_t index_entries_offset;  /* Start of entries array */
     uint32_t results_offset;        /* Start of results buffer */
     uint32_t results_buffer_size;   /* Actual output buffer size */
+    uint32_t checkpoint_offset;     /* Checkpoint for resuming after overflow */
     
-    uint32_t reserved[2];           /* Padding for 8-byte alignment */
+    uint32_t reserved[1];           /* Padding for 8-byte alignment */
 } __attribute__((packed)) KmerBatchDescriptor;
 
 DPU_STATIC_ASSERT(sizeof(KmerBatchDescriptor) % 8 == 0, "KmerBatchDescriptor must be 8-byte aligned");

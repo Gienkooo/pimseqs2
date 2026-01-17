@@ -788,6 +788,7 @@ namespace mmseqs::dpu
             
             desc.results_offset = results_off;
             desc.results_buffer_size = result_buffer_size;
+            desc.checkpoint_offset = ctx.CHECKPOINT_OFF;
             
             memcpy(descriptors[d].data(), &desc, sizeof(desc));
         }
