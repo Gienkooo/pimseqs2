@@ -21,26 +21,20 @@ rm -f "${CPU_DB}"* "${DPU_DB}"* "${CPU_RES}" "${DPU_RES}"
 # E-value threshold (default high for validation to check all scores, override with E_VALUE env var)
 E_VALUE="${E_VALUE:-1000}"
 # Max results per query (default high to not truncate results during validation)
-MAX_SEQS="${MAX_SEQS:-10000}"
+MAX_SEQS="${MAX_SEQS:-10000000}"
 log "Using E-value threshold: $E_VALUE, max-seqs: $MAX_SEQS"
-
-# To isolate and test ONLY the gapped alignment stage, we follow this workflow:
-# 1. Generate a prefilter database of candidate pairs on the CPU.
-# 2. Run gapped alignment on CPU using those candidates as input (ground truth).
-# 3. Run gapped prefilter on DPU using the exact same candidates as input.
-# This provides a true apples-to-apples comparison of the SW implementations.
 
 CANDIDATE_DB="$OUT_DIR/candidate_db"
 rm -f "${CANDIDATE_DB}"*
 
-log "1. Generating candidate pairs with CPU prefilter..."
-"$MMSEQS_BIN" ungappedprefilter "$QUERY_DB" "$TARGET_DB" "$CANDIDATE_DB" \
-    --threads $(nproc) --prefilter-mode 2 --dpu 0 -v 3 \
-    > "$OUT_DIR/candidate_gen.log" 2>&1
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    cat "$OUT_DIR/candidate_gen.log"
-    error "Candidate generation failed"
-fi
+log "1. Generating ALL-vs-ALL candidate list (fake_pref)..."
+fake_pref "$QUERY_DB" "$TARGET_DB" "$CANDIDATE_DB"
+
+# Verify it worked
+NUM_Q=$(wc -l < "${QUERY_DB}.lookup")
+NUM_T=$(wc -l < "${TARGET_DB}.lookup")
+log "   Database contains $NUM_Q queries and $NUM_T targets."
+log "   The CPU will now perform $(($NUM_Q * $NUM_T)) alignments."
 
 # Run CPU
 log "2. Running Gapped Alignment on CPU with candidate pairs..."
