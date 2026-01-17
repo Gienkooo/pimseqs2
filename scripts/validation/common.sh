@@ -7,9 +7,9 @@ ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
 BUILD_DIR="$ROOT_DIR/build"
 MMSEQS_BIN="$BUILD_DIR/src/mmseqs"
 
-# Default datasets (can be overridden by environment variables)
-QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY_small.fasta}"
-TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB_small.fasta}"
+# Default datasets (respect environment variables if already set)
+QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY.fasta}"
+TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB.fasta}"
 
 # Output directory
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
@@ -47,6 +47,9 @@ check_mmseqs() {
 # Prepare databases if they don't exist
 prepare_dbs() {
     check_mmseqs
+
+    rm -rf "$RESULTS_DIR/query_db"* "$RESULTS_DIR/target_db"* \
+        && log "Old databases removed successfully" || error "Failed to remove old databases"
     
     if [ ! -f "${QUERY_DB}.dbtype" ]; then
         log "Creating query database..."
