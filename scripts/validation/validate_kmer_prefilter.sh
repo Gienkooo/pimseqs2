@@ -24,7 +24,7 @@ DPU_DB="$OUT_DIR/kmer_dpu_db"
 
 # Scripts
 COMPARE_SCRIPT="$SCRIPT_DIR/compare_results.py"
-CHECKER_SCRIPT_CPU="$SCRIPT_DIR/verify_double_hits.py"
+CHECKER_SCRIPT="$SCRIPT_DIR/verify_double_hits.py"
 
 log "Configuration:"
 log "  Mask: $MASK"
@@ -85,9 +85,9 @@ python3 "$COMPARE_SCRIPT" "$CPU_RES" "$DPU_RES" "KmerPrefilter"
 # 6. Verify False Positives (Only if Exact Matching is ON)
 if [ "$EXACT_KMER_MATCHING" -eq 1 ]; then
     log "Verifying False Positives (Diagonal Check)..."
-    if [ -f "$CHECKER_SCRIPT_DPU" ]; then
+    if [ -f "$CHECKER_SCRIPT" ]; then
         # CPU Check (if applicable)
-        DPU_FP=$(python3 "$CHECKER_SCRIPT_DPU" \
+        DPU_FP=$(python3 "$CHECKER_SCRIPT" \
             --query "$QUERY_FASTA" \
             --target "$TARGET_FASTA" \
             --tsv "$CPU_RES" \
@@ -98,7 +98,7 @@ if [ "$EXACT_KMER_MATCHING" -eq 1 ]; then
         log "Detailed logs written to: cpu_diag_check.log"
 
         # DPU Check with separated logging
-        DPU_FP=$(python3 "$CHECKER_SCRIPT_DPU" \
+        DPU_FP=$(python3 "$CHECKER_SCRIPT" \
             --query "$QUERY_FASTA" \
             --target "$TARGET_FASTA" \
             --tsv "$DPU_RES" \
