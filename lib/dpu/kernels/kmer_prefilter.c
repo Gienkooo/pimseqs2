@@ -1,26 +1,3 @@
-/**
- * K-mer Prefilter DPU Kernel - Target-Partitioned Leader-Follower Model
- * 
- * ALGORITHM REQUIREMENTS:
- * 1. Packets MUST be processed strictly in order (position index ordering)
- * 2. For diagonal d, two hits are a "double hit" only if no other diagonal 
- *    was seen for that target between them
- * 3. On query boundary (sentinel), state must be reset for all targets
- * 
- * IMPLEMENTATION:
- * - Leader (Tasklet 0): Fetches packets and index entries from MRAM to shared WRAM
- * - Followers (All Tasklets): Process hits only for targets they "own" (tid % NR_TASKLETS == me())
- * - Eliminates spinlocks and guarantees sequential packet processing
- * - Transactional batches with checkpoint/rollback for overflow handling
- * 
- * DPU CONSTRAINTS ENFORCED:
- * - All MRAM transfers are 8-byte aligned (addresses and sizes)
- * - WRAM budget: ~52KB used of 60KB available
- * - Max single MRAM transfer: 2KB (chunked for larger transfers)
- * - No recursion, no large stack allocations
- * - All barriers reached by all tasklets unconditionally
- */
-
 #include <mram.h>
 #include <alloc.h>
 #include <stdbool.h>
@@ -40,9 +17,6 @@
 #define IS_POWER_OF_2(x) ((x) && !((x) & ((x) - 1)))
 _Static_assert(IS_POWER_OF_2(NR_TASKLETS), "NR_TASKLETS must be a power of 2!");
 
-// ============================================================================
-// CONFIGURATION (All sizes are 8-byte aligned)
-// ============================================================================
 
 // Entry buffer capacity calculation:
 // - DPU max single MRAM transfer: 2048 bytes
@@ -282,11 +256,8 @@ int main() {
             g_shared.current_packet_idx = 0;
         }
         
-        // Load state table from MRAM backing store (32KB, chunked reads)
-        // On first launch, Host initializes MRAM state to 0xFFFFFFFF (reset state)
         mram_read_safe(m_state_table, w_state_table, MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
         
-        // Initialize shared control variables
         g_shared.total_hits_written = 0;
         g_shared.overflow_occurred = 0;
         g_shared.transaction_aborted = 0;
@@ -294,7 +265,6 @@ int main() {
         g_shared.entries_offset = 0;
         g_shared.entries_total = 0;
     }
-    
     barrier_wait(&g_barrier);
     
     // For idle DPUs - host sends an empty descriptor 
@@ -304,7 +274,7 @@ int main() {
     
     // PHASE 2: TRANSACTIONAL BATCH PROCESSING
     __attribute__((aligned(8))) KmerDoubleHit t_local_hits[LOCAL_HIT_BUFFER_SIZE];
-    __attribute__((aligned(8))) KmerBucket t_bucket_cache;  // 256 bytes for bucket lookup
+    __attribute__((aligned(8))) KmerBucket t_bucket_cache; 
     uint32_t t_local_hit_count = 0;
     
     // Calculate max results that fit in output buffer
@@ -312,7 +282,6 @@ int main() {
     
     // Main processing loop - each iteration is one transaction batch
     while (1) {
-        // ----- Transaction Start (Leader captures batch boundaries) -----
         uint32_t batch_start_packet;
         uint32_t batch_start_hits;
         
@@ -557,52 +526,39 @@ int main() {
                 }
                 t_local_hit_count = 0;
             }
-            
-            // BARRIER: Before next packet in batch
             barrier_wait(&g_barrier);
         }
         
-        // ----- Transaction Commit or Rollback (Leader handles, all wait) -----
+        // Transaction Commit or Rollback 
         if (me() == 0) {
             if (g_shared.transaction_aborted) {
-                // ROLLBACK: Revert to batch start state
                 g_shared.total_hits_written = batch_start_hits;
                 g_shared.overflow_occurred = 1;
                 
-                // Write header with overflow flag
                 __attribute__((aligned(8))) KmerResultHeader hdr;
                 hdr.total_hits = g_shared.total_hits_written;
                 hdr.overflow = 1;
                 
-                __mram_ptr KmerResultHeader* hdr_ptr = 
-                    (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
+                __mram_ptr KmerResultHeader* hdr_ptr = (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
                 mram_write(&hdr, hdr_ptr, sizeof(KmerResultHeader));
-                
-                // DO NOT update checkpoint - leave at batch_start_packet for resume
-                // State table in MRAM remains valid from previous commit
-                
-            } else {
-                // COMMIT: Update progress
+            } 
+            else {
                 g_shared.current_packet_idx = batch_start_packet + TRANSACTION_BATCH_SIZE;
                 if (g_shared.current_packet_idx > g_descriptor.num_query_packets) {
                     g_shared.current_packet_idx = g_descriptor.num_query_packets;
                 }
                 
-                // Save checkpoint (8-byte aligned struct)
+                // Save checkpoint 
                 __attribute__((aligned(8))) KmerCheckpoint ckpt;
                 ckpt.packet_idx = g_shared.current_packet_idx;
                 ckpt.entry_idx = 0;
-                ckpt.key_idx = 0;
+                ckpt.padding = 0;
                 ckpt.valid = 1;
                 mram_write(&ckpt, m_checkpoint, sizeof(KmerCheckpoint));
                 
-                // Save state table to MRAM backing store (32KB, chunked writes)
-                mram_write_safe(w_state_table, m_state_table, 
-                               MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
+                mram_write_safe(w_state_table, m_state_table, MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
             }
         }
-        
-        // BARRIER: All tasklets wait for commit/rollback to complete
         barrier_wait(&g_barrier);
         
         if (g_shared.overflow_occurred) {
@@ -610,11 +566,8 @@ int main() {
         }
     }
     
-    // =========================================================================
     // PHASE 3: FINALIZE (Leader writes final header)
-    // =========================================================================
-    
-    if (me() == 0 && !g_shared.overflow_occurred) {
+        if (me() == 0 && !g_shared.overflow_occurred) {
         // Write final header (success case)
         __attribute__((aligned(8))) KmerResultHeader hdr;
         hdr.total_hits = g_shared.total_hits_written;
@@ -628,7 +581,7 @@ int main() {
         __attribute__((aligned(8))) KmerCheckpoint ckpt;
         ckpt.packet_idx = g_descriptor.num_query_packets;
         ckpt.entry_idx = 0;
-        ckpt.key_idx = 0;
+        ckpt.padding = 0;
         ckpt.valid = 0;  // Mark as complete
         mram_write(&ckpt, m_checkpoint, sizeof(KmerCheckpoint));
     }

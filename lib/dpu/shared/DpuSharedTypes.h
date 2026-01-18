@@ -144,8 +144,8 @@ DPU_STATIC_ASSERT(sizeof(KmerCompactIndexEntry) == 4, "KmerCompactIndexEntry mus
 typedef struct {
     uint32_t packet_idx;    /* Index of query packet being processed */
     uint32_t entry_idx;     /* Offset in entries list */
-    uint32_t key_idx;       /* Cached binary search result */
     uint32_t valid;         /* 1 if checkpoint active, 0 otherwise */
+    uint32_t padding;       
 } __attribute__((packed)) KmerCheckpoint;
 
 DPU_STATIC_ASSERT(sizeof(KmerCheckpoint) == 16, "KmerCheckpoint must be 16 bytes");
