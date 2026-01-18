@@ -305,15 +305,8 @@ int main() {
         for (uint32_t batch_offset = 0; batch_offset < TRANSACTION_BATCH_SIZE; ++batch_offset) {
             uint32_t pkt_idx = batch_start_packet + batch_offset;
             
-            // Check bounds (all tasklets check consistently)
-            if (pkt_idx >= g_descriptor.num_query_packets) {
-                break;
-            }
-            
-            // BARRIER: Sync before checking abort flag
-            barrier_wait(&g_barrier);
-            
-            if (g_shared.transaction_aborted) {
+            // Check bounds and abort flag
+            if (pkt_idx >= g_descriptor.num_query_packets || g_shared.transaction_aborted) {
                 break;
             }
             
@@ -328,23 +321,19 @@ int main() {
             }
             barrier_wait(&g_barrier);
             
-            // Reset state for all targets on sentinel packet
+            // Reset state for all targets for a new query
             if (w_current_packet.kmer_idx == KMER_PACKET_SENTINEL_KEY) {
-                // Owner-Computes Reset: Each tasklet resets its owned targets
-                // Divides target sequences evenly among NR_TASKLETS (16)
+                // Each tasklet resets its owned targets
                 uint32_t chunk_size = (g_descriptor.num_targets + NR_TASKLETS - 1) / NR_TASKLETS;
                 uint32_t start_t = me() * chunk_size;
                 uint32_t end_t = start_t + chunk_size;
                 if (end_t > g_descriptor.num_targets) end_t = g_descriptor.num_targets;
                 
-                // Reset state entries to "no previous hit" (0xFFFF means invalid)
+                // Reset state entries to "no previous hit"
                 for (uint32_t t = start_t; t < end_t; ++t) {
                     w_state_table[t].pos = 0xFFFF;
                     w_state_table[t].diag = 0;
                 }
-                
-                // BARRIER: All resets complete
-                barrier_wait(&g_barrier);
                 
                 // Leader writes sentinel marker to output
                 if (me() == 0) {
@@ -366,31 +355,26 @@ int main() {
                     }
                     mutex_unlock(g_output_mutex);
                 }
-                
-                // BARRIER: Before next packet
                 barrier_wait(&g_barrier);
+
                 continue;
             }
             
-            // === LEADER: Look up k-mer in hash index ===
+            // Leader looks up k-mer in hash index
             if (me() == 0) {
                 uint32_t offset = 0;
                 uint32_t count = 0;
                 
-                bool found = lookup_bucket(w_current_packet.kmer_idx, 
-                                          w_current_packet.bucket_idx,
-                                          &offset, &count,
-                                          &t_bucket_cache);
+                bool found = lookup_bucket(w_current_packet.kmer_idx, w_current_packet.bucket_idx, &offset, &count, &t_bucket_cache);
+
                 if (found && count > 0) {
                     // Bounds check: ensure offset + count doesn't exceed index
                     if (offset + count <= g_descriptor.num_index_entries) {
                         g_shared.entries_offset = offset;
-                        g_shared.entries_total = (count > MAX_DPU_SEQS) ? MAX_DPU_SEQS : count;
+                        g_shared.entries_total = count;
                     }
                 }
             }
-            
-            // BARRIER: All tasklets wait for lookup result
             barrier_wait(&g_barrier);
             
             // === PROCESS ENTRIES IN CHUNKS ===
@@ -400,65 +384,52 @@ int main() {
             uint32_t base_idx = g_shared.entries_offset;  // Entry index (not byte offset)
             
             while (processed < total_entries) {
-                // Check abort before each chunk
                 if (g_shared.transaction_aborted) {
                     break;
                 }
                 
-                // Leader fetches next chunk of entries using aligned read
-                uint32_t chunk_len = 0;
+                uint32_t entries_chunk_len = 0;
                 
                 if (me() == 0) {
-                    chunk_len = total_entries - processed;
-                    if (chunk_len > ENTRY_BUFFER_CAPACITY) {
-                        chunk_len = ENTRY_BUFFER_CAPACITY;
+                    entries_chunk_len = total_entries - processed;
+                    if (entries_chunk_len > ENTRY_BUFFER_CAPACITY) {
+                        entries_chunk_len = ENTRY_BUFFER_CAPACITY;
                     }
                     
                     // Bounds check before read
-                    if (base_idx + processed + chunk_len <= g_descriptor.num_index_entries) {
+                    if (base_idx + processed + entries_chunk_len <= g_descriptor.num_index_entries) {
                         // Use aligned read helper to handle 4-byte entries on 8-byte aligned MRAM
                         // Returns offset (0 or 1) where valid data starts - zero-cost pointer optimization
-                        uint32_t offset = read_entries_aligned(m_entries, base_idx + processed, chunk_len, w_entry_buffer);
+                        uint32_t offset = read_entries_aligned(m_entries, base_idx + processed, entries_chunk_len, w_entry_buffer);
                         g_shared.buffer_start_idx = offset;
                     } else {
                         g_shared.buffer_start_idx = 0;
                     }
-                    g_shared.entries_count = chunk_len;
+                    g_shared.entries_count = entries_chunk_len;
                 }
-                
-                // BARRIER: Wait for chunk to be loaded
                 barrier_wait(&g_barrier);
                 
-                chunk_len = g_shared.entries_count;
+                entries_chunk_len = g_shared.entries_count;
                 
                 // === FOLLOWERS: Owner-Computes pattern ===
                 // Each tasklet scans ALL entries but only acts on owned targets
                 // Use pointer arithmetic to access valid data (zero-cost optimization)
                 KmerCompactIndexEntry* valid_entries = &w_entry_buffer[g_shared.buffer_start_idx];
                 
-                for (uint32_t e = 0; e < chunk_len; ++e) {
+                for (uint32_t e = 0; e < entries_chunk_len; ++e) {
                     KmerCompactIndexEntry entry = valid_entries[e];
                     uint16_t tid = entry.local_target_id;
                     
                     // Bounds check: skip invalid target IDs
                     // Use num_targets (actual count in this batch) not MAX_DPU_SEQS
-                    if (tid >= g_descriptor.num_targets) {
-                        continue;
-                    }
-                    
-                    // OWNERSHIP CHECK: Only process targets assigned to this tasklet
-                    // This guarantees no two tasklets access the same state entry
-                    if ((tid & (NR_TASKLETS - 1)) != (uint16_t)me()) {
+                    if ((tid & (NR_TASKLETS - 1)) != (uint16_t)me() || tid >= g_descriptor.num_targets) {
                         continue;
                     }
                     
                     // Access state (exclusive - no lock needed due to ownership)
                     KmerDiagonalStateEntry* state = &w_state_table[tid];
                     
-                    // Calculate diagonal: query_pos - target_pos
                     int16_t diag = (int16_t)w_current_packet.query_pos - (int16_t)entry.pos_j;
-                    
-                    // Check for double hit: same diagonal as previous hit for this target
                     bool is_double = (state->pos != 0xFFFF && state->diag == diag);
                     
                     // Update state to last seen diagonal (always, regardless of double hit)
@@ -496,9 +467,8 @@ int main() {
                     }
                 }
                 
-                processed += chunk_len;
+                processed += entries_chunk_len;
                 
-                // BARRIER: All tasklets sync after processing chunk
                 barrier_wait(&g_barrier);
             }
             
