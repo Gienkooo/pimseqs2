@@ -2,7 +2,6 @@
 #include <alloc.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <string.h>
 #include <defs.h>
 #include <barrier.h>
 #include <mutex.h>
@@ -83,14 +82,14 @@ __attribute__((aligned(8))) KmerQueryPacket wram_current_packet;
 
 // Shared control variables accessed under barrier synchronization
 __attribute__((aligned(8))) struct {
-    uint32_t entries_buffer_count;       // Valid entries in wram_entry_buffer
-    uint32_t mram_kmer_entry_start_index;      // MRAM offset for current k-mer's entries
-    uint32_t entries_for_kmer_total;     // Total entries for current k-mer
-    uint32_t current_packet_idx;         // Global progress tracker
-    uint32_t total_mram_hits_written;    // Hits written to MRAM
-    uint32_t overflow_occurred;          // Overflow flag (use uint32_t for alignment)
-    uint32_t transaction_aborted;        // Soft abort flag
-    uint32_t wram_buffer_valid_start_offset;          // 0 or 1: where valid data starts in wram_entry_buffer
+    uint32_t entries_buffer_count;              // Valid entries in wram_entry_buffer
+    uint32_t mram_kmer_entry_start_index;       // MRAM offset for current k-mer's entries
+    uint32_t entries_for_kmer_total;            // Total entries for current k-mer
+    uint32_t current_packet_idx;                // Global progress tracker
+    uint32_t total_mram_hits_written;           // Hits written to MRAM
+    uint32_t overflow_occurred;                 // Overflow flag (use uint32_t for alignment)
+    uint32_t transaction_aborted;               // Soft abort flag
+    uint32_t wram_buffer_valid_start_offset;    // 0 or 1: where valid data starts in wram_entry_buffer
 } g_shared;
 
 __mram_ptr uint8_t* mram_base;
@@ -210,9 +209,8 @@ int main() {
         mram_state_table = (__mram_ptr KmerDiagonalStateEntry*)(mram_base + g_descriptor.state_table_offset);
         
         // Load checkpoint to resume from last committed position
-        // IMPORTANT: Host MUST zero the checkpoint before first launch.
-        // We verify the valid flag to catch uninitialized MRAM.
-        KmerCheckpoint checkpoint;
+        // Host MUST zero the checkpoint before first launch.
+        __attribute__((aligned(8))) KmerCheckpoint checkpoint;
         mram_read(mram_checkpoint, &checkpoint, sizeof(KmerCheckpoint));
         
         // Only use checkpoint if valid flag is set (valid=1 means in-progress, valid=0 means complete/fresh)
@@ -220,7 +218,6 @@ int main() {
         if (checkpoint.valid == 1 && checkpoint.packet_idx < g_descriptor.num_query_packets) {
             g_shared.current_packet_idx = checkpoint.packet_idx;
         } else {
-            // Fresh start or completed - start from beginning
             g_shared.current_packet_idx = 0;
         }
         
