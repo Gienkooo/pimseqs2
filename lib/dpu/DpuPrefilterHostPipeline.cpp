@@ -836,6 +836,13 @@ namespace mmseqs::dpu
                     }
                 }
 
+                // CHECK FOR CORRUPTION (Code 2)
+                if (overflow == 2) {
+                    Debug(Debug::ERROR) << "[DPU] FATAL: Index Corruption detected on DPU " << d << "!\n";
+                    Debug(Debug::ERROR) << "       Kernel reported out-of-bounds Bucket, Entry, or Target ID.\n";
+                    EXIT(EXIT_FAILURE);
+                }
+
                 if (overflow) {
                     all_dpus_complete = false; // Must relaunch this DPU
                     

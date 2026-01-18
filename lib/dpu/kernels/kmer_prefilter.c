@@ -145,14 +145,16 @@ static bool lookup_bucket(uint32_t kmer_idx, uint16_t bucket_idx,
                           KmerBucket* bucket_cache) {
     uint32_t current_bucket = (uint32_t)bucket_idx;
     
-    // Bounds check: bucket index must be valid
     if (current_bucket >= g_descriptor.num_buckets) {
+        g_shared.overflow_occurred = 2;
+        g_shared.transaction_aborted = 1;
         return false;
     }
     
     while (current_bucket != CHAIN_END_IDX) {
-        // Bounds check before MRAM access
         if (current_bucket >= g_descriptor.num_buckets) {
+            g_shared.overflow_occurred = 2;
+            g_shared.transaction_aborted = 1;
             return false;
         }
         
@@ -372,6 +374,9 @@ int main() {
                     if (offset + count <= g_descriptor.num_index_entries) {
                         g_shared.entries_offset = offset;
                         g_shared.entries_total = count;
+                    } else {
+                        g_shared.overflow_occurred = 2;
+                        g_shared.transaction_aborted = 1;
                     }
                 }
             }
@@ -420,34 +425,35 @@ int main() {
                     KmerCompactIndexEntry entry = valid_entries[e];
                     uint16_t tid = entry.local_target_id;
                     
-                    // Bounds check: skip invalid target IDs
-                    // Use num_targets (actual count in this batch) not MAX_DPU_SEQS
-                    if ((tid & (NR_TASKLETS - 1)) != (uint16_t)me() || tid >= g_descriptor.num_targets) {
+                    if (tid >= g_descriptor.num_targets) {
+                        g_shared.overflow_occurred = 2;
+                        g_shared.transaction_aborted = 1;
+                        break;
+                    }
+
+                    // Ownership check
+                    if ((tid & (NR_TASKLETS - 1)) != (uint16_t)me()) {
                         continue;
                     }
                     
-                    // Access state (exclusive - no lock needed due to ownership)
                     KmerDiagonalStateEntry* state = &w_state_table[tid];
                     
                     int16_t diag = (int16_t)w_current_packet.query_pos - (int16_t)entry.pos_j;
                     bool is_double = (state->pos != 0xFFFF && state->diag == diag);
                     
-                    // Update state to last seen diagonal (always, regardless of double hit)
+                    // Update state regardless of double hit
                     state->pos = w_current_packet.query_pos;
                     state->diag = diag;
                     
                     if (is_double) {
-                        // Buffer the hit locally
                         t_local_hits[t_local_hit_count].target_id = tid;
                         t_local_hits[t_local_hit_count].diagonal = diag;
                         t_local_hits[t_local_hit_count].padding = 0;
                         t_local_hit_count++;
                         
-                        // Flush if local buffer is full (8 hits = 64 bytes, 8-byte aligned)
                         if (t_local_hit_count >= LOCAL_HIT_BUFFER_SIZE) {
                             mutex_lock(g_output_mutex);
-                            bool success = (!g_shared.transaction_aborted && 
-                                            g_shared.total_hits_written + t_local_hit_count <= max_results);
+                            bool success = (!g_shared.transaction_aborted && g_shared.total_hits_written + t_local_hit_count <= max_results);
                             uint32_t my_write_offset = g_shared.total_hits_written;
                             
                             if (success) {
@@ -458,9 +464,7 @@ int main() {
                             mutex_unlock(g_output_mutex);
                             
                             if (success) {
-                                mram_write(t_local_hits, 
-                                          &m_output_buffer[my_write_offset],
-                                          t_local_hit_count * sizeof(KmerDoubleHit));
+                                mram_write(t_local_hits, &m_output_buffer[my_write_offset], t_local_hit_count * sizeof(KmerDoubleHit));
                             }
                             t_local_hit_count = 0;
                         }
@@ -475,8 +479,7 @@ int main() {
             // Flush remaining local hits after each packet
             if (t_local_hit_count > 0) {
                 mutex_lock(g_output_mutex);
-                bool success = (!g_shared.transaction_aborted && 
-                                g_shared.total_hits_written + t_local_hit_count <= max_results);
+                bool success = (!g_shared.transaction_aborted && g_shared.total_hits_written + t_local_hit_count <= max_results);
                 uint32_t my_write_offset = g_shared.total_hits_written;
                 
                 if (success) {
@@ -500,11 +503,11 @@ int main() {
         if (me() == 0) {
             if (g_shared.transaction_aborted) {
                 g_shared.total_hits_written = batch_start_hits;
-                g_shared.overflow_occurred = 1;
+                if (g_shared.overflow_occurred != 2) g_shared.overflow_occurred = 1;
                 
                 __attribute__((aligned(8))) KmerResultHeader hdr;
                 hdr.total_hits = g_shared.total_hits_written;
-                hdr.overflow = 1;
+                hdr.overflow = g_shared.overflow_occurred;
                 
                 __mram_ptr KmerResultHeader* hdr_ptr = (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
                 mram_write(&hdr, hdr_ptr, sizeof(KmerResultHeader));
