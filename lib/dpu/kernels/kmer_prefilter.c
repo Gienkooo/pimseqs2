@@ -256,7 +256,11 @@ int main() {
             g_shared.current_packet_idx = 0;
         }
         
-        mram_read_safe(m_state_table, w_state_table, MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
+        uint32_t state_size = DPU_ALIGN_SIZE(g_descriptor.num_targets * sizeof(KmerDiagonalStateEntry));
+        if (state_size > MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)) {
+            state_size = MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry);
+        }
+        mram_read_safe(m_state_table, w_state_table, state_size);
         
         g_shared.total_hits_written = 0;
         g_shared.overflow_occurred = 0;
@@ -290,19 +294,14 @@ int main() {
             batch_start_hits = g_shared.total_hits_written;
             g_shared.transaction_aborted = 0;
         }
-        
-        // BARRIER: Ensure all tasklets see consistent batch start state
         barrier_wait(&g_barrier);
         
-        // Check completion conditions (all tasklets check, no conditional barrier)
-        if (batch_start_packet >= g_descriptor.num_query_packets) {
-            break;  // All packets processed
-        }
-        if (g_shared.overflow_occurred) {
-            break;  // Overflow from previous batch
+        // Exit if all packets processed or overflow occurred
+        if (batch_start_packet >= g_descriptor.num_query_packets || g_shared.overflow_occurred) {
+            break; 
         }
         
-        // ----- Process packets in this transaction batch -----
+        // Process packets in this transaction batch
         for (uint32_t batch_offset = 0; batch_offset < TRANSACTION_BATCH_SIZE; ++batch_offset) {
             uint32_t pkt_idx = batch_start_packet + batch_offset;
             
@@ -318,7 +317,7 @@ int main() {
                 break;
             }
             
-            // === LEADER: Fetch current packet from MRAM ===
+            // Fetch current packet from MRAM
             if (me() == 0) {
                 // Bounds check
                 if (pkt_idx < g_descriptor.num_query_packets) {
@@ -327,18 +326,16 @@ int main() {
                 g_shared.entries_count = 0;
                 g_shared.entries_total = 0;
             }
-            
-            // BARRIER: All tasklets wait for packet to be loaded
             barrier_wait(&g_barrier);
             
-            // === SENTINEL PACKET: Reset state for all targets ===
+            // Reset state for all targets on sentinel packet
             if (w_current_packet.kmer_idx == KMER_PACKET_SENTINEL_KEY) {
                 // Owner-Computes Reset: Each tasklet resets its owned targets
-                // Divides target sequences evenly among NR_TASKLETS (16) = 512 each
-                uint32_t chunk_size = (MAX_DPU_SEQS + NR_TASKLETS - 1) / NR_TASKLETS;
+                // Divides target sequences evenly among NR_TASKLETS (16)
+                uint32_t chunk_size = (g_descriptor.num_targets + NR_TASKLETS - 1) / NR_TASKLETS;
                 uint32_t start_t = me() * chunk_size;
                 uint32_t end_t = start_t + chunk_size;
-                if (end_t > MAX_DPU_SEQS) end_t = MAX_DPU_SEQS;
+                if (end_t > g_descriptor.num_targets) end_t = g_descriptor.num_targets;
                 
                 // Reset state entries to "no previous hit" (0xFFFF means invalid)
                 for (uint32_t t = start_t; t < end_t; ++t) {
@@ -548,7 +545,6 @@ int main() {
                     g_shared.current_packet_idx = g_descriptor.num_query_packets;
                 }
                 
-                // Save checkpoint 
                 __attribute__((aligned(8))) KmerCheckpoint ckpt;
                 ckpt.packet_idx = g_shared.current_packet_idx;
                 ckpt.entry_idx = 0;
@@ -556,7 +552,11 @@ int main() {
                 ckpt.valid = 1;
                 mram_write(&ckpt, m_checkpoint, sizeof(KmerCheckpoint));
                 
-                mram_write_safe(w_state_table, m_state_table, MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry));
+                uint32_t state_size = DPU_ALIGN_SIZE(g_descriptor.num_targets * sizeof(KmerDiagonalStateEntry));
+                if (state_size > MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)) {
+                    state_size = MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry);
+                }
+                mram_write_safe(w_state_table, m_state_table, state_size);
             }
         }
         barrier_wait(&g_barrier);
@@ -566,23 +566,20 @@ int main() {
         }
     }
     
-    // PHASE 3: FINALIZE (Leader writes final header)
-        if (me() == 0 && !g_shared.overflow_occurred) {
-        // Write final header (success case)
+    // PHASE 3: Finalize processing if no overflow occurred
+    if (me() == 0 && !g_shared.overflow_occurred) {
         __attribute__((aligned(8))) KmerResultHeader hdr;
         hdr.total_hits = g_shared.total_hits_written;
         hdr.overflow = 0;
         
-        __mram_ptr KmerResultHeader* hdr_ptr = 
-            (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
+        __mram_ptr KmerResultHeader* hdr_ptr = (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
         mram_write(&hdr, hdr_ptr, sizeof(KmerResultHeader));
         
-        // Final checkpoint (all packets processed)
         __attribute__((aligned(8))) KmerCheckpoint ckpt;
         ckpt.packet_idx = g_descriptor.num_query_packets;
         ckpt.entry_idx = 0;
         ckpt.padding = 0;
-        ckpt.valid = 0;  // Mark as complete
+        ckpt.valid = 0; // Mark processing as complete
         mram_write(&ckpt, m_checkpoint, sizeof(KmerCheckpoint));
     }
     
