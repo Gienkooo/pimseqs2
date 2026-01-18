@@ -402,7 +402,7 @@ namespace mmseqs::dpu
         std::vector<uint64_t> perQueryPackets;
         std::vector<uint64_t> perQueryDoubleHits;
         
-        auto splits = DpuDbSplitter::splitDatabase(tdbr, num_dpus, MAX_DPU_INDEX_SIZE, MAX_DPU_SEQS);
+        auto splits = DpuDbSplitter::splitDatabaseBalancedKmer(tdbr, num_dpus, MAX_DPU_INDEX_SIZE, MAX_DPU_SEQS);
         
         if (splits.empty()) {
             Debug(Debug::ERROR) << "[CPU] Database splitting failed\n";

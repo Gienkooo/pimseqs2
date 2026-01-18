@@ -1,101 +1,186 @@
 #include "DpuDbSplitter.h"
+#include "shared/DpuSharedTypes.h" 
 #include "Debug.h"
 #include <algorithm>
 #include <cmath>
-#include <vector> 
+#include <queue>
+#include <vector>
 
 namespace mmseqs::dpu {
 
-    std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabase(
-        DBReader<unsigned int>* tdbr,
-        uint32_t num_dpus,
-        size_t mram_limit_bytes,
-        uint32_t max_seqs_per_dpu
-    ) {
-        size_t total_seqs = tdbr->getSize();
-        
-        // 1. Gather Metadata
-        std::vector<SequenceMetadata> seqs;
-        seqs.reserve(total_seqs);
-        
-        for (size_t i = 0; i < total_seqs; ++i) {
-            uint32_t key = tdbr->getDbKey(i);
-            uint32_t len = tdbr->getSeqLen(i);
-            size_t size = estimateSequenceSizeBytes(len);
+std::vector<DpuDbSplitter::SequenceMetadata> DpuDbSplitter::getMetadata(
+    DBReader<unsigned int>* tdbr, 
+    size_t mram_limit_bytes
+) {
+    size_t total_seqs = tdbr->getSize();
+    std::vector<DpuDbSplitter::SequenceMetadata> seqs;
+    seqs.reserve(total_seqs);
+
+    if (mram_limit_bytes <= DPU_FIXED_INDEX_OVERHEAD) {
+        Debug(Debug::ERROR) << "[DPU] MRAM limit (" << mram_limit_bytes 
+                            << ") is smaller than fixed overhead (" << DPU_FIXED_INDEX_OVERHEAD << ")\n";
+        return {};
+    }
+
+    size_t available_for_entries = mram_limit_bytes - DPU_FIXED_INDEX_OVERHEAD;
+
+    for (size_t i = 0; i < total_seqs; ++i) {
+        uint32_t key = tdbr->getDbKey(i);
+        uint32_t len = tdbr->getSeqLen(i);
+        size_t marginal_size = estimateSequenceSizeBytes(len);
+
+        if (marginal_size > available_for_entries) {
+            Debug(Debug::ERROR) << "[DPU] Sequence " << key << " is too large.\n";
+            return {};
+        }
+        seqs.push_back({key, len, marginal_size});
+    }
+
+    // LPT Sort (Descending)
+    std::sort(seqs.begin(), seqs.end(), [](const auto& a, const auto& b) {
+        return a.estimated_size > b.estimated_size;
+    });
+
+    return seqs;
+}
+
+std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabaseGreedyKmer(
+    DBReader<unsigned int>* tdbr,
+    uint32_t num_dpus,
+    size_t mram_limit_bytes,
+    uint32_t max_seqs_per_dpu
+) {
+    if (tdbr->getSize() == 0) return {};
+    auto seqs = getMetadata(tdbr, mram_limit_bytes);
+    if (seqs.empty()) return {};
+
+    std::vector<DpuChunk> chunks;
+    chunks.emplace_back(); 
+    chunks.back().current_estimated_bytes = DPU_FIXED_INDEX_OVERHEAD;
+
+    for (const auto& seq : seqs) {
+        DpuChunk& current = chunks.back();
+        bool size_ok = (current.current_estimated_bytes + seq.estimated_size) <= mram_limit_bytes;
+        bool count_ok = (current.current_seq_count + 1) <= max_seqs_per_dpu;
+
+        if (size_ok && count_ok) {
+            current.sequence_ids.push_back(seq.db_key);
+            current.current_seq_count++;
+            current.current_estimated_bytes += seq.estimated_size;
+            current.current_total_length += seq.len;
+        } else {
+            chunks.emplace_back();
+            DpuChunk& next = chunks.back();
+            next.current_estimated_bytes = DPU_FIXED_INDEX_OVERHEAD;
             
-            if (size > mram_limit_bytes) {
-                Debug(Debug::ERROR) << "[DPU] Sequence " << key << " is too large (" 
-                                    << size/1024/1024 << "MB) for DPU MRAM limit (" 
-                                    << mram_limit_bytes/1024/1024 << "MB)\n";
-                return {};
-            }
-            
-            seqs.push_back({key, len, size});
+            next.sequence_ids.push_back(seq.db_key);
+            next.current_seq_count++;
+            next.current_estimated_bytes += seq.estimated_size;
+            next.current_total_length += seq.len;
+        }
+    }
+
+    std::vector<std::vector<uint32_t>> result;
+    result.reserve(chunks.size());
+    for (const auto& chunk : chunks) {
+        if (!chunk.sequence_ids.empty()) result.push_back(chunk.sequence_ids);
+    }
+    
+    Debug(Debug::INFO) << "[DPU] Greedy Split: " << result.size() << " chunks created.\n";
+    return result;
+}
+
+std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabaseBalancedKmer(
+    DBReader<unsigned int>* tdbr,
+    uint32_t num_dpus,
+    size_t mram_limit_bytes,
+    uint32_t max_seqs_per_dpu
+) {
+    if (tdbr->getSize() == 0) return {};
+    auto seqs = getMetadata(tdbr, mram_limit_bytes);
+    if (seqs.empty()) return {};
+
+    size_t total_marginal_bytes = 0;
+    for(const auto& s : seqs) total_marginal_bytes += s.estimated_size;
+
+    size_t usable_mram = mram_limit_bytes - DPU_FIXED_INDEX_OVERHEAD;
+    size_t min_chunks_seq = (seqs.size() + max_seqs_per_dpu - 1) / max_seqs_per_dpu;
+    size_t min_chunks_ram = (total_marginal_bytes + usable_mram - 1) / usable_mram;
+    size_t min_chunks = std::max(min_chunks_seq, min_chunks_ram);
+
+    size_t num_waves = (min_chunks + num_dpus - 1) / num_dpus;
+    if (num_waves == 0) num_waves = 1;
+
+    Debug(Debug::INFO) << "[DPU] Balanced Splitter: Initial guess " << num_waves << " waves.\n";
+
+    while (true) {
+        size_t num_chunks = num_waves * num_dpus;
+        auto cmp = [](const DpuChunk* a, const DpuChunk* b) {
+            return a->current_estimated_bytes > b->current_estimated_bytes;
+        };
+        std::priority_queue<DpuChunk*, std::vector<DpuChunk*>, decltype(cmp)> pq(cmp);
+
+        std::vector<DpuChunk> chunks(num_chunks);
+        for (size_t i = 0; i < num_chunks; ++i) {
+            chunks[i].current_estimated_bytes = DPU_FIXED_INDEX_OVERHEAD;
+            pq.push(&chunks[i]);
         }
 
-        // Sort Descending 
-        std::sort(seqs.begin(), seqs.end(), [](const SequenceMetadata& a, const SequenceMetadata& b) {
-            return a.estimated_size > b.estimated_size;
-        });
-
-        // 2. Greedy Linear Packing
-        std::vector<DpuChunk> chunks;
-        if (!seqs.empty()) {
-            chunks.emplace_back(); 
-        }
-
+        bool fit_successful = true;
         for (const auto& seq : seqs) {
-            DpuChunk& current = chunks.back();
-            
-            bool size_ok = (current.current_estimated_bytes + seq.estimated_size) <= mram_limit_bytes;
-            bool count_ok = (current.current_seq_count + 1) <= max_seqs_per_dpu;
+            DpuChunk* best_chunk = pq.top();
+            pq.pop();
+
+            bool size_ok = (best_chunk->current_estimated_bytes + seq.estimated_size) <= mram_limit_bytes;
+            bool count_ok = (best_chunk->current_seq_count + 1) <= max_seqs_per_dpu;
 
             if (size_ok && count_ok) {
-                // Fits in current chunk
-                current.sequence_ids.push_back(seq.db_key);
-                current.current_seq_count++;
-                current.current_estimated_bytes += seq.estimated_size;
-                current.current_total_length += seq.length;
+                best_chunk->sequence_ids.push_back(seq.db_key);
+                best_chunk->current_seq_count++;
+                best_chunk->current_estimated_bytes += seq.estimated_size;
+                best_chunk->current_total_length += seq.len;
+                pq.push(best_chunk);
             } else {
-                // Must start a new chunk
-                chunks.emplace_back();
-                DpuChunk& next = chunks.back();
-                
-                // We already validated that the seq fits in an empty chunk in step 1
-                next.sequence_ids.push_back(seq.db_key);
-                next.current_seq_count++;
-                next.current_estimated_bytes += seq.estimated_size;
-                next.current_total_length += seq.length;
+                fit_successful = false;
+                break;
             }
         }
 
-        // 3. Convert to output format
-        std::vector<std::vector<uint32_t>> result;
-        result.reserve(chunks.size());
-        
-        size_t min_load = 0;
-        size_t max_load = 0;
-        if (!chunks.empty()) min_load = SIZE_MAX;
-        
-        for (const auto& chunk : chunks) {
-            if (!chunk.sequence_ids.empty()) {
+        if (fit_successful) {
+            std::vector<std::vector<uint32_t>> result;
+            result.reserve(num_chunks);
+            size_t min_load = SIZE_MAX, max_load = 0;
+
+            for (const auto& chunk : chunks) {
                 result.push_back(chunk.sequence_ids);
-                size_t bytes = chunk.current_estimated_bytes;
-                if (bytes < min_load) min_load = bytes;
-                if (bytes > max_load) max_load = bytes;
+                if (!chunk.sequence_ids.empty()) {
+                    min_load = std::min(min_load, chunk.current_estimated_bytes);
+                    max_load = std::max(max_load, chunk.current_estimated_bytes);
+                }
             }
+            Debug(Debug::INFO) << "[DPU] Balanced Split: " << num_waves << " waves (" 
+                               << result.size() << " chunks). Load (Min/Max): " 
+                               << min_load/1024 << "KB / " << max_load/1024 << "KB\n";
+            return result;
         }
-        
-        size_t num_waves = 0;
-        if (num_dpus > 0) {
-            num_waves = (result.size() + num_dpus - 1) / num_dpus;
+
+        num_waves++;
+        if (num_waves > seqs.size()) {
+             Debug(Debug::ERROR) << "[DPU] Splitter failed to converge.\n";
+             return {};
         }
-        
-        Debug(Debug::INFO) << "[DPU] Database split into " << result.size() 
-                        << " chunks (" << num_waves << " waves)." 
-                        << " Load Balance (Bytes): Min=" << min_load/1024 
-                        << "KB Max=" << max_load/1024 << "KB\n";
-        return result;
     }
+}
+
+std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabase(
+    DBReader<unsigned int>* tdbr,
+    uint32_t num_dpus,
+    size_t mram_limit_bytes,
+    uint32_t max_seqs_per_dpu
+) {
+    // This function exists only to ensure compilation/linking for existing calls.
+    // Forwards to the Greedy strategy to maintain legacy behavior.
+    return splitDatabaseGreedyKmer(tdbr, num_dpus, mram_limit_bytes, max_seqs_per_dpu);
+}
 
 } // namespace mmseqs::dpu

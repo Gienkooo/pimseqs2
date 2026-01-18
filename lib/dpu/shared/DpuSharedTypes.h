@@ -36,18 +36,18 @@ extern "C" {
 
 /* ==================== K-mer Matching Specific Limits and Structures ==================== 
  * MRAM Layout (Bucketed Hash Index):
- *   [0x000000] Descriptor         (~96 B)
- *   [STATIC]   State Table        (16 KB)   ← Per-sequence diagonal tracking
- *   [STATIC]   Query Buffer       (24 MB)   ← Input packets, fixed size
- *   [VARIABLE] Bucket Array       (~16 MB)  ← 65536 primary buckets + overflow
- *   [VARIABLE] Entries Array      (varies)  ← {target_id, pos} pairs
- *   [VARIABLE] Output Buffer      (remaining MRAM)
- *      ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
- *      ↳ [0x08] Double Hits...      ← Contiguous hit array
+ * [0x000000] Descriptor         (~96 B)   ← Batch metadata
+ * [STATIC]   Checkpoint         (16 B)    ← Recovery state (packet_idx, valid flag)
+ * [STATIC]   State Table        (32 KB)   ← Per-sequence diagonal tracking (8192 * 4B)
+ * [STATIC]   Query Buffer       (12 MB)   ← Input packets, fixed size
+ * [VARIABLE] Bucket Array       (16 MB+)  ← 65536 primary buckets (16MB) + overflow
+ * [VARIABLE] Entries Array      (varies)  ← {target_id, pos} pairs
+ * [VARIABLE] Output Buffer      (remaining)
+ * ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
+ * ↳ [0x08] Double Hits...      ← Contiguous hit array
  */
 
-/* ==================== BUCKETED INDEX PARAMETERS ==================== */
-/* 65536 buckets * 256 bytes = 16 MB Index Size */
+/* Bucketed Index Parameters  */
 #define NUM_BUCKETS 65536
 #define BUCKET_SIZE 256
 #define BUCKET_CAPACITY 20  /* (256 - 2 count - 2 pad - 4 next - 8 pad) / 12 bytes per item = 20 */
@@ -60,15 +60,17 @@ extern "C" {
 #define KMER_PACKET_SENTINEL_KEY     0xFFFFFFFF   /* End-of-query marker in packet stream */
 #define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
 
+/* Fixed MRAM Overhead Calculation */
+#define DPU_INDEX_BUCKETS_SIZE   (NUM_BUCKETS * BUCKET_SIZE)    /* 16 MB */
+#define DPU_STATE_TABLE_SIZE     (MAX_DPU_SEQS * 4)             /* 32 KB */
+#define DPU_FIXED_INDEX_OVERHEAD (DPU_INDEX_BUCKETS_SIZE + DPU_STATE_TABLE_SIZE)
+#define MAX_DPU_INDEX_SIZE       (34 * 1024 * 1024) 
+
 #define MAX_DPU_SEQS 8192       
-#define MAX_DPU_INDEX_SIZE (34 * 1024 * 1024) /* 32 MB max index size per DPU */
-#define PACKET_READ_BATCH_SIZE 32
 
 /* Buffer Size Configuration */
-#define KMER_QUERY_BUFFER_SIZE (12 * 1024 * 1024)     /* query packet buffer */
-#define KMER_MIN_OUTPUT_BUFFER_SIZE (1 * 1024 * 1024) /* 1 MB minimum output */
-
-#define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))
+#define KMER_QUERY_BUFFER_SIZE      (12 * 1024 * 1024)    
+#define KMER_MIN_OUTPUT_BUFFER_SIZE (1 * 1024 * 1024)
 
 /* ==================== HASH CALCULATION ==================== */
 /* MurmurHash3 Finalizer (fast integer hash)
