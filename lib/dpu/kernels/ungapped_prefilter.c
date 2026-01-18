@@ -11,15 +11,13 @@
 
 #define AA_NUMBER 21
 #define MRAM_MAX 2048
-#define LONG_TARGET_LEN 2048
+#define LONG_TARGET_LEN 4096
 #define LONG_QUERY_LEN 2048
 #define WRAM_CACHE 57344
 
 #define MRAM_ALIGN_SIZE(x) (((x) + 7) & ~7U) // 8 * ceil(x/8)
 
 BARRIER_INIT(barrier, NR_TASKLETS);
-
-// __mram_noinit int16_t mram_score[MAX_TARGET_LEN]
 
 __dma_aligned BatchDescriptor batch_descriptor;
 __dma_aligned QueryMetadata query_meta;
@@ -184,9 +182,129 @@ static void align_long_q(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
     }
 }
 
-// inline void* mram_short_read(void* src, void* dest, uint32_t bytes) { }
+static void align_long_qt(
+    uint32_t tasklet_id, 
+    uintptr_t mram_base, 
+    int8_t* pssm_buffer,
+    uint8_t* target_buffer,
+    int16_t* band_scores,
+    int16_t* band_max_scores
+) {
+    uint32_t t_len = target_meta.target_len;
+    uint32_t q_len = query_meta.query_len;
+    uint32_t max_t_chunk_len = LONG_TARGET_LEN;
+    uint32_t max_q_chunk_len = LONG_QUERY_LEN;
 
-// inline void* mram_long_read(void* src, void* dest, uint32_t bytes) { }
+    int32_t min_diag = 1 - (int32_t)q_len;
+    int32_t max_diag = (int32_t)t_len - 1;
+    int32_t max_band_width = (int32_t)max_t_chunk_len - (int32_t)max_q_chunk_len + 1;
+
+    int16_t my_max_score = 0;
+    int16_t my_best_diag = 0;
+
+    // begin band
+    for (int32_t band_start_diag = min_diag; band_start_diag <= max_diag; band_start_diag += max_band_width) {
+        
+        int32_t band_width = max_band_width;
+        if (max_diag - band_start_diag + 1 < band_width) {
+            band_width = max_diag - band_start_diag + 1;
+        }
+        int32_t band_end_diag = band_start_diag + band_width - 1;
+
+        for (int32_t k = tasklet_id; k < band_width; k += NR_TASKLETS) {
+            band_scores[k] = 0;
+            band_max_scores[k] = 0;
+        }
+        barrier_wait(&barrier);
+
+        // begin chunk
+        for (uint32_t q_start = 0; q_start < q_len; q_start += max_q_chunk_len) {
+
+            uint32_t q_chunk_len = max_q_chunk_len;
+            if (q_len - q_start < q_chunk_len) q_chunk_len = q_len - q_start;
+
+            // load query
+            if (tasklet_id == 0) {
+                uint32_t aligned_size = MRAM_ALIGN_SIZE(q_chunk_len * AA_NUMBER);
+                uintptr_t src_addr = mram_base + batch_descriptor.pssm_data_offset + query_meta.pssm_offset_in_batch + (q_start * AA_NUMBER);
+                uintptr_t aligned_addr = src_addr & ~7U;
+                uint32_t offset = src_addr & 7U;
+                
+                uint32_t read_off = 0;
+                for(;read_off + MRAM_MAX < aligned_size; read_off += MRAM_MAX) {
+                    mram_read((__mram_ptr void*)(aligned_addr + read_off), (uint8_t*)pssm_buffer + read_off, MRAM_MAX);
+                } mram_read((__mram_ptr void*)(aligned_addr + read_off), (uint8_t*)pssm_buffer + read_off, aligned_size - read_off);
+                pssm_global = pssm_buffer + offset;
+            }
+            barrier_wait(&barrier);
+
+            int32_t t_idx_min = (int32_t)q_start + band_start_diag;
+            int32_t t_idx_max = ((int32_t)q_start + (int32_t)q_chunk_len - 1) + band_end_diag;
+            int32_t t_start = t_idx_min > 0 ? t_idx_min : 0;
+            int32_t t_end = t_idx_max < (int32_t)t_len - 1 ? t_idx_max : (int32_t)t_len - 1;
+            if (t_start > t_end) {
+                barrier_wait(&barrier); 
+                continue;
+            }
+
+            // load target
+            int32_t t_chunk_len = t_end - t_start + 1;
+            if (tasklet_id == 0) {
+                uint32_t aligned_size = MRAM_ALIGN_SIZE(t_chunk_len);
+                uintptr_t src_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + t_start;
+                uintptr_t aligned_addr = src_addr & ~7U;
+                uint32_t offset = src_addr & 7U;
+
+                uint32_t read_off = 0;
+                for(;read_off + MRAM_MAX < aligned_size; read_off += MRAM_MAX) {
+                    mram_read((__mram_ptr void*)(aligned_addr + read_off), target_buffer + read_off, MRAM_MAX);
+                } mram_read((__mram_ptr void*)(aligned_addr + read_off), target_buffer + read_off, aligned_size - read_off);
+                target_global = target_buffer + offset;
+            }
+            barrier_wait(&barrier);
+
+            // compute scores
+            int8_t* pssm_chunk = pssm_global;
+            uint8_t* target_chunk = target_global;
+            for (uint32_t i = 0; i < q_chunk_len; ++i) {
+                int32_t q_global = q_start + i;
+                uint32_t q_offset = i * AA_NUMBER;
+                for (int32_t k = tasklet_id; k < band_width; k += NR_TASKLETS) {
+                    int32_t diag = band_start_diag + k;
+                    int32_t t_global = q_global + diag;
+                    if (t_global >= 0 && t_global < (int32_t)t_len) {
+                        int32_t t_local = t_global - t_start;
+                        if (t_local >= 0 && t_local < t_chunk_len) {
+                            uint8_t t_val = target_chunk[t_local];
+                            if (t_val >= AA_NUMBER) t_val = 20;
+                            int16_t match_score = (int16_t)pssm_chunk[q_offset + t_val];
+                            int16_t score = band_scores[k] + match_score;
+                            if (score < 0) score = 0;
+                            band_scores[k] = score;
+                            if (score > band_max_scores[k]) {
+                                band_max_scores[k] = score;
+                            }
+                        }
+                    }
+                }
+            }
+        } // end chunk
+
+        for (int32_t k = tasklet_id; k < band_width; k += NR_TASKLETS) {
+            if (band_max_scores[k] > my_max_score) {
+                my_max_score = band_max_scores[k];
+                my_best_diag = (int16_t)(- band_start_diag - k);
+            }
+        }
+        barrier_wait(&barrier);
+
+    } // end band
+
+    if (my_max_score > tasklet_results[tasklet_id].score) {
+        tasklet_results[tasklet_id].score = my_max_score;
+        tasklet_results[tasklet_id].diagonal = my_best_diag;
+    }
+}
 
 int main() {
     uint32_t tasklet_id = me();
@@ -275,18 +393,23 @@ int main() {
                     barrier_wait(&barrier);
                 }
                 // LONG TARGET
-                else { // TODO: fix target len
+                else {
                     for(int32_t idx = tasklet_id; idx < LONG_QUERY_LEN; idx += NR_TASKLETS) score_buffer[idx] = 0;
                     for(int32_t target_start = 0; target_start < target_meta.target_len; target_start += LONG_TARGET_LEN) {
-                        // Load Target Sequence
+                        // Load target
                         if (tasklet_id == 0) {
-                            uint32_t aligned_target_size = MRAM_ALIGN_SIZE(target_meta.target_len);
+                            uint32_t aligned_target_size = target_start + LONG_TARGET_LEN > target_meta.target_len ?
+                                MRAM_ALIGN_SIZE(target_meta.target_len - target_start) : MRAM_ALIGN_SIZE(LONG_TARGET_LEN);
                             if (aligned_target_size > LONG_TARGET_LEN) aligned_target_size = LONG_TARGET_LEN;
                             uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + target_start;
                             uintptr_t aligned_target_addr = target_addr & ~7U;
                             uint32_t offset = target_addr & 7U;
-                            mram_read((__mram_ptr void*)aligned_target_addr, target_buffer, aligned_target_size);
+                            uint32_t target_read_offset = 0;
+                            for(;target_read_offset + MRAM_MAX < aligned_target_size; target_read_offset += MRAM_MAX) {
+                                mram_read((__mram_ptr void*)(aligned_target_addr + target_read_offset), target_buffer + target_read_offset, MRAM_MAX);
+                            } mram_read((__mram_ptr void*)(aligned_target_addr + target_read_offset), target_buffer + target_read_offset, aligned_target_size - target_read_offset);
                             target_global = target_buffer + offset;
+                            target_len = aligned_target_size;
                         }
                         barrier_wait(&barrier);
                         
@@ -389,9 +512,16 @@ int main() {
                         align_long_q(tasklet_id, target, pssm, target_meta.target_len, pssm_len, query_start, score_buffer);
                         barrier_wait(&barrier);
                     }                    
-                }TODO: 
+                }
                 // LONG TARGET
-                // TODO
+                else {
+                    int8_t* pssm_buf = (int8_t*)wram; 
+                    uint8_t* target_buf = (uint8_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN)); 
+                    int16_t* band_scores = (int16_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN) + LONG_TARGET_LEN);
+                    int16_t* band_max_scores = band_scores + (LONG_TARGET_LEN);
+                    align_long_qt(tasklet_id, mram_base, pssm_buf, target_buf, band_scores, band_max_scores);
+                    barrier_wait(&barrier);
+                }
 
                 // Store score and diagonal
                 if (tasklet_id == 0) {
