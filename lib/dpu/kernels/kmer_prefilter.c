@@ -20,48 +20,7 @@ _Static_assert(IS_POWER_OF_2(NR_TASKLETS), "NR_TASKLETS must be a power of 2!");
 #define ENTRY_BUFFER_SIZE (ENTRY_BUFFER_CAPACITY + 2)
 
 #define TRANSACTION_BATCH_SIZE 128
-#define MAX_MRAM_TRANSFER_SIZE 2048
 #define LOCAL_HIT_BUFFER_SIZE 32
-
-/**
- * Safe MRAM write for buffers larger than 2KB.
- * PRECONDITIONS:
- * - wram_src must be 8-byte aligned
- * - mram_dst must be 8-byte aligned  
- * - size must be multiple of 8
- */
-static void mram_write_safe(const void *wram_src, __mram_ptr void *mram_dst, uint32_t size) {
-    uint32_t offset = 0;
-    const uint8_t *src_ptr = (const uint8_t *)wram_src;
-    __mram_ptr uint8_t *dst_ptr = (__mram_ptr uint8_t *)mram_dst;
-
-    while (offset < size) {
-        uint32_t chunk = (size - offset > MAX_MRAM_TRANSFER_SIZE) 
-                        ? MAX_MRAM_TRANSFER_SIZE : (size - offset);
-        mram_write(&src_ptr[offset], &dst_ptr[offset], chunk);
-        offset += chunk;
-    }
-}
-
-/**
- * Safe MRAM read for buffers larger than 2KB.
- * PRECONDITIONS:
- * - mram_src must be 8-byte aligned
- * - wram_dst must be 8-byte aligned
- * - size must be multiple of 8
- */
-static void mram_read_safe(__mram_ptr const void *mram_src, void *wram_dst, uint32_t size) {
-    uint32_t offset = 0;
-    __mram_ptr const uint8_t *src_ptr = (__mram_ptr const uint8_t *)mram_src;
-    uint8_t *dst_ptr = (uint8_t *)wram_dst;
-
-    while (offset < size) {
-        uint32_t chunk = (size - offset > MAX_MRAM_TRANSFER_SIZE) 
-                        ? MAX_MRAM_TRANSFER_SIZE : (size - offset);
-        mram_read(&src_ptr[offset], &dst_ptr[offset], chunk);
-        offset += chunk;
-    }
-}
 
 BARRIER_INIT(g_barrier, NR_TASKLETS);
 MUTEX_INIT(g_output_mutex);
