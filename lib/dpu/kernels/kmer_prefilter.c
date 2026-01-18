@@ -30,11 +30,15 @@
 #include <barrier.h>
 #include <mutex.h>
 
+#include "dpu_common.h"
 #include "DpuSharedTypes.h"
 
 #ifndef NR_TASKLETS
 #define NR_TASKLETS 16
 #endif
+
+#define IS_POWER_OF_2(x) ((x) && !((x) & ((x) - 1)))
+_Static_assert(IS_POWER_OF_2(NR_TASKLETS), "NR_TASKLETS must be a power of 2!");
 
 // ============================================================================
 // CONFIGURATION (All sizes are 8-byte aligned)
@@ -50,30 +54,13 @@
 #define ENTRY_BUFFER_SIZE (ENTRY_BUFFER_CAPACITY + 2)
 
 // Transaction batch size: process this many packets before committing state
-#define TRANSACTION_BATCH_SIZE 32
+#define TRANSACTION_BATCH_SIZE 128
 
-// Maximum DPU single transfer size (DPU hardware limit)
-#define MAX_DPU_TRANSFER_SIZE 2048
+// Maximum MRAM single transfer size (DPU hardware limit)
+#define MAX_MRAM_TRANSFER_SIZE 2048
 
-// Local hit buffer per tasklet: 8 hits * 8 bytes = 64 bytes (8-byte aligned)
-#define LOCAL_HIT_BUFFER_SIZE 8
-
-// ============================================================================
-// WRAM BUDGET VERIFICATION
-// ============================================================================
-// State table:      8192 * 4 = 32,768 bytes
-// Entry buffer:     512 * 4  =  2,048 bytes  
-// Current packet:   8 bytes
-// Descriptor:       48 bytes (aligned to 8)
-// Shared vars:      ~64 bytes
-// Per-tasklet:      16 * (64 + 256 + 8) = ~5,248 bytes (local hits + bucket cache + misc)
-// System/stack:     ~16KB reserved
-// TOTAL:            ~56KB < 60KB ✓
-// ============================================================================
-
-// ============================================================================
-// MRAM SAFE TRANSFER HELPERS (respects 2KB max and 8-byte alignment)
-// ============================================================================
+// Local hit buffer per tasklet: 32 hits * 8 bytes = 256 bytes (8-byte aligned)
+#define LOCAL_HIT_BUFFER_SIZE 32
 
 /**
  * Safe MRAM write for buffers larger than 2KB.
@@ -88,8 +75,8 @@ static void mram_write_safe(const void *wram_src, __mram_ptr void *mram_dst, uin
     __mram_ptr uint8_t *dst_ptr = (__mram_ptr uint8_t *)mram_dst;
 
     while (offset < size) {
-        uint32_t chunk = (size - offset > MAX_DPU_TRANSFER_SIZE) 
-                        ? MAX_DPU_TRANSFER_SIZE : (size - offset);
+        uint32_t chunk = (size - offset > MAX_MRAM_TRANSFER_SIZE) 
+                        ? MAX_MRAM_TRANSFER_SIZE : (size - offset);
         mram_write(&src_ptr[offset], &dst_ptr[offset], chunk);
         offset += chunk;
     }
@@ -108,8 +95,8 @@ static void mram_read_safe(__mram_ptr const void *mram_src, void *wram_dst, uint
     uint8_t *dst_ptr = (uint8_t *)wram_dst;
 
     while (offset < size) {
-        uint32_t chunk = (size - offset > MAX_DPU_TRANSFER_SIZE) 
-                        ? MAX_DPU_TRANSFER_SIZE : (size - offset);
+        uint32_t chunk = (size - offset > MAX_MRAM_TRANSFER_SIZE) 
+                        ? MAX_MRAM_TRANSFER_SIZE : (size - offset);
         mram_read(&src_ptr[offset], &dst_ptr[offset], chunk);
         offset += chunk;
     }
@@ -264,17 +251,11 @@ static uint32_t read_entries_aligned(__mram_ptr KmerCompactIndexEntry* mram_base
     return (misalignment == 4) ? 1 : 0;
 }
 
-// ============================================================================
-// MAIN KERNEL
-// ============================================================================
 
 int main() {
-    // =========================================================================
+
     // PHASE 1: INITIALIZATION (Leader sets up, all tasklets wait at barrier)
-    // =========================================================================
-    
     if (me() == 0) {
-        // Load descriptor from MRAM (8-byte aligned struct)
         mram_base = (__mram_ptr uint8_t*)DPU_MRAM_HEAP_POINTER;
         mram_read(mram_base, &g_descriptor, sizeof(KmerBatchDescriptor));
         
@@ -314,19 +295,14 @@ int main() {
         g_shared.entries_total = 0;
     }
     
-    // BARRIER: All tasklets must reach this point
     barrier_wait(&g_barrier);
     
-    // Early exit if no work
+    // For idle DPUs - host sends an empty descriptor 
     if (g_descriptor.num_query_packets == 0) {
         return 0;
     }
     
-    // =========================================================================
     // PHASE 2: TRANSACTIONAL BATCH PROCESSING
-    // =========================================================================
-    
-    // Per-tasklet local buffers (static allocation, 8-byte aligned)
     __attribute__((aligned(8))) KmerDoubleHit t_local_hits[LOCAL_HIT_BUFFER_SIZE];
     __attribute__((aligned(8))) KmerBucket t_bucket_cache;  // 256 bytes for bucket lookup
     uint32_t t_local_hit_count = 0;
@@ -389,7 +365,7 @@ int main() {
             // === SENTINEL PACKET: Reset state for all targets ===
             if (w_current_packet.kmer_idx == KMER_PACKET_SENTINEL_KEY) {
                 // Owner-Computes Reset: Each tasklet resets its owned targets
-                // Divides MAX_DPU_SEQS (8192) evenly among NR_TASKLETS (16) = 512 each
+                // Divides target sequences evenly among NR_TASKLETS (16) = 512 each
                 uint32_t chunk_size = (MAX_DPU_SEQS + NR_TASKLETS - 1) / NR_TASKLETS;
                 uint32_t start_t = me() * chunk_size;
                 uint32_t end_t = start_t + chunk_size;
@@ -506,7 +482,7 @@ int main() {
                     
                     // OWNERSHIP CHECK: Only process targets assigned to this tasklet
                     // This guarantees no two tasklets access the same state entry
-                    if ((tid % NR_TASKLETS) != (uint16_t)me()) {
+                    if ((tid & (NR_TASKLETS - 1)) != (uint16_t)me()) {
                         continue;
                     }
                     
@@ -533,16 +509,22 @@ int main() {
                         // Flush if local buffer is full (8 hits = 64 bytes, 8-byte aligned)
                         if (t_local_hit_count >= LOCAL_HIT_BUFFER_SIZE) {
                             mutex_lock(g_output_mutex);
-                            if (!g_shared.transaction_aborted && 
-                                g_shared.total_hits_written + t_local_hit_count <= max_results) {
-                                mram_write(t_local_hits, 
-                                          &m_output_buffer[g_shared.total_hits_written],
-                                          t_local_hit_count * sizeof(KmerDoubleHit));
+                            bool success = (!g_shared.transaction_aborted && 
+                                            g_shared.total_hits_written + t_local_hit_count <= max_results);
+                            uint32_t my_write_offset = g_shared.total_hits_written;
+                            
+                            if (success) {
                                 g_shared.total_hits_written += t_local_hit_count;
                             } else {
                                 g_shared.transaction_aborted = 1;
                             }
                             mutex_unlock(g_output_mutex);
+                            
+                            if (success) {
+                                mram_write(t_local_hits, 
+                                          &m_output_buffer[my_write_offset],
+                                          t_local_hit_count * sizeof(KmerDoubleHit));
+                            }
                             t_local_hit_count = 0;
                         }
                     }
@@ -557,16 +539,22 @@ int main() {
             // Flush remaining local hits after each packet
             if (t_local_hit_count > 0) {
                 mutex_lock(g_output_mutex);
-                if (!g_shared.transaction_aborted && 
-                    g_shared.total_hits_written + t_local_hit_count <= max_results) {
-                    mram_write(t_local_hits, 
-                              &m_output_buffer[g_shared.total_hits_written],
-                              t_local_hit_count * sizeof(KmerDoubleHit));
+                bool success = (!g_shared.transaction_aborted && 
+                                g_shared.total_hits_written + t_local_hit_count <= max_results);
+                uint32_t my_write_offset = g_shared.total_hits_written;
+                
+                if (success) {
                     g_shared.total_hits_written += t_local_hit_count;
                 } else {
                     g_shared.transaction_aborted = 1;
                 }
                 mutex_unlock(g_output_mutex);
+                
+                if (success) {
+                    mram_write(t_local_hits, 
+                              &m_output_buffer[my_write_offset],
+                              t_local_hit_count * sizeof(KmerDoubleHit));
+                }
                 t_local_hit_count = 0;
             }
             
