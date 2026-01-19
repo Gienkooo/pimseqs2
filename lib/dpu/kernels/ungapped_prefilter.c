@@ -13,6 +13,7 @@
 #define MRAM_MAX 2048
 #define LONG_TARGET_LEN 4096
 #define LONG_QUERY_LEN 2048
+if(tasklet)
 #define WRAM_CACHE 57344
 
 #define MRAM_ALIGN_SIZE(x) (((x) + 7) & ~7U) // 8 * ceil(x/8)
@@ -38,6 +39,19 @@ typedef struct {
 TaskletResult tasklet_results[NR_TASKLETS];
 
 
+static void* load_mram(__mram_ptr void* raw_mram_addr, void* wram_buffer, uint32_t aligned_size) {
+    uintptr_t addr_val = (uintptr_t)raw_mram_addr;
+    uintptr_t aligned_mram_addr = addr_val & ~7U;
+    uint32_t offset = addr_val & 7U;
+    uint32_t read_offset = 0;
+    uint8_t* buffer_bytes = (uint8_t*)wram_buffer;
+    for (; read_offset + MRAM_MAX < aligned_size; read_offset += MRAM_MAX) {
+        mram_read((__mram_ptr void*)(aligned_mram_addr + read_offset), buffer_bytes + read_offset, MRAM_MAX);
+    } mram_read((__mram_ptr void*)(aligned_mram_addr + read_offset), buffer_bytes + read_offset, aligned_size - read_offset);
+    return (void*)(buffer_bytes + offset);
+}
+
+
 static void align_short(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uint32_t t_len, uint32_t q_len) {
     int16_t max_score = 0;
     int16_t best_diag = 0;
@@ -50,7 +64,6 @@ static void align_short(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uint
         int32_t q_end = q_len;
         if (-delta > q_start) q_start = -delta;
         if ((int32_t)t_len - delta < q_end) q_end = (int32_t)t_len - delta;
-        if (q_start >= q_end) continue;
 
         // Iterate over diagonal
         int16_t diag_score = 0;
@@ -103,8 +116,6 @@ static void align_long_t(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
             q_end = t_len - delta;
         }
 
-        if (q_start >= q_end) continue;
-
         for (int32_t q = q_start; q < q_end; ++q) {
             int32_t t = q + delta;
             uint8_t aa = target[t];
@@ -141,21 +152,22 @@ static void align_long_q(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
         int16_t diag_score = 0;
         int16_t score = 0;
 
+        int32_t read_idx = (delta - 1);
+        int32_t write_idx = ((int32_t)q_len-+delta-1);
+        uint8_t write = 0;
+
         int32_t t_start = delta > 0 ? delta : 0;
         int32_t t_end = t_len;
-        uint8_t write = 0;
 
         if (delta > 0) {
             t_start = delta;
-            score = buffer[delta-1];
+            score = buffer[read_idx];
         }
 
         if ((int32_t)t_len - delta >= (int32_t)q_len) {
             write = 1;
             t_end = delta + (int32_t)q_len;
         }
-
-        if (t_start >= t_end) continue;
 
         for (int32_t t = t_start; t < t_end; ++t) {
             int32_t q = t - delta;
@@ -172,7 +184,7 @@ static void align_long_q(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
             best_diag = (int16_t)(q_start-delta);
         }
         if (write) {
-            buffer[q_len+delta-1] = score;
+            buffer[write_idx] = score;
         }
     }
  
@@ -182,14 +194,7 @@ static void align_long_q(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
     }
 }
 
-static void align_long_qt(
-    uint32_t tasklet_id, 
-    uintptr_t mram_base, 
-    int8_t* pssm_buffer,
-    uint8_t* target_buffer,
-    int16_t* band_scores,
-    int16_t* band_max_scores
-) {
+static void align_long_qt(uint32_t tasklet_id, uintptr_t mram_base, int8_t* pssm_buffer, uint8_t* target_buffer, int16_t* band_scores, int16_t* band_max_scores) {
     uint32_t t_len = target_meta.target_len;
     uint32_t q_len = query_meta.query_len;
     uint32_t max_t_chunk_len = LONG_TARGET_LEN;
@@ -227,14 +232,7 @@ static void align_long_qt(
             if (tasklet_id == 0) {
                 uint32_t aligned_size = MRAM_ALIGN_SIZE(q_chunk_len * AA_NUMBER);
                 uintptr_t src_addr = mram_base + batch_descriptor.pssm_data_offset + query_meta.pssm_offset_in_batch + (q_start * AA_NUMBER);
-                uintptr_t aligned_addr = src_addr & ~7U;
-                uint32_t offset = src_addr & 7U;
-                
-                uint32_t read_off = 0;
-                for(;read_off + MRAM_MAX < aligned_size; read_off += MRAM_MAX) {
-                    mram_read((__mram_ptr void*)(aligned_addr + read_off), (uint8_t*)pssm_buffer + read_off, MRAM_MAX);
-                } mram_read((__mram_ptr void*)(aligned_addr + read_off), (uint8_t*)pssm_buffer + read_off, aligned_size - read_off);
-                pssm_global = pssm_buffer + offset;
+                pssm_global = load_mram(src_addr, pssm_buffer, aligned_size);
             }
             barrier_wait(&barrier);
 
@@ -252,14 +250,7 @@ static void align_long_qt(
             if (tasklet_id == 0) {
                 uint32_t aligned_size = MRAM_ALIGN_SIZE(t_chunk_len);
                 uintptr_t src_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + t_start;
-                uintptr_t aligned_addr = src_addr & ~7U;
-                uint32_t offset = src_addr & 7U;
-
-                uint32_t read_off = 0;
-                for(;read_off + MRAM_MAX < aligned_size; read_off += MRAM_MAX) {
-                    mram_read((__mram_ptr void*)(aligned_addr + read_off), target_buffer + read_off, MRAM_MAX);
-                } mram_read((__mram_ptr void*)(aligned_addr + read_off), target_buffer + read_off, aligned_size - read_off);
-                target_global = target_buffer + offset;
+                target_global = load_mram(src_addr, target_buffer, aligned_size);
             }
             barrier_wait(&barrier);
 
@@ -380,10 +371,7 @@ int main() {
                     if (tasklet_id == 0) {
                         uint32_t aligned_target_size = MRAM_ALIGN_SIZE(target_meta.target_len);
                         uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data;
-                        uintptr_t aligned_target_addr = target_addr & ~7U;
-                        uint32_t offset = target_addr & 7U;
-                        mram_read((__mram_ptr void*)aligned_target_addr, target_buffer, aligned_target_size);
-                        target_global = target_buffer + offset;
+                        target_global = load_mram(target_addr, target_buffer, aligned_target_size);
                     }
                     barrier_wait(&barrier);
                     target = target_global;
@@ -402,13 +390,7 @@ int main() {
                                 MRAM_ALIGN_SIZE(target_meta.target_len - target_start) : MRAM_ALIGN_SIZE(LONG_TARGET_LEN);
                             if (aligned_target_size > LONG_TARGET_LEN) aligned_target_size = LONG_TARGET_LEN;
                             uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + target_start;
-                            uintptr_t aligned_target_addr = target_addr & ~7U;
-                            uint32_t offset = target_addr & 7U;
-                            uint32_t target_read_offset = 0;
-                            for(;target_read_offset + MRAM_MAX < aligned_target_size; target_read_offset += MRAM_MAX) {
-                                mram_read((__mram_ptr void*)(aligned_target_addr + target_read_offset), target_buffer + target_read_offset, MRAM_MAX);
-                            } mram_read((__mram_ptr void*)(aligned_target_addr + target_read_offset), target_buffer + target_read_offset, aligned_target_size - target_read_offset);
-                            target_global = target_buffer + offset;
+                            target_global = load_mram(target_addr, target_buffer, aligned_target_size);
                             target_len = aligned_target_size;
                         }
                         barrier_wait(&barrier);
@@ -481,10 +463,7 @@ int main() {
                     if (tasklet_id == 0) {
                         uint32_t aligned_target_size = MRAM_ALIGN_SIZE(target_meta.target_len);
                         uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data;
-                        uintptr_t aligned_target_addr = target_addr & ~7U;
-                        uint32_t offset = target_addr & 7U;
-                        mram_read((__mram_ptr void*)aligned_target_addr, target_buffer, aligned_target_size);
-                        target_global = target_buffer + offset;
+                        target_global = load_mram(target_addr, target_buffer, aligned_target_size);
                     }
                     barrier_wait(&barrier);
                     target = target_global;
@@ -497,13 +476,7 @@ int main() {
                                 MRAM_ALIGN_SIZE((query_meta.query_len - query_start) * AA_NUMBER) : MRAM_ALIGN_SIZE(LONG_QUERY_LEN * AA_NUMBER);
                             if (aligned_pssm_size > LONG_QUERY_LEN * AA_NUMBER) aligned_pssm_size = LONG_QUERY_LEN * AA_NUMBER;
                             uintptr_t pssm_addr = mram_base + batch_descriptor.pssm_data_offset + query_meta.pssm_offset_in_batch + query_start * AA_NUMBER;
-                            uintptr_t aligned_pssm_addr = pssm_addr & ~7U;
-                            uint32_t offset = pssm_addr & 7U;
-                            uint32_t pssm_read_offset = 0;
-                            for(;pssm_read_offset + MRAM_MAX < aligned_pssm_size; pssm_read_offset += MRAM_MAX) {
-                                mram_read((__mram_ptr void*)(aligned_pssm_addr + pssm_read_offset), pssm_buffer + pssm_read_offset, MRAM_MAX);
-                            } mram_read((__mram_ptr void*)(aligned_pssm_addr + pssm_read_offset), pssm_buffer + pssm_read_offset, aligned_pssm_size - pssm_read_offset);
-                            pssm_global = pssm_buffer + offset;
+                            pssm_global = load_mram(pssm_addr, pssm_buffer, aligned_pssm_size);
                             pssm_len = aligned_pssm_size / AA_NUMBER;
                         }
                         barrier_wait(&barrier);
