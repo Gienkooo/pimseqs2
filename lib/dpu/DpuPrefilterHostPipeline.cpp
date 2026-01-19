@@ -1113,6 +1113,59 @@ namespace mmseqs::dpu
             DpuWorkflow::MramLayout max_layout = workflow_.calculateLayout(
                 sizeof(GappedBatchDescriptor), q_limits.max_common_bytes, 16384, q_limits.max_queries, max_tdata_size, sizeof(GappedHit), scratch_size);
 
+            // ========== ADAPTIVE SAFE BATCHING ==========
+            // 1. Find the "Bottleneck DPU" (the one with the most targets)
+            //    Because if the batch fits here, it fits everywhere
+            size_t max_targets_any_dpu = 0;
+            for (uint32_t d = 0; d < num_dpus; ++d) {
+                if (perDpuTargetMeta[d].size() > max_targets_any_dpu) {
+                    max_targets_any_dpu = perDpuTargetMeta[d].size();
+                }
+            }
+
+            // 2. Calculate Available MRAM for Results
+            //    Total MRAM - (DB Size + Metadata + Code + Stack Safety Margin)
+            const size_t MRAM_TOTAL = 64 * 1024 * 1024;
+            // max_layout.results_offset includes all static data (descriptor + common + target meta + target data)
+            size_t static_used = max_layout.results_offset;
+            size_t safety_margin = 100 * 1024; // 100KB for safety (code, stack, heap)
+
+            size_t available_for_results = 0;
+            if (MRAM_TOTAL > static_used + safety_margin) {
+                available_for_results = MRAM_TOTAL - static_used - safety_margin;
+            } else {
+                Debug(Debug::ERROR) << "[DPU] Database shard too large! No MRAM left for results.";
+                continue; // Skip this target batch
+            }
+
+            // Must match kernel logic: active_tasklets * 2 vectors * (MaxLen+1) * 2 bytes
+            size_t kernel_scratch = active_tasklets * 2 * DpuCommunicationManager::alignToMram((max_query_len + 1) * sizeof(int16_t));
+            size_t net_hit_buffer_size = 0;
+
+            if (available_for_results > kernel_scratch) {
+                net_hit_buffer_size = available_for_results - kernel_scratch;
+            }
+
+            const size_t HIT_SIZE = 16; // sizeof(GappedHit)
+            size_t worst_case_hits_per_query = max_targets_any_dpu * HIT_SIZE;
+
+            size_t safe_batch_size = (worst_case_hits_per_query > 0)
+                ? net_hit_buffer_size / worst_case_hits_per_query
+                : 64;
+
+            if (safe_batch_size == 0) safe_batch_size = 1;
+            if (safe_batch_size > 128) safe_batch_size = 128;
+
+            max_layout.results_capacity = static_cast<uint32_t>(available_for_results);
+            q_limits.max_queries = static_cast<uint32_t>(safe_batch_size);
+
+            Debug(Debug::INFO) << "[DPU] Adaptive Batching:"
+                               << "\n  Buffer: " << (available_for_results / 1024) << " KB"
+                               << "\n  Kernel Scratch: " << (kernel_scratch / 1024) << " KB"
+                               << "\n  Net Hit Buffer: " << (net_hit_buffer_size / 1024) << " KB"
+                               << "\n  Max Targets: " << max_targets_any_dpu
+                               << "\n  Safe Batch Size: " << safe_batch_size;
+
             // Prepare descriptors with fixed layout
             for (uint32_t d = 0; d < num_dpus; ++d) {
                 layouts[d] = max_layout; // Use fixed layout for everyone

@@ -14,9 +14,7 @@
 /* Kernel-specific constants */
 #define MAX_TARGET_LEN 5000
 
-/* Dynamic scratch size based on tasklet count.
- * Gapped-only kernel needs less scratch than combined kernel.
- * WRAM budget: ~3KB per tasklet with 11 tasklets. */
+/* Dynamic scratch size based on tasklet count. */
 #define SCRATCH_SIZE SCRATCH_PER_TASKLET(MAX_SAFE_TASKLETS)
 
 __dma_aligned GappedBatchDescriptor g_bd;
@@ -45,21 +43,28 @@ static SwResult compute_sw_tiled(
 {
     SwResult result = (SwResult){0, 0, 0};
     int16_t max_score = 0;
-    // MRAM vectors: per-tasklet storage for right boundary between target tiles
-    uint32_t col_vec_len_bytes = ALIGN8((query_len + 1) * sizeof(int16_t));
+    
+    // Calculate Safe Stride including alignment padding
+    // 64 residues -> 65 entries -> 130 bytes -> 136 aligned bytes
+    uint32_t vec_stride = ALIGN8((Q_TILE_SIZE + 1) * sizeof(int16_t));
+    
+    // MRAM vectors base pointers
     uintptr_t mram_H_vec = mram_scratch_vectors;
-    uintptr_t mram_E_vec = mram_scratch_vectors + col_vec_len_bytes;
+    // Offset E_vec by the total size of H_vec (all tiles)
+    // We calculate total size in main, but here we need the split point.
+    // To keep it simple, we assume the caller allocated enough space and
+    // passed mram_scratch_vectors pointing to a block large enough for H + E.
+    uint32_t num_q_tiles = (query_len + Q_TILE_SIZE - 1) / Q_TILE_SIZE;
+    uintptr_t mram_E_vec = mram_scratch_vectors + (num_q_tiles * vec_stride);
 
-    // Initialize MRAM vectors (Column 0, before first target tile)
-    mram_fill_i16(mram_H_vec, query_len + 1, 0);
-    mram_fill_i16(mram_E_vec, query_len + 1, NEG_INF);
+    // Initialize MRAM vectors (Column 0)
+    // We must clear the entire allocated area to be safe
+    mram_fill_i16(mram_H_vec, (num_q_tiles * vec_stride) / 2, 0);
+    mram_fill_i16(mram_E_vec, (num_q_tiles * vec_stride) / 2, NEG_INF);
 
     // WRAM layout
     uint8_t *ptr = wram_scratch;
 
-    // Horizontal boundaries for query-tiling:
-    // H_top/F_top: values at row boundary before processing current query tile
-    // H_bot/F_bot: produced values at bottom of current query tile (fed into next tile)
     int16_t *H_top = (int16_t *)ptr;
     ptr += ALIGN8((T_TILE_SIZE + 1) * sizeof(int16_t));
     int16_t *F_top = (int16_t *)ptr;
@@ -69,7 +74,6 @@ static SwResult compute_sw_tiled(
     int16_t *F_bot = (int16_t *)ptr;
     ptr += ALIGN8((T_TILE_SIZE + 1) * sizeof(int16_t));
 
-    // Vertical boundary vectors (left edge of this target tile), size Q_TILE_SIZE+1
     int16_t *H_col = (int16_t *)ptr;
     ptr += ALIGN8((Q_TILE_SIZE + 1) * sizeof(int16_t));
     int16_t *E_col = (int16_t *)ptr;
@@ -93,21 +97,20 @@ static SwResult compute_sw_tiled(
         mram_read((__mram_ptr void *)(mram_base + target_data_offset + t_start),
                   target_tile, ALIGN8(t_size));
 
-        // At the start of each target tile, the top boundary (row 0) is the DP row at the
-        // query-tile boundary, initialized to 0/NEG_INF for the very first query tile.
         for (uint32_t col = 0; col <= t_size; col++)
         {
             H_top[col] = 0;
             F_top[col] = NEG_INF;
         }
 
-        for (uint32_t q_start = 0; q_start < query_len; q_start += Q_TILE_SIZE)
+        uint32_t q_tile_idx = 0;
+        for (uint32_t q_start = 0; q_start < query_len; q_start += Q_TILE_SIZE, q_tile_idx++)
         {
             uint32_t q_size = min_u32(Q_TILE_SIZE, query_len - q_start);
-
-            // Load left boundary for this (target tile, query tile) from MRAM
-            // Includes i=0..q_size
             uint32_t vec_bytes = ALIGN8((q_size + 1) * sizeof(int16_t));
+            
+            uint32_t mram_offset = q_tile_idx * vec_stride;
+
             if (t_tile_idx == 0)
             {
                 for (uint32_t i = 0; i <= q_size; i++)
@@ -118,12 +121,11 @@ static SwResult compute_sw_tiled(
             }
             else
             {
-                mram_read((__mram_ptr void *)(mram_H_vec + q_start * sizeof(int16_t)), H_col, vec_bytes);
-                mram_read((__mram_ptr void *)(mram_E_vec + q_start * sizeof(int16_t)), E_col, vec_bytes);
+                mram_read((__mram_ptr void *)(mram_H_vec + mram_offset), H_col, vec_bytes);
+                mram_read((__mram_ptr void *)(mram_E_vec + mram_offset), E_col, vec_bytes);
             }
 
-            // Load PSSM rows for this query tile in a single block read
-            // Use aligned path when possible (host pads PSSM to 32-byte boundaries)
+            // Load PSSM
             uintptr_t tile_addr = pssm_mram_base + (uintptr_t)q_start * ALPHA_SIZE;
             uint32_t tile_bytes = q_size * ALPHA_SIZE;
             if ((tile_addr & 7U) == 0) {
@@ -132,47 +134,39 @@ static SwResult compute_sw_tiled(
                 mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
             }
 
-            // Ensure column 0 boundary for this query tile
             H_bot[0] = H_col[q_size];
             F_bot[0] = NEG_INF;
 
-            // Process columns 1..t_size (col index in tile space)
+            // Process columns
             for (uint32_t col = 1; col <= t_size; col++)
             {
                 uint8_t aa = target_tile[col - 1];
-                if (aa >= ALPHA_SIZE)
-                    aa = 20;
+                if (aa >= ALPHA_SIZE) aa = 20;
 
-                // Top-of-tile boundary values for this column (i=0)
-                int16_t h_up = H_top[col];       // H(0,col)
-                int16_t f_up = F_top[col];       // F(0,col)
-                int16_t h_diag = H_top[col - 1]; // H(0,col-1)
+                int16_t h_up = H_top[col];
+                int16_t f_up = F_top[col];
+                int16_t h_diag = H_top[col - 1];
+                int8_t *pssm_ptr = &pssm_tile[aa];
 
-                // Sweep i = 1..q_size, update H_col/E_col in place (column-major)
                 for (uint32_t i = 1; i <= q_size; i++)
                 {
-                    int16_t h_left = H_col[i]; // old H(i,col-1)
-                    int16_t e_left = E_col[i]; // old E(i,col-1)
+                    int16_t h_left = H_col[i];
+                    int16_t e_left = E_col[i];
 
                     int8_t sub = pssm_tile[(i - 1) * ALPHA_SIZE + aa];
 
-                    // E(i,col) from left (gap in target / horizontal gap) — saturating
                     int16_t e_ext = sat_sub(e_left, gap_extend);
                     int16_t e_open = sat_sub(h_left, gap_open);
                     int16_t e_new = max2(e_ext, e_open);
 
-                    // F(i,col) from up (gap in query / vertical gap) — saturating
                     int16_t f_ext = sat_sub(f_up, gap_extend);
                     int16_t f_open = sat_sub(h_up, gap_open);
                     int16_t f_new = max2(f_ext, f_open);
 
-                    // H(i,col) — saturating add for diagonal
                     int16_t diag = sat_add(h_diag, (int16_t)sub);
                     int16_t h_new = max3(diag, e_new, f_new);
-                    if (h_new < 0)
-                        h_new = 0;
+                    if (h_new < 0) h_new = 0;
 
-                    // Track global max (update on ties to make endpoint deterministic)
                     if (h_new >= max_score)
                     {
                         max_score = h_new;
@@ -181,34 +175,24 @@ static SwResult compute_sw_tiled(
                         result.t_end = (uint16_t)(t_start + col);
                     }
 
-                    // Shift for next i:
-                    // next diag should be old H(i,col-1)
                     h_diag = h_left;
                     h_up = h_new;
                     f_up = f_new;
 
-                    // Store new column values
                     H_col[i] = h_new;
                     E_col[i] = e_new;
                 }
 
-                // Bottom boundary at i=q_size for this column -> feed next query tile
                 H_bot[col] = h_up;
                 F_bot[col] = f_up;
             }
 
-            // Write right boundary (after finishing this target tile) to MRAM for the next target tile
-            mram_write(H_col, (__mram_ptr void *)(mram_H_vec + q_start * sizeof(int16_t)), vec_bytes);
-            mram_write(E_col, (__mram_ptr void *)(mram_E_vec + q_start * sizeof(int16_t)), vec_bytes);
+            mram_write(H_col, (__mram_ptr void *)(mram_H_vec + mram_offset), vec_bytes);
+            mram_write(E_col, (__mram_ptr void *)(mram_E_vec + mram_offset), vec_bytes);
 
-            // Swap top/bottom boundaries for the next query tile
             int16_t *tmp;
-            tmp = H_top;
-            H_top = H_bot;
-            H_bot = tmp;
-            tmp = F_top;
-            F_top = F_bot;
-            F_bot = tmp;
+            tmp = H_top; H_top = H_bot; H_bot = tmp;
+            tmp = F_top; F_top = F_bot; F_bot = tmp;
         }
     }
     result.score = max_score;
@@ -222,8 +206,6 @@ int main() {
     
     if (tasklet_id == 0) {
         mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(GappedBatchDescriptor)));
-        
-        /* Compute effective tasklets into SHARED global */
         uint8_t eff = g_bd.header.num_active_tasklets;
         if (eff == 0 || eff > MAX_SAFE_TASKLETS) {
             eff = MAX_SAFE_TASKLETS;
@@ -232,28 +214,23 @@ int main() {
     }
     barrier_wait(&my_barrier);
 
-    /* Now ALL tasklets can safely read the shared g_effective_tasklets */
     bool is_active = (tasklet_id < g_effective_tasklets);
 
     if (tasklet_id == 0) {
         __dma_aligned uint32_t hdr[2] = {0, 0};
         mram_write(hdr, (__mram_ptr void *)(mram_base + g_bd.header.results_offset), 8);
-
-        // Reset per-launch hit bookkeeping so the first write is well-defined
         g_hit_count = 0;
-        g_hit_write_offset = 8; // hits start right after the 8-byte [count+pad] header
+        g_hit_write_offset = 8;
         g_overflow = 0;
 
-        // Cache Query Metadata
         uint32_t num_q = g_bd.header.num_queries;
-        if (num_q > MAX_BATCH_QUERIES) num_q = MAX_BATCH_QUERIES; // Safety
+        if (num_q > MAX_BATCH_QUERIES) num_q = MAX_BATCH_QUERIES;
         uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
         mram_read((__mram_ptr void*)qmeta_base, g_query_meta, MRAM_ALIGN_SIZE(num_q * sizeof(QueryMetadata)));
     }
     barrier_wait(&my_barrier);
 
     if (tasklet_id == 0) {
-        // Reset WRAM allocator so per-launch allocations start from a clean state
         mem_reset();
     }
     barrier_wait(&my_barrier);
@@ -261,29 +238,36 @@ int main() {
     uint8_t *scratch_buffer_raw = NULL;
     uint8_t *scratch_buffer = NULL;
 
-    /* Only active tasklets allocate WRAM scratch; inactive tasklets skip
-     * allocations but continue to participate in barriers. */
     if (is_active) {
         scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
         scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
     }
 
-    /* If an active tasklet failed to allocate, abort the kernel for safety. */
     if (is_active && !scratch_buffer_raw) return 0;
 
-    // header.query_len is now MAX query len in batch
     uint32_t max_query_len = g_bd.header.query_len;
     int16_t min_score = g_bd.min_score;
     
     uintptr_t pssm_base_start = mram_base + g_bd.header.pssm_data_offset;
     uintptr_t results_base = mram_base + g_bd.header.results_offset;
     
-    uint32_t hits_area_size = MRAM_ALIGN_SIZE(g_bd.header.num_targets * g_bd.header.num_queries * sizeof(GappedHit) + 64);
-    uintptr_t scratch_base = results_base + hits_area_size;
+    uint32_t total_buffer_size = g_bd.header.results_buffer_size;
 
-    uint32_t vec_size_bytes = MRAM_ALIGN_SIZE((max_query_len + 1) * sizeof(int16_t));
-    uint32_t task_offset = tasklet_id * (2 * vec_size_bytes);
-    uintptr_t mram_scratch_vectors = scratch_base + task_offset;
+    // Calculate Allocation Size based on SAFE STRIDE
+    // We need 2 vectors (H, E) per tasklet.
+    // Each vector is (NumTiles * SafeStride).
+    uint32_t vec_stride = ALIGN8((Q_TILE_SIZE + 1) * sizeof(int16_t));
+    uint32_t num_q_tiles = (max_query_len + Q_TILE_SIZE - 1) / Q_TILE_SIZE;
+    uint32_t single_vec_size = num_q_tiles * vec_stride;
+    
+    uint32_t total_scratch_bytes = g_effective_tasklets * (2 * single_vec_size);
+
+    if (total_scratch_bytes >= total_buffer_size) return 0;
+    
+    uint32_t limit_for_hits = total_buffer_size - total_scratch_bytes;
+
+    uint32_t task_offset = tasklet_id * (2 * single_vec_size);
+    uintptr_t mram_scratch_vectors = results_base + limit_for_hits + task_offset;
 
     const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(GappedHit));
     GappedHit local_hits[8];
@@ -294,7 +278,7 @@ int main() {
         if (local_count) {                                                                 \
             uint32_t bytes = local_count * HIT_STRIDE;                                     \
             mutex_lock(hit_mutex);                                                         \
-            if (g_hit_write_offset + bytes > hits_area_size) {                             \
+            if (g_hit_write_offset + bytes > limit_for_hits) {                             \
                 g_overflow = 1;                                                            \
                 mutex_unlock(hit_mutex);                                                   \
                 local_count = 0;                                                           \
@@ -309,10 +293,7 @@ int main() {
         }                                                                                  \
     } while (0)
     
-    // Only active tasklets should enter the work loop
-    // All the other ones jump straight to the final barrier
     if (is_active) {
-        // Static round-robin work distribution
         for (uint32_t t = tasklet_id; t < g_bd.header.num_targets; t += g_effective_tasklets)
         {
             __dma_aligned TargetMetadata meta;
@@ -323,14 +304,11 @@ int main() {
                 continue;
             }
             
-            /* FILTER 1: canBeCovered - skip pairs that can never achieve coverage */
             if (!can_be_covered(max_query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
                 continue;
             }
             
-            // Loop over all queries in the batch
             for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
-                // Use cached metadata if available, else read from MRAM
                 QueryMetadata qmeta;
                 if (q_idx < MAX_BATCH_QUERIES) {
                     qmeta = g_query_meta[q_idx];
@@ -353,28 +331,15 @@ int main() {
                     g_bd.gap_open_cost,
                     g_bd.gap_extend_cost);
                 
-                /* FILTER 2: min_score threshold */
-                if (sw.score < min_score) {
-                    continue;
-                }
+                if (sw.score < min_score) continue;
                 
-                /* FILTER 3: minimum alignment length */
                 uint16_t aln_len = (sw.q_end > sw.t_end) ? sw.q_end : sw.t_end;
-                if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len) {
-                    continue;
-                }
+                if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len) continue;
                 
-                /* FILTER 4: hasCoverage - check actual coverage from alignment */
-                if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
-                    continue;
-                }
+                if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) continue;
                 
-                /* FILTER 5: estimated sequence identity (NO DIVISION!) */
-                if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct)) {
-                    continue;
-                }
+                if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct)) continue;
                 
-                /* All filters passed - write hit */
                 __dma_aligned GappedHit hit;
                 hit.target_id = meta.target_id;
                 hit.score = sw.score;
@@ -401,7 +366,6 @@ int main() {
         __dma_aligned uint32_t count_buf[2];
         count_buf[0] = g_hit_count;
         count_buf[1] = g_overflow;
-        /* Write count at offset 0 of results buffer */
         mram_write(count_buf, (__mram_ptr void*)results_base, 8);
     }
     
