@@ -13,18 +13,20 @@
 #define MRAM_MAX 2048
 #define LONG_TARGET_LEN 4096
 #define LONG_QUERY_LEN 2048
-if(tasklet)
 #define WRAM_CACHE 57344
 
 #define MRAM_ALIGN_SIZE(x) (((x) + 7) & ~7U) // 8 * ceil(x/8)
+#define XAA(x) (((x) << 4) + ((x) << 2) + (x))
 
 BARRIER_INIT(barrier, NR_TASKLETS);
 
 __dma_aligned BatchDescriptor batch_descriptor;
 __dma_aligned QueryMetadata query_meta;
 __dma_aligned TargetMetadata target_meta;
+__dma_aligned TargetMetadata next_meta;
 
 __dma_aligned uint8_t wram[WRAM_CACHE];
+uintptr_t mram_base;
 
 uint8_t* target_global;
 int8_t* pssm_global;
@@ -51,6 +53,29 @@ static void* load_mram(__mram_ptr void* raw_mram_addr, void* wram_buffer, uint32
     return (void*)(buffer_bytes + offset);
 }
 
+inline void store_hit(uint32_t i, uint32_t j) {
+    int16_t best_score = 0;
+    int16_t best_diag = 0;
+    for (int k = 0; k < NR_TASKLETS; k++) {
+        if (tasklet_results[k].score > best_score) {
+            best_score = tasklet_results[k].score;
+            best_diag = tasklet_results[k].diagonal;
+        }
+    }
+    Hit hit;
+    hit.target_id = target_meta.target_id;
+    hit.query_id = query_meta.query_id;
+    hit.score = best_score;
+    hit.diagonal = best_diag;
+    hit.pad1 = 0;
+    hit.pad2 = 0;
+
+    uintptr_t res_addr = mram_base + batch_descriptor.results_offset + ((i * batch_descriptor.num_targets + j) * sizeof(Hit));
+    mram_write(&hit, (__mram_ptr void*)res_addr, MRAM_ALIGN_SIZE(sizeof(Hit)));
+
+    printf("DPU[%u] Q=%u T=%u S=%d D=%d\n", me(), i, target_meta.target_id, best_score, best_diag);
+}
+
 
 static void align_short(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uint32_t t_len, uint32_t q_len) {
     int16_t max_score = 0;
@@ -58,7 +83,7 @@ static void align_short(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uint
     uint32_t num_diags = q_len + t_len - 1;
 
     // Iterate over diagonals
-    for (uint32_t diag_idx = tasklet_id; diag_idx < num_diags; diag_idx += NR_TASKLETS) {
+    for (uint32_t diag_idx = tasklet_id-1; diag_idx < num_diags; diag_idx += NR_TASKLETS-1) {
         int32_t delta = (int32_t)diag_idx - (int32_t)q_len + 1;
         int32_t q_start = 0;
         int32_t q_end = q_len;
@@ -72,7 +97,7 @@ static void align_short(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uint
             int32_t t = q + delta;
             uint8_t aa = target[t];
             if (aa >= AA_NUMBER) aa = 20;
-            int16_t val = (int16_t) pssm[q * AA_NUMBER + aa];
+            int16_t val = (int16_t) pssm[XAA(q) + aa];
             score += val;
             if (score < 0) score = 0;
             if (score > diag_score) diag_score = score;
@@ -95,7 +120,7 @@ static void align_long_t(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
     int32_t diag_start = 1 - (int32_t)q_len;
     int32_t diag_end = (int32_t)t_len;
 
-    for (int32_t delta = diag_start + (int32_t)tasklet_id; delta < diag_end; delta += NR_TASKLETS) {
+    for (int32_t delta = diag_start + (int32_t)tasklet_id-1; delta < diag_end; delta += NR_TASKLETS-1) {
         int16_t diag_score = 0;
         int16_t score = 0;
 
@@ -120,7 +145,7 @@ static void align_long_t(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
             int32_t t = q + delta;
             uint8_t aa = target[t];
             if (aa >= AA_NUMBER) aa = 20;
-            int16_t val = (int16_t)pssm[q * AA_NUMBER + aa];
+            int16_t val = (int16_t)pssm[XAA(q) + aa];
             score += val;
             if (score < 0) score = 0;
             if (score > diag_score) diag_score = score;
@@ -153,7 +178,7 @@ static void align_long_q(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
         int16_t score = 0;
 
         int32_t read_idx = (delta - 1);
-        int32_t write_idx = ((int32_t)q_len-+delta-1);
+        int32_t write_idx = ((int32_t)q_len-delta-1);
         uint8_t write = 0;
 
         int32_t t_start = delta > 0 ? delta : 0;
@@ -173,7 +198,7 @@ static void align_long_q(uint32_t tasklet_id, uint8_t* target, int8_t* pssm, uin
             int32_t q = t - delta;
             uint8_t aa = target[t];
             if (aa >= AA_NUMBER) aa = 20;
-            int16_t val = (int16_t)pssm[q * AA_NUMBER + aa];
+            int16_t val = (int16_t)pssm[XAA(q) + aa];
             score += val;
             if (score < 0) score = 0;
             if (score > diag_score) diag_score = score;
@@ -299,20 +324,19 @@ static void align_long_qt(uint32_t tasklet_id, uintptr_t mram_base, int8_t* pssm
 
 int main() {
     uint32_t tasklet_id = me();
-    uintptr_t mram_base = (uintptr_t)__sys_used_mram_end;
 
     // Load batch descriptor
     if (tasklet_id == 0) {
+        mram_base = (uintptr_t)__sys_used_mram_end;
         mram_read((__mram_ptr void*)mram_base, &batch_descriptor, MRAM_ALIGN_SIZE(sizeof(BatchDescriptor)));
         printf("DPU[%u] Batch: Targets=%u QLen=%u\n", me(), batch_descriptor.num_targets, batch_descriptor.query_len);
     }
     barrier_wait(&barrier);
 
-    uint8_t* target_buffer = (uint8_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN));
-    int8_t* pssm_buffer = (int8_t*)wram;
-    uint8_t* target;
-    int8_t* pssm;
-    int16_t* score_buffer = (int16_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN) + LONG_TARGET_LEN);
+    int8_t* pssm_buffer = (int8_t*)wram; // [0-42]
+    uint8_t* target_buffer = (uint8_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN)); // [42-46]
+    int16_t* score_buffer = (int16_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN) + LONG_TARGET_LEN); // [46-54]
+    int16_t* next_buffer = (int16_t*)(wram + WRAM_CACHE - LONG_TARGET_LEN); // [50-54]
 
     // Iterate over queries
     for (uint32_t i = 0; i < batch_descriptor.num_queries; ++i) {
@@ -338,27 +362,28 @@ int main() {
             } mram_read((__mram_ptr void*)(aligned_pssm_addr + pssm_read_offset), pssm_buffer + pssm_read_offset, aligned_pssm_size - pssm_read_offset);
             pssm_global = pssm_buffer + offset;
             barrier_wait(&barrier);
-            pssm = pssm_global;
 
             // Iterate over targets
+            uint8_t* current_buffer = target_buffer;
+            uint8_t* prefetch_buffer = next_buffer;
+            bool init = true;
             for (uint32_t j = 0; j < batch_descriptor.num_targets; j += 1) {
 
-                // Load Target Metadata
+                // Load Target & Metadata
                 if(tasklet_id == 0) {
-                    uintptr_t target_meta_addr = mram_base + batch_descriptor.targets_metadata_offset + (j * sizeof(TargetMetadata));
-                    mram_read((__mram_ptr void*)target_meta_addr, &target_meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
+                    if (!init) {
+                        target_meta = next_meta;
+                    } else {
+                        init = false;
+                        uintptr_t target_meta_addr = mram_base + batch_descriptor.targets_metadata_offset + (j * sizeof(TargetMetadata));
+                        mram_read((__mram_ptr void*)target_meta_addr, &target_meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
+                        uint32_t load_len = target_meta.target_len > LONG_TARGET_LEN ? LONG_TARGET_LEN : target_meta.target_len;
+                        uint32_t aligned_target_size = MRAM_ALIGN_SIZE(load_len);
+                        uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data;
+                        target_global = load_mram(target_addr, current_buffer, aligned_target_size);
+                    }
                 }
                 barrier_wait(&barrier);
-
-                // Initialize Hit structure
-                Hit hit;
-                hit.target_id = target_meta.target_id;
-                hit.query_id = query_meta.query_id;
-                hit.score = 0;
-                hit.diagonal = 0;
-                hit.pad1 = 0;
-                hit.pad2 = 0;
-                uintptr_t res_addr = mram_base + batch_descriptor.results_offset + ((i * batch_descriptor.num_targets + j) * sizeof(Hit));
 
                 // Initialize results
                 tasklet_results[tasklet_id].score = 0;
@@ -367,64 +392,70 @@ int main() {
                 // SHORT TARGET
                 if (target_meta.target_len <= LONG_TARGET_LEN) {
 
-                    // Load Target Sequence
-                    if (tasklet_id == 0) {
-                        uint32_t aligned_target_size = MRAM_ALIGN_SIZE(target_meta.target_len);
-                        uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data;
-                        target_global = load_mram(target_addr, target_buffer, aligned_target_size);
-                    }
-                    barrier_wait(&barrier);
-                    target = target_global;
-
                     // Compute score and diagonal
-                    align_short(tasklet_id, target, pssm, target_meta.target_len, query_meta.query_len);
+                    if (tasklet_id != 0) {
+                        align_short(tasklet_id, target_global, pssm_global, target_meta.target_len, query_meta.query_len);
+                    } else {
+                        if (j + 1 < batch_descriptor.num_targets) {
+                            uintptr_t next_meta_addr = mram_base + batch_descriptor.targets_metadata_offset + ((j + 1) * sizeof(TargetMetadata));
+                            mram_read((__mram_ptr void*)next_meta_addr, &next_meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
+                            uint32_t next_len = next_meta.target_len > LONG_TARGET_LEN ? LONG_TARGET_LEN : next_meta.target_len;
+                            uint32_t aligned_next_size = MRAM_ALIGN_SIZE(next_len);
+                            uintptr_t next_data_addr = mram_base + batch_descriptor.targets_data_offset + next_meta.offset_in_data;
+                            load_mram(next_data_addr, prefetch_buffer, aligned_next_size);
+                        }
+                    }
                     barrier_wait(&barrier);
                 }
                 // LONG TARGET
                 else {
+                    bool is_last_chunk = false;
                     for(int32_t idx = tasklet_id; idx < LONG_QUERY_LEN; idx += NR_TASKLETS) score_buffer[idx] = 0;
                     for(int32_t target_start = 0; target_start < target_meta.target_len; target_start += LONG_TARGET_LEN) {
-                        // Load target
-                        if (tasklet_id == 0) {
-                            uint32_t aligned_target_size = target_start + LONG_TARGET_LEN > target_meta.target_len ?
-                                MRAM_ALIGN_SIZE(target_meta.target_len - target_start) : MRAM_ALIGN_SIZE(LONG_TARGET_LEN);
-                            if (aligned_target_size > LONG_TARGET_LEN) aligned_target_size = LONG_TARGET_LEN;
-                            uintptr_t target_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + target_start;
-                            target_global = load_mram(target_addr, target_buffer, aligned_target_size);
-                            target_len = aligned_target_size;
-                        }
-                        barrier_wait(&barrier);
-                        
-                        target = target_global;
 
                         // Compute score and diagonal
-                        align_long_t(tasklet_id, target, pssm, target_meta.target_len, query_meta.query_len, target_start, score_buffer);
+                        uint32_t next_start = target_start + LONG_TARGET_LEN;
+                        is_last_chunk = (next_start >= target_meta.target_len);
+                        if (tasklet_id != 0) {
+                            align_long_t(tasklet_id, target_global, pssm_global, target_meta.target_len, query_meta.query_len, target_start, score_buffer);
+                        } else if(!is_last_chunk) {
+                            uint32_t remaining = target_meta.target_len - next_start;
+                            uint32_t load_len = remaining > LONG_TARGET_LEN ? LONG_TARGET_LEN : remaining;
+                            uintptr_t t_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + next_start;
+                            load_mram(t_addr, prefetch_buffer, MRAM_ALIGN_SIZE(load_len));
+                        } else if (j + 1 < batch_descriptor.num_targets) {
+                            uintptr_t next_meta_addr = mram_base + batch_descriptor.targets_metadata_offset + ((j + 1) * sizeof(TargetMetadata));
+                            mram_read((__mram_ptr void*)next_meta_addr, &next_meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
+                            uint32_t next_len = next_meta.target_len > LONG_TARGET_LEN ? LONG_TARGET_LEN : next_meta.target_len;
+                            uint32_t aligned_next_size = MRAM_ALIGN_SIZE(next_len);
+                            uintptr_t next_data_addr = mram_base + batch_descriptor.targets_data_offset + next_meta.offset_in_data;
+                            load_mram(next_data_addr, prefetch_buffer, aligned_next_size);
+                        }
                         barrier_wait(&barrier);
+                        if (!is_last_chunk) {
+                            if (tasklet_id == 0) {
+                                uint8_t* temp = current_buffer;
+                                current_buffer = prefetch_buffer;
+                                prefetch_buffer = temp;
+                                uintptr_t next_chunk_addr = mram_base + batch_descriptor.targets_data_offset + target_meta.offset_in_data + next_start;
+                                uint32_t offset = next_chunk_addr & 7U;
+                                target_global = (void*)(current_buffer + offset);
+                            }
+                            barrier_wait(&barrier);
+                        }
                     }
                 }
 
                 // Store score and diagonal
                 if (tasklet_id == 0) {
-                    int16_t best_score = 0;
-                    int16_t best_diag = 0;
-                    for (int k = 0; k < NR_TASKLETS; k++) {
-                        if (tasklet_results[k].score > best_score) {
-                            best_score = tasklet_results[k].score;
-                            best_diag = tasklet_results[k].diagonal;
-                        }
-                    }
-                    Hit hit;
-                    hit.target_id = target_meta.target_id;
-                    hit.query_id = query_meta.query_id;
-                    hit.score = best_score;
-                    hit.diagonal = best_diag;
-                    hit.pad1 = 0;
-                    hit.pad2 = 0;
+                    store_hit(i, j);
 
-                    uintptr_t res_addr = mram_base + batch_descriptor.results_offset + ((i * batch_descriptor.num_targets + j) * sizeof(Hit));
-                    mram_write(&hit, (__mram_ptr void*)res_addr, MRAM_ALIGN_SIZE(sizeof(Hit)));
-
-                    printf("DPU[%u] Q=%u T=%u S=%d D=%d\n", me(), i, target_meta.target_id, best_score, best_diag);
+                    uint8_t* temp = current_buffer;
+                    current_buffer = prefetch_buffer;
+                    prefetch_buffer = temp;
+                    uintptr_t next_data_addr = mram_base + batch_descriptor.targets_data_offset + next_meta.offset_in_data;
+                    uint32_t offset = next_data_addr & 7U;
+                    target_global = (void*)(current_buffer + offset);
                 }
 
                 barrier_wait(&barrier);
@@ -441,16 +472,6 @@ int main() {
                     mram_read((__mram_ptr void*)target_meta_addr, &target_meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
                 }
                 barrier_wait(&barrier);
-
-                // Initialize Hit structure
-                Hit hit;
-                hit.target_id = target_meta.target_id;
-                hit.query_id = query_meta.query_id;
-                hit.score = 0;
-                hit.diagonal = 0;
-                hit.pad1 = 0;
-                hit.pad2 = 0;
-                uintptr_t res_addr = mram_base + batch_descriptor.results_offset + ((i * batch_descriptor.num_targets + j) * sizeof(Hit));
                 
                 // Initialize results
                 tasklet_results[tasklet_id].score = 0;
@@ -466,7 +487,6 @@ int main() {
                         target_global = load_mram(target_addr, target_buffer, aligned_target_size);
                     }
                     barrier_wait(&barrier);
-                    target = target_global;
 
                     for(int32_t idx = tasklet_id; idx < LONG_TARGET_LEN; idx += NR_TASKLETS) score_buffer[idx] = 0;
                     for(int32_t query_start = 0; query_start < query_meta.query_len; query_start += LONG_QUERY_LEN) {
@@ -480,9 +500,8 @@ int main() {
                             pssm_len = aligned_pssm_size / AA_NUMBER;
                         }
                         barrier_wait(&barrier);
-                        pssm = pssm_global;
 
-                        align_long_q(tasklet_id, target, pssm, target_meta.target_len, pssm_len, query_start, score_buffer);
+                        align_long_q(tasklet_id, target_global, pssm_global, target_meta.target_len, pssm_len, query_start, score_buffer);
                         barrier_wait(&barrier);
                     }                    
                 }
@@ -491,34 +510,13 @@ int main() {
                     int8_t* pssm_buf = (int8_t*)wram; 
                     uint8_t* target_buf = (uint8_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN)); 
                     int16_t* band_scores = (int16_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN) + LONG_TARGET_LEN);
-                    int16_t* band_max_scores = band_scores + (LONG_TARGET_LEN);
+                    int16_t* band_max_scores = (int16_t*)(wram + (AA_NUMBER * LONG_QUERY_LEN) + LONG_TARGET_LEN + 2*(LONG_TARGET_LEN - LONG_QUERY_LEN));
                     align_long_qt(tasklet_id, mram_base, pssm_buf, target_buf, band_scores, band_max_scores);
                     barrier_wait(&barrier);
                 }
 
                 // Store score and diagonal
-                if (tasklet_id == 0) {
-                    int16_t best_score = 0;
-                    int16_t best_diag = 0;
-                    for (int k = 0; k < NR_TASKLETS; k++) {
-                        if (tasklet_results[k].score > best_score) {
-                            best_score = tasklet_results[k].score;
-                            best_diag = tasklet_results[k].diagonal;
-                        }
-                    }
-                    Hit hit;
-                    hit.target_id = target_meta.target_id;
-                    hit.query_id = query_meta.query_id;
-                    hit.score = best_score;
-                    hit.diagonal = best_diag;
-                    hit.pad1 = 0;
-                    hit.pad2 = 0;
-
-                    uintptr_t res_addr = mram_base + batch_descriptor.results_offset + ((i * batch_descriptor.num_targets + j) * sizeof(Hit));
-                    mram_write(&hit, (__mram_ptr void*)res_addr, MRAM_ALIGN_SIZE(sizeof(Hit)));
-
-                    printf("DPU[%u] Q=%u T=%u S=%d D=%d\n", me(), i, target_meta.target_id, best_score, best_diag);
-                }
+                if (tasklet_id == 0) { store_hit(i, j); }
 
                 barrier_wait(&barrier);
             }
