@@ -427,7 +427,8 @@ namespace mmseqs::dpu
             for (size_t w = 0; w < wave_size; ++w) {
                 size_t chunk_idx = wave_start + w;
                 wave_indices[w] = DpuIndexBuilder::build(
-                    tdbr, splits[chunk_idx], ksize, subMat,
+                    tdbr, splits[chunk_idx], ksize, subMat, 
+                    chunk_idx, chunk_idx % num_dpus,
                     useSpacedKmers, spacedPattern, patternSpan
                 );
             }

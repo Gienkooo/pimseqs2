@@ -60,6 +60,8 @@ public:
         const std::vector<uint32_t>& target_ids,
         int kmer_size,
         BaseMatrix* subMat,
+        uint32_t global_chunk_id,
+        uint32_t dpu_id,
         bool useSpacedKmers = false,
         const uint8_t* spacedPattern = nullptr,
         int patternSpan = 0
