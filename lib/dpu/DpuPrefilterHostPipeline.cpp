@@ -448,7 +448,7 @@ namespace mmseqs::dpu
                 
                 // Check total size using pre-calculated base offset (Buckets + Entries)
                 uint32_t buckets_size = DpuCommunicationManager::alignToMram(index.buckets.size());
-                uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+                uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerIndexEntry));
                 
                 uint32_t variable_structures_end = ctx.VARIABLE_INDEX_START + buckets_size + entries_size;
                 uint32_t fixed_structures_end = ctx.VARIABLE_INDEX_START;
@@ -492,7 +492,7 @@ namespace mmseqs::dpu
                 ptr += buckets_size;
 
                 // Copy Entries
-                if (!index.entries.empty()) memcpy(ptr, index.entries.data(), index.entries.size() * sizeof(KmerCompactIndexEntry));
+                if (!index.entries.empty()) memcpy(ptr, index.entries.data(), index.entries.size() * sizeof(KmerIndexEntry));
 
                 DPU_DEBUG_LOG << "[CPU " << dpu_id << "] Prepared index: " << index.num_buckets << " buckets, " << index.entries.size() << " entries (" << (index.getTotalBytes() / 1024) << " KB)\n";
             }
@@ -768,7 +768,7 @@ namespace mmseqs::dpu
             uint32_t buckets_off = ctx.VARIABLE_INDEX_START;
             uint32_t buckets_size = DpuCommunicationManager::alignToMram(index.buckets.size());
             uint32_t entries_off = buckets_off + buckets_size;
-            uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerCompactIndexEntry));
+            uint32_t entries_size = DpuCommunicationManager::alignToMram(index.entries.size() * sizeof(KmerIndexEntry));
             uint32_t results_off = entries_off + entries_size;
             
             uint32_t remaining_mram = DPU_MRAM_TOTAL_SIZE - results_off;

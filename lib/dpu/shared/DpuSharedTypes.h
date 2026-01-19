@@ -138,9 +138,9 @@ DPU_STATIC_ASSERT(sizeof(KmerDoubleHit) == 8, "KmerDoubleHit must be 8 bytes");
 typedef struct {
     uint16_t local_target_id;  /* Local target ID within DPU */
     uint16_t pos_j;            /* Position j in target sequence */
-} __attribute__((packed)) KmerCompactIndexEntry;
+} __attribute__((packed)) KmerIndexEntry;
 
-DPU_STATIC_ASSERT(sizeof(KmerCompactIndexEntry) == 4, "KmerCompactIndexEntry must be 4 bytes");
+DPU_STATIC_ASSERT(sizeof(KmerIndexEntry) == 4, "KmerIndexEntry must be 4 bytes");
 
 /* Checkpoint Structure - For resuming after output buffer overflow */
 typedef struct {

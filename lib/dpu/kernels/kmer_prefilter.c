@@ -34,7 +34,7 @@ __host __attribute__((aligned(8))) KmerDiagonalStateEntry wram_state_table[MAX_D
 
 // Shared entry buffer for Leader-Follower pattern (2KB + padding, 8-byte aligned)
 // Extra 2 entries for alignment padding during misaligned MRAM reads
-__attribute__((aligned(8))) KmerCompactIndexEntry wram_entry_buffer[ENTRY_BUFFER_SIZE];
+__attribute__((aligned(8))) KmerIndexEntry wram_entry_buffer[ENTRY_BUFFER_SIZE];
 
 // Current packet being processed (8 bytes, naturally aligned)
 __attribute__((aligned(8))) KmerQueryPacket wram_current_packet;
@@ -53,7 +53,7 @@ __attribute__((aligned(8))) struct {
 
 __mram_ptr uint8_t* mram_base;
 __mram_ptr KmerBucket* mram_buckets;
-__mram_ptr KmerCompactIndexEntry* mram_entries;
+__mram_ptr KmerIndexEntry* mram_entries;
 __mram_ptr KmerQueryPacket* mram_query_packets;
 __mram_ptr KmerDoubleHit* mram_output_buffer;
 __mram_ptr KmerCheckpoint* mram_checkpoint;
@@ -103,10 +103,10 @@ static bool lookup_bucket(uint32_t kmer_idx, uint16_t bucket_idx,
 }
 
 /**
- * Reads 4-byte KmerCompactIndexEntry structs from MRAM with proper 8-byte alignment.
+ * Reads 4-byte KmerIndexEntry structs from MRAM with proper 8-byte alignment.
  * 
  * The DPU MRAM requires 8-byte aligned addresses for all transfers.
- * KmerCompactIndexEntry is only 4 bytes, so when start_idx is odd, the byte
+ * KmerIndexEntry is only 4 bytes, so when start_idx is odd, the byte
  * address would end in 0x4, violating alignment requirements.
  * 
  * This function:
@@ -123,24 +123,24 @@ static bool lookup_bucket(uint32_t kmer_idx, uint16_t bucket_idx,
  * @param wram_dst   Destination WRAM buffer (must have space for count+2 entries)
  * @return           Offset where valid data starts: 0 (aligned) or 1 (misaligned by 4)
  */
-static uint32_t read_entries_aligned(__mram_ptr KmerCompactIndexEntry* mram_base, 
+static uint32_t read_entries_aligned(__mram_ptr KmerIndexEntry* mram_base, 
                                      uint32_t start_idx, 
                                      uint32_t count, 
-                                     KmerCompactIndexEntry* wram_dst) {
+                                     KmerIndexEntry* wram_dst) {
     if (count == 0) return 0;
     
     // 1. Calculate the byte offset of the requested entry
-    uint32_t byte_offset = start_idx * sizeof(KmerCompactIndexEntry);  // start_idx * 4
+    uint32_t byte_offset = start_idx * sizeof(KmerIndexEntry);  // start_idx * 4
     
     // 2. Align down to 8 bytes
     uint32_t aligned_offset = byte_offset & ~7u;
     uint32_t misalignment = byte_offset & 7u;  // Will be 0 or 4
     
     // 3. Calculate total bytes to read (from aligned start to end, rounded up to 8)
-    uint32_t end_offset = byte_offset + (count * sizeof(KmerCompactIndexEntry));
+    uint32_t end_offset = byte_offset + (count * sizeof(KmerIndexEntry));
     uint32_t read_len = ((end_offset - aligned_offset) + 7u) & ~7u;
     
-    if (read_len > ENTRY_BUFFER_SIZE * sizeof(KmerCompactIndexEntry)) {
+    if (read_len > ENTRY_BUFFER_SIZE * sizeof(KmerIndexEntry)) {
         g_shared.overflow_occurred = 2;
         g_shared.transaction_aborted = 1;
         return 0;
@@ -161,7 +161,7 @@ int main() {
         
         // Initialize MRAM pointers (all offsets are 8-byte aligned by Host)
         mram_buckets = (__mram_ptr KmerBucket*)(mram_base + g_descriptor.buckets_offset);
-        mram_entries = (__mram_ptr KmerCompactIndexEntry*)(mram_base + g_descriptor.index_entries_offset);
+        mram_entries = (__mram_ptr KmerIndexEntry*)(mram_base + g_descriptor.index_entries_offset);
         mram_query_packets = (__mram_ptr KmerQueryPacket*)(mram_base + g_descriptor.query_packets_offset);
         mram_output_buffer = (__mram_ptr KmerDoubleHit*)(mram_base + g_descriptor.results_offset + sizeof(KmerResultHeader));
         mram_checkpoint = (__mram_ptr KmerCheckpoint*)(mram_base + g_descriptor.checkpoint_offset);
@@ -340,10 +340,10 @@ int main() {
                 entries_chunk_len = g_shared.entries_buffer_count;
                 
                 // Each tasklet scans all entries but only acts on owned targets
-                KmerCompactIndexEntry* valid_entries = &wram_entry_buffer[g_shared.wram_buffer_valid_start_offset];
+                KmerIndexEntry* valid_entries = &wram_entry_buffer[g_shared.wram_buffer_valid_start_offset];
                 
                 for (uint32_t entry_idx = 0; entry_idx < entries_chunk_len; ++entry_idx) {
-                    KmerCompactIndexEntry entry = valid_entries[entry_idx];
+                    KmerIndexEntry entry = valid_entries[entry_idx];
                     uint16_t target_id = entry.local_target_id;
                     
                     if (target_id >= g_descriptor.num_targets) {

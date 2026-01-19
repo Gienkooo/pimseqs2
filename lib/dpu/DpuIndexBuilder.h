@@ -20,13 +20,13 @@ namespace mmseqs::dpu {
  */
 struct DpuIndexBuffer {
     std::vector<uint8_t> buckets;               // Raw bucket data (KmerBucket array)
-    std::vector<KmerCompactIndexEntry> entries; // {target_id, pos_j} pairs
+    std::vector<KmerIndexEntry> entries; // {target_id, pos_j} pairs
     uint32_t num_buckets;                       // Total buckets (NUM_BUCKETS + overflow)
     
     DpuIndexBuffer() : num_buckets(0) {}
     
     size_t getTotalBytes() const {
-        return buckets.size() + entries.size() * sizeof(KmerCompactIndexEntry);
+        return buckets.size() + entries.size() * sizeof(KmerIndexEntry);
     }
     
     size_t getBucketsBytes() const {
@@ -34,7 +34,7 @@ struct DpuIndexBuffer {
     }
     
     size_t getEntriesBytes() const {
-        return entries.size() * sizeof(KmerCompactIndexEntry);
+        return entries.size() * sizeof(KmerIndexEntry);
     }
 };
 
