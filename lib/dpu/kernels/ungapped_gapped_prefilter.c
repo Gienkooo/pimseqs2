@@ -412,7 +412,6 @@ int main() {
     // header.query_len is now MAX query len in batch
     uint32_t max_query_len = g_bd.header.query_len;
     int16_t min_ungapped_score = g_bd.min_ungapped_score;
-    int16_t min_score = g_bd.min_score;
     bool force_gapped = (g_bd.header.flags & 1);
 
     uintptr_t pssm_base_start = mram_base + g_bd.header.pssm_data_offset;
@@ -504,7 +503,8 @@ int main() {
                     g_bd.gap_open_cost,
                     g_bd.gap_extend_cost);
 
-                if (sw.score < min_score)
+                int32_t current_min_score = (int32_t)qmeta.min_score;
+                if (sw.score < current_min_score)
                     continue;
 
                 uint16_t aln_len = max_u32((uint32_t)sw.q_end, (uint32_t)sw.t_end);
@@ -522,7 +522,6 @@ int main() {
                 hit.t_end = sw.t_end;
                 hit.padding[0] = (uint16_t)q_idx;
                 hit.padding[1] = 0;
-                hit.padding[2] = 0;
 
                 local_hits[local_count++] = hit;
                 if (local_count == 32)

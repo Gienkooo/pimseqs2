@@ -69,7 +69,6 @@ namespace mmseqs::dpu
 
         uint32_t current_pssm_offset = 0;
         uint32_t total_residues = 0;
-        const uint32_t MAX_RESIDUES = 20000; // soft cap to avoid oversized batches
 
         while (batch.next_q_idx < qdbr->getSize() && batch.meta.size() < limits.max_queries) {
             const size_t qId = batch.next_q_idx;
@@ -83,9 +82,6 @@ namespace mmseqs::dpu
                 L = static_cast<uint32_t>(seqMapper->L);
             }
 
-            // Soft residue guard
-            if (!batch.meta.empty() && (total_residues + L > MAX_RESIDUES)) break;
-
             // Build PSSM
             if (compBias.size() < L) compBias.resize(L);
             auto pssm = is_profile
@@ -93,8 +89,12 @@ namespace mmseqs::dpu
                 : buildPSSMFromSequence(querySeq, L, subMat, par.compBiasCorrection, par.compBiasCorrectionScale, compBias);
 
             // Hard PSSM byte guard
-            if (batch.pssm.size() + pssm.size() > limits.max_pssm_bytes) break;
-
+            if (batch.pssm.size() + pssm.size() > limits.max_pssm_bytes) 
+            {
+                Debug(Debug::WARNING) << "[DPU] PSSM buffer overflow, skipping batch\n";
+                break;
+            }
+            
             // 32-byte padding for PSSM block
             const uint32_t pssm_size = static_cast<uint32_t>(pssm.size());
             const uint32_t padding32 = static_cast<uint32_t>((32u - (pssm_size % 32u)) % 32u);
@@ -111,14 +111,17 @@ namespace mmseqs::dpu
             qmeta.query_len = L;
             qmeta.pssm_offset_in_batch = current_pssm_offset;
             qmeta.bias = 0;
-            qmeta.pad[0] = qmeta.pad[1] = qmeta.pad[2] = 0;
+            qmeta.padding_byte = 0;
 
-            int16_t q_min = minScoreThr;
+            qmeta.min_score = static_cast<int16_t>(minScoreThr);
             if (evaluer && par.evalThr != std::numeric_limits<double>::max()) {
-                const int rawMin = evaluer->minScore(par.evalThr, L);
-                if (rawMin > q_min) q_min = static_cast<int16_t>(rawMin);
+                qmeta.min_score = evaluer->minScore(par.evalThr, qdbr->getSeqLen(qId));
             }
-            if (q_min < batch.min_score) batch.min_score = q_min;
+            // Debug print for first query in batch to validate runtime behavior
+            if (batch.meta.empty()) {
+                Debug(Debug::INFO) << "[DEBUG] DPU Threshold Check: Setting q_min = " << qmeta.min_score
+                                   << " (Param: " << minScoreThr << ")\n";
+            }
 
             batch.meta.push_back(qmeta);
             batch.keys.push_back(queryKey);
@@ -186,7 +189,6 @@ namespace mmseqs::dpu
                 double evalue = 0.0;
                 if (par.evalThr != std::numeric_limits<double>::max()) {
                     evalue = evaluer ? evaluer->computeEvalue(hit.score, qLen) : 0.0;
-                    if (!isIdentity && evalue > par.evalThr) continue;
                 }
 
                 Matcher::result_t res;
@@ -211,6 +213,17 @@ namespace mmseqs::dpu
                 if (Alignment::checkCriteria(res, isIdentity, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr)) {
                     out_results[q_idx].push_back(res);
                 }
+                else
+                {
+                    DPU_DEBUG_LOG << "[DPU]   Hit filtered out: qIdx=" << q_idx
+                                  << ", targetKey=" << targetKey
+                                  << ", score=" << hit.score
+                                  << ", evalue=" << evalue
+                                  << ", seqId=" << res.seqId
+                                  << ", alnLen=" << res.alnLength
+                                  << ", qcov=" << res.qcov
+                                  << ", dbcov=" << res.dbcov
+                                  << "\n";}
             }
         }
     }
@@ -1073,7 +1086,7 @@ namespace mmseqs::dpu
         const uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(GappedBatchDescriptor));
 
         // Calculate scratch memory needed for tiled implementation
-        const uint32_t vec_bytes = DpuCommunicationManager::alignToMram((max_query_len + 1) * sizeof(int16_t));
+        const uint32_t vec_bytes = DpuCommunicationManager::alignToMram((max_query_len + 1) * sizeof(int32_t));
         const uint32_t scratch_size = (2 * vec_bytes) * active_tasklets;
 
         Debug(Debug::INFO) << "DPU Gapped Batch Debug:\n"
@@ -1138,24 +1151,32 @@ namespace mmseqs::dpu
                 continue; // Skip this target batch
             }
 
-            // Must match kernel logic: active_tasklets * 2 vectors * (MaxLen+1) * 2 bytes
-            size_t kernel_scratch = active_tasklets * 2 * DpuCommunicationManager::alignToMram((max_query_len + 1) * sizeof(int16_t));
+            // 3. Subtract Kernel Overhead (Scratch Vectors)
+            //    Must match kernel logic: active_tasklets * 2 vectors * (MaxLen+1) * 2 bytes
+            const size_t vec_stride_mram = DpuCommunicationManager::alignToMram((Q_TILE_SIZE + 1) * sizeof(int32_t));
+            const size_t num_q_tiles_mram = (max_query_len + Q_TILE_SIZE - 1) / Q_TILE_SIZE;
+            const size_t single_vec_size_mram = num_q_tiles_mram * vec_stride_mram;
+            const size_t kernel_scratch = (size_t)active_tasklets * 2u * single_vec_size_mram;
+
             size_t net_hit_buffer_size = 0;
 
             if (available_for_results > kernel_scratch) {
                 net_hit_buffer_size = available_for_results - kernel_scratch;
             }
 
-            const size_t HIT_SIZE = 16; // sizeof(GappedHit)
+            const size_t HIT_SIZE = sizeof(GappedHit);
             size_t worst_case_hits_per_query = max_targets_any_dpu * HIT_SIZE;
 
             size_t safe_batch_size = (worst_case_hits_per_query > 0)
                 ? net_hit_buffer_size / worst_case_hits_per_query
                 : 64;
 
-            if (safe_batch_size == 0) safe_batch_size = 1;
-            if (safe_batch_size > 128) safe_batch_size = 128;
+            // 5. Clamp to reasonable limits
+            if (safe_batch_size == 0) safe_batch_size = 1; // Try at least 1
+            if (safe_batch_size > 128) safe_batch_size = 128; // Don't go crazy
 
+            // 6. UPDATE LIMITS
+            //    Tell the layout it has ALL the available space for results
             max_layout.results_capacity = static_cast<uint32_t>(available_for_results);
             q_limits.max_queries = static_cast<uint32_t>(safe_batch_size);
 
@@ -1165,13 +1186,14 @@ namespace mmseqs::dpu
                                << "\n  Net Hit Buffer: " << (net_hit_buffer_size / 1024) << " KB"
                                << "\n  Max Targets: " << max_targets_any_dpu
                                << "\n  Safe Batch Size: " << safe_batch_size;
+            // ========== END ADAPTIVE SAFE BATCHING ==========
 
             // Prepare descriptors with fixed layout
             for (uint32_t d = 0; d < num_dpus; ++d) {
                 layouts[d] = max_layout; // Use fixed layout for everyone
 
-                const uint32_t usable_results = (max_layout.results_capacity > 8u)
-                    ? (max_layout.results_capacity - 8u)
+                const uint32_t usable_results = (max_layout.results_capacity > (8u + (uint32_t)kernel_scratch))
+                    ? (max_layout.results_capacity - 8u - (uint32_t)kernel_scratch)
                     : 0u;
                 maxHitsPerDpu[d] = usable_results / static_cast<uint32_t>(sizeof(GappedHit));
                 
@@ -1249,15 +1271,13 @@ namespace mmseqs::dpu
 
                     GappedBatchDescriptor bd(
                         hdr,
-                        batch.min_score,
                         static_cast<int16_t>(par.gapOpen.values.aminoacid()),
                         static_cast<int16_t>(par.gapExtend.values.aminoacid()),
-                        static_cast<int16_t>(par.zdrop),
-                        0,
                         static_cast<uint8_t>(par.covMode),
                         static_cast<uint8_t>(par.covThr * 100.0f), // TODO this should be wrapped inside the object itself
                         static_cast<uint8_t>(std::min(par.alnLenThr, 255)),
-                        static_cast<uint8_t>(par.seqIdThr * 100.0f));
+                        static_cast<uint8_t>(par.seqIdThr * 100.0f)
+                    );
 
                     bd_bufs[d].resize(sizeof(GappedBatchDescriptor));
                     memcpy(bd_bufs[d].data(), &bd, sizeof(GappedBatchDescriptor));
@@ -1575,7 +1595,7 @@ namespace mmseqs::dpu
                     bd.header.results_offset = max_layout.results_offset;
                     bd.header.results_buffer_size = max_layout.results_capacity;
                     bd.header.num_active_tasklets = active_tasklets;
-                    bd.min_score = minScoreThr;
+                    bd.min_score = 0; // per-query thresholds used instead of batch-level min_score
                     bd.gap_open_cost = static_cast<int16_t>(par.gapOpen.values.aminoacid());
                     bd.gap_extend_cost = static_cast<int16_t>(par.gapExtend.values.aminoacid());
                     bd.pssm_bias = 0;
@@ -1992,16 +2012,14 @@ namespace mmseqs::dpu
                     CombinedBatchDescriptor bd(
                         hdr,
                         minUngappedThr,
-                        batch.min_score,
                         static_cast<int16_t>(par.gapOpen.values.aminoacid()),
                         static_cast<int16_t>(par.gapExtend.values.aminoacid()),
-                        static_cast<int16_t>(par.zdrop),
-                        0,
                         static_cast<uint8_t>(par.covMode),
                         static_cast<uint8_t>(par.covThr * 100.0f),
                         static_cast<uint8_t>(std::min(par.alnLenThr, 255)),
-                        static_cast<uint8_t>(par.seqIdThr * 100.0f));
-
+                        static_cast<uint8_t>(par.seqIdThr * 100.0f)
+                    );
+                    
                     query_descriptors[d] = bd;
                 }
 

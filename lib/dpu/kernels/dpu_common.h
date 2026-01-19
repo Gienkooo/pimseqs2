@@ -64,21 +64,13 @@
 #define WRAM_AVAILABLE_HEAP(n)  (60 * 1024 - (n) * 2048)
 #define SCRATCH_PER_TASKLET(n)  (WRAM_AVAILABLE_HEAP(n) / (n))
 
-/* Smith-Waterman tiling constants */
-#ifndef Q_TILE_SIZE
-#define Q_TILE_SIZE 64
-#endif
-#ifndef T_TILE_SIZE
-#define T_TILE_SIZE 64
-#endif
-
 /* Default gap costs (can be overridden by batch descriptor) */
 #define DEFAULT_GAP_OPEN 11
 #define DEFAULT_GAP_EXTEND 1
 
 /* --- Smith-Waterman Result Type --- */
 typedef struct {
-    int16_t score;
+    int32_t score;
     uint16_t q_end;
     uint16_t t_end;
 } SwResult;
@@ -147,14 +139,14 @@ static inline int has_coverage(uint16_t q_end, uint16_t t_end, uint32_t query_le
     }
 }
 
-static inline int passes_seq_id_threshold(int16_t score, uint16_t q_end, uint16_t t_end, uint8_t seq_id_thr_pct) {
+static inline int passes_seq_id_threshold(int32_t score, uint16_t q_end, uint16_t t_end, uint8_t seq_id_thr_pct) {
     if (seq_id_thr_pct == 0) return 1;
     if (score <= 0) return 0;
     uint32_t aln_len = max_u32(q_end, t_end);
     if (aln_len == 0) return 0;
     
     /* seqId = (score/aln_len)*0.1656 + 0.1141 */
-    int32_t lhs = MUL_1656((int32_t)score);
+    int32_t lhs = MUL_1656(score);
     int32_t rhs_factor = (int32_t)MUL_100((uint32_t)seq_id_thr_pct) - 1141; // Using *100 for % scale
     if (rhs_factor <= 0) return 1;
     int32_t rhs = (int32_t)aln_len * rhs_factor;
