@@ -177,7 +177,8 @@ public:
         uint64_t hdr = 0;
         comm_.gatherDataFromDPU(dpu_id, &hdr, 8, results_mram_offset);
         uint32_t hitcount = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-        uint32_t overflow = static_cast<uint32_t>(hdr >> 32);
+        uint32_t hi = static_cast<uint32_t>((hdr >> 32) & 0xFFFFFFFFu);
+        uint32_t overflow = (hi >> 31) & 1u;
         if (overflow_out) *overflow_out = overflow;
 
         if (result_capacity_bytes <= 8) return {};

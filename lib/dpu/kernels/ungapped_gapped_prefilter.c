@@ -32,6 +32,9 @@ __host uint32_t g_overflow;
 
 /* Shared tasklet limit - set by tasklet 0, read by all after barrier */
 __host uint8_t g_effective_tasklets;
+/* Pooled WRAM scratch buffer shared by tasklets (allocated by tasklet 0) */
+uint8_t *g_scratch_pool = NULL;
+uint32_t g_scratch_stride = 0;
 
 __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
 
@@ -350,62 +353,81 @@ int main() {
 
     if (tasklet_id == 0) {
         mram_read((__mram_ptr void*)mram_base, &g_bd, MRAM_ALIGN_SIZE(sizeof(CombinedBatchDescriptor)));
-        // Read batch descriptor and compute effective tasklets into SHARED global
-        uint8_t eff = g_bd.header.num_active_tasklets;
-        if (eff == 0 || eff > MAX_SAFE_TASKLETS) {
-            eff = MAX_SAFE_TASKLETS;
-        }
-        g_effective_tasklets = eff;
-    }
-    barrier_wait(&my_barrier);
-    
-    /* Now ALL tasklets can safely read the shared g_effective_tasklets */
-    bool is_active = (tasklet_id < g_effective_tasklets);
+        // Read batch descriptor and compute requested tasklets
+        uint8_t req = g_bd.header.num_active_tasklets;
+        if (req == 0 || req > MAX_SAFE_TASKLETS) req = MAX_SAFE_TASKLETS;
 
-    if (tasklet_id == 0) {
+        /* Prepare header and bookkeeping */
         __dma_aligned uint32_t hdr[2] = {0, 0};
         mram_write(hdr, (__mram_ptr void *)(mram_base + g_bd.header.results_offset), 8);
 
-        // Reset per-launch hit bookkeeping so the first write is well-defined
         g_hit_count = 0;
-        g_hit_write_offset = 8; // hits start right after the 8-byte [count+pad] header
+        g_hit_write_offset = 8; // hits start right after the 8-byte header
         g_overflow = 0;
 
-        // Cache Query Metadata
+        /* Cache Query Metadata */
         uint32_t num_q = g_bd.header.num_queries;
         if (num_q > MAX_BATCH_QUERIES) num_q = MAX_BATCH_QUERIES; // Safety
         uintptr_t qmeta_base = mram_base + g_bd.header.queries_metadata_offset;
         mram_read((__mram_ptr void*)qmeta_base, g_query_meta, MRAM_ALIGN_SIZE(num_q * sizeof(QueryMetadata)));
 
-        uint32_t vecBytes = MRAM_ALIGN_SIZE((g_bd.header.query_len + 1) * sizeof(int16_t));
-        uint32_t scratch_needed = (2 * vecBytes) * (g_bd.header.num_active_tasklets);
-
-        DEBUG_PRINT("[DPU] results_buffer_size=%u scratch_needed=%u vecBytes=%u active=%u\n",
-               g_bd.header.results_buffer_size, scratch_needed, vecBytes, g_bd.header.num_active_tasklets);
-
-        // Reset WRAM allocator so per-launch allocations start from a clean state
+        /* Reset WRAM allocator so per-launch allocations start from a clean state */
         mem_reset();
-        DEBUG_PRINT("[DPU] Tasklet %u mem_reset done; allocating WRAM: SCRATCH_SIZE=%u\n",
-               tasklet_id, SCRATCH_SIZE);
+
+        /* Compute a safe per-tasklet WRAM stride and attempt pooled allocation with downshift */
+        const uint32_t a = ALIGN8((T_TILE_SIZE + 1) * sizeof(int16_t));
+        const uint32_t b = ALIGN8((Q_TILE_SIZE + 1) * sizeof(int16_t));
+        const uint32_t p_target = ALIGN8(T_TILE_SIZE);
+        const uint32_t p_pssm = ALIGN8(Q_TILE_SIZE * ALPHA_SIZE + 8);
+
+        /* Try pooled allocation with adaptive per-tasklet stride: when eff decreases
+         * we allow per-tasklet scratch to increase by using SCRATCH_PER_TASKLET(eff). */
+        uint8_t eff = req;
+        uint8_t *pool_raw = NULL;
+        uint32_t chosen_stride = 0;
+        while (eff >= 1) {
+            uint32_t per = SCRATCH_PER_TASKLET(eff);
+            uint32_t stride = ALIGN8(per);
+            pool_raw = (uint8_t *)mem_alloc((size_t)eff * stride + 8);
+            if (pool_raw) {
+                chosen_stride = stride;
+                break;
+            }
+            eff--;
+        }
+
+        if (!pool_raw) {
+            /* Allocation failed for all tasklets */
+            g_effective_tasklets = 0;
+            g_scratch_pool = NULL;
+            g_scratch_stride = 0;
+        } else {
+            g_scratch_pool = (uint8_t *)ALIGN8_PTR(pool_raw);
+            g_scratch_stride = chosen_stride;
+            g_effective_tasklets = eff;
+        }
     }
     barrier_wait(&my_barrier);
 
-    uint8_t *scratch_buffer_raw  = NULL;
-    uint8_t *scratch_buffer      = NULL;
+    /* Recompute activity after allocation/downshift */
+    bool is_active = (tasklet_id < g_effective_tasklets);
 
-    /* Only active tasklets allocate WRAM scratch; inactive tasklets skip
-     * allocations but continue to participate in barriers. */
+    /* If allocation failed for all tasklets, bail out early. Tasklet 0
+     * already wrote an empty header before allocation, so simply return. */
+    if (g_effective_tasklets == 0) {
+        return 0;
+    }
+
+    uint8_t *scratch_buffer = NULL;
     if (is_active) {
-        scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
-        scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
+        scratch_buffer = g_scratch_pool + ((size_t)tasklet_id * (size_t)g_scratch_stride);
     }
 
     if (tasklet_id == 0) {
-        if (!scratch_buffer_raw) {
-            DEBUG_PRINT("[DPU] Tasklet %u mem_alloc failed: scratch=%p\n",
-                   tasklet_id, scratch_buffer_raw);
+        if (g_effective_tasklets == 0) {
+            DEBUG_PRINT("[DPU] pooled allocation failed for all tasklets\n");
         } else {
-            DEBUG_PRINT("[DPU] Tasklet %u mem_alloc OK\n", tasklet_id);
+            DEBUG_PRINT("[DPU] pooled allocation OK: eff=%u stride=%u\n", g_effective_tasklets, g_scratch_stride);
         }
     }
 
@@ -417,13 +439,34 @@ int main() {
     uintptr_t pssm_base_start = mram_base + g_bd.header.pssm_data_offset;
     uintptr_t results_base = mram_base + g_bd.header.results_offset;
 
-    uint32_t vec_size_bytes = MRAM_ALIGN_SIZE((max_query_len + 1) * sizeof(int16_t));
-    uint32_t scratch_bytes = MUL_2(vec_size_bytes) * (g_bd.header.num_active_tasklets);
-    uint32_t hits_area_size = MRAM_ALIGN_SIZE(g_bd.header.results_buffer_size - scratch_bytes);
-    uintptr_t scratch_base = results_base + hits_area_size;
+    // Calculate allocation space for MRAM scratch vectors using observed effective tasklets
+    uint32_t vec_stride = ALIGN8((Q_TILE_SIZE + 1) * sizeof(int16_t));
+    uint32_t num_q_tiles = (max_query_len + Q_TILE_SIZE - 1) / Q_TILE_SIZE;
+    uint32_t single_vec_size = num_q_tiles * vec_stride;
+    uint64_t total_scratch_bytes64 = (uint64_t)g_effective_tasklets * (2ull * (uint64_t)single_vec_size);
 
-    uint32_t task_offset = tasklet_id * MUL_2(vec_size_bytes);
-    uintptr_t mram_scratch_vectors = scratch_base + task_offset;
+    // Guard: prevent unsigned underflow when MRAM can't hold requested scratch
+    if (total_scratch_bytes64 + 8ull > (uint64_t)g_bd.header.results_buffer_size) {
+        g_overflow = 1;
+        g_effective_tasklets = 0; // force no active tasklets
+        barrier_wait(&my_barrier);
+        if (tasklet_id == 0) {
+            __dma_aligned uint32_t count_buf[2];
+            count_buf[0] = 0;
+            uint32_t hi = (1u << 31); // overflow bit
+            count_buf[1] = hi;
+            mram_write(count_buf, (__mram_ptr void *)results_base, 8);
+        }
+        return 0;
+    }
+
+    uint32_t total_scratch_bytes = (uint32_t)total_scratch_bytes64;
+    uint32_t limit_for_hits = g_bd.header.results_buffer_size - total_scratch_bytes;
+    uint32_t task_offset = tasklet_id * (2 * single_vec_size);
+    uintptr_t mram_scratch_vectors = results_base + limit_for_hits + task_offset;
+
+    /* Use pooled per-tasklet stride as the effective WRAM scratch size for callers */
+    uint32_t scratch_size = g_scratch_stride;
 
     const uint32_t HIT_STRIDE = MRAM_ALIGN_SIZE(sizeof(GappedHit));
 
@@ -436,7 +479,7 @@ int main() {
         if (local_count) {                                                                 \
             uint32_t bytes = local_count * HIT_STRIDE;                                     \
             mutex_lock(hit_mutex);                                                         \
-            if (g_hit_write_offset + bytes > hits_area_size) {                             \
+            if (g_hit_write_offset + bytes > limit_for_hits) {                             \
                 g_overflow = 1;                                                            \
                 mutex_unlock(hit_mutex);                                                   \
                 local_count = 0;                                                           \
@@ -484,7 +527,7 @@ int main() {
                 bool ran_prefilter = compute_ungapped_diagonal(
                     mram_base + g_bd.header.targets_data_offset + meta.offset_in_data,
                     meta.target_len, qmeta.query_len, pssm_addr,
-                    scratch_buffer, SCRATCH_SIZE, &ungapped_score);
+                    scratch_buffer, scratch_size, &ungapped_score);
 
                 if (ran_prefilter) {
                     if (!force_gapped && ungapped_score < min_ungapped_score)
@@ -499,7 +542,7 @@ int main() {
                     pssm_addr,
                     mram_scratch_vectors,
                     scratch_buffer,
-                    SCRATCH_SIZE,
+                    scratch_size,
                     g_bd.gap_open_cost,
                     g_bd.gap_extend_cost);
 
@@ -541,7 +584,10 @@ int main() {
     {
         __dma_aligned uint32_t count_buf[2];
         count_buf[0] = g_hit_count;
-        count_buf[1] = g_overflow;
+        /* Pack effective tasklets into upper 32-bits and set high bit if overflow */
+        uint32_t hi = (uint32_t)(g_effective_tasklets & 0xFFFFu);
+        if (g_overflow) hi |= (1u << 31);
+        count_buf[1] = hi;
         mram_write(count_buf, (__mram_ptr void *)(results_base), 8);
     }
 

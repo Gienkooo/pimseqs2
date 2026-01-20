@@ -163,7 +163,8 @@ namespace mmseqs::dpu
         EvalueComputation* evaluer,
         bool sameDB,
         QueryMatcherTaxonomyHook* taxonomyHook,
-        std::vector<std::vector<Matcher::result_t>>& out_results)
+        std::vector<std::vector<Matcher::result_t>>& out_results,
+        bool is_gpu)
     {
         if (batch.keys.empty()) return;
         if (out_results.size() < batch.keys.size()) {
@@ -199,7 +200,7 @@ namespace mmseqs::dpu
                 res.dbLen = tdbr->getSeqLen(hit.target_id);
                 res.qEndPos = hit.q_end;
                 res.qLen = qLen;
-                res.score = evaluer ? static_cast<int>(evaluer->computeBitScore(hit.score) + 0.5) : hit.score;
+                res.score = evaluer ? static_cast<int>(evaluer->computeBitScore(hit.score) + (is_gpu ? 0 : 0.5f)) : hit.score;
                 res.qStartPos = 0;
                 res.dbStartPos = 0;
 
@@ -1361,15 +1362,20 @@ namespace mmseqs::dpu
                                 memcpy(&hdr, header_bufs[d].data(), 8);
                                 const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
                                 const uint32_t hi = static_cast<uint32_t>((hdr >> 32) & 0xFFFFFFFFu);
-                                if (hi > 0) { // Extract effective tasklets
-                                    // Record observed effective tasklets (hi == effective_tasklets)
-                                    sumEffective += hi;
+                                const uint32_t overflow_flag = (hi >> 31) & 1u;
+                                const uint32_t effective_tasklets = hi & 0xFFFFu;
+                                if (effective_tasklets > 0) {
+                                    sumEffective += effective_tasklets;
                                     effectiveSamples++;
-                                    if (hi < minEffective) minEffective = (uint8_t)hi;
-                                    if (hi > maxEffective) maxEffective = (uint8_t)hi;
-                                    if (hi < active_tasklets) taskletDownshiftEvents++;
+                                    if (effective_tasklets < minEffective) minEffective = (uint8_t)effective_tasklets;
+                                    if (effective_tasklets > maxEffective) maxEffective = (uint8_t)effective_tasklets;
+                                    if (effective_tasklets < active_tasklets) taskletDownshiftEvents++;
                                 }
                                 const uint32_t max_hits = maxHitsPerDpu[d];
+                                if (overflow_flag) {
+                                    Debug(Debug::ERROR) << "[DPU] Gapped batch overflow flag set on DPU " << d
+                                                        << " (hits=" << hit_count << ", capacity=" << max_hits << ")";
+                                }
                                 if (hit_count > max_hits) {
                                     Debug(Debug::ERROR) << "[DPU] Gapped batch overflow detected for DPU " << d
                                                         << " (hits=" << hit_count << ", max=" << max_hits << ")";
@@ -1418,7 +1424,7 @@ namespace mmseqs::dpu
                 std::vector<std::vector<Matcher::result_t>> batch_results(batch.meta.size());
                 {
                     auto timer = dpu_comm_.timeSlot(PS::HostProcessHits);
-                    processDpuHits(dpu_hits, batch, tdbr, par, evaluer, sameDB, taxonomyHook, batch_results);
+                    processDpuHits(dpu_hits, batch, tdbr, par, evaluer, sameDB, taxonomyHook, batch_results, false);
                     dpu_comm_.recordSlotMetrics(PS::HostProcessHits, 0, total_hits);
                 }
 
@@ -1928,7 +1934,7 @@ namespace mmseqs::dpu
             // DATA-RESIDENT PATTERN: Scatter targets ONCE at start of wave
             // Targets stay resident in DPU MRAM while we broadcast multiple query batches
             DPU_DEBUG_LOG << "[DPU] Wave " << (bIdx + 1) << "/" << targetBatches.size() 
-                          << ": Scattering " << active_dpus.size() << " target batches (data-resident)\\n";
+                          << ": Scattering " << active_dpus.size() << " target batches (data-resident)\n";
             workflow_.scatterTargetsOnly(perDpuTargetMeta, perDpuTargetData, max_layout);
 
             BatchLimits batch_limits{};
@@ -1959,9 +1965,11 @@ namespace mmseqs::dpu
                     uint64_t hdr = 0;
                     memcpy(&hdr, header_bufs[d].data(), 8);
                     const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-                    const uint32_t overflow_flag = static_cast<uint32_t>(hdr >> 32);
+                    const uint32_t hi = static_cast<uint32_t>((hdr >> 32) & 0xFFFFFFFFu);
+                    const uint32_t overflow_flag = (hi >> 31) & 1u;
+                    const uint32_t effective_tasklets = hi & 0xFFFFu;
                     const uint32_t max_hits = maxHitsPerDpu[d];
-                    if (overflow_flag != 0) {
+                    if (overflow_flag) {
                         Debug(Debug::ERROR) << "[DPU] Combined batch overflow flag set on DPU " << d
                                             << " (hits=" << hit_count << ", capacity=" << max_hits << ")";
                     }
@@ -2123,7 +2131,7 @@ namespace mmseqs::dpu
                 std::vector<std::vector<Matcher::result_t>> batch_results(batch.meta.size());
                 {
                     auto timer = dpu_comm_.timeSlot(PS::HostProcessHits);
-                    processDpuHits(dpu_hits, batch, tdbr, par, evaluer, sameDB, taxonomyHook, batch_results);
+                    processDpuHits(dpu_hits, batch, tdbr, par, evaluer, sameDB, taxonomyHook, batch_results, true);
                     dpu_comm_.recordSlotMetrics(PS::HostProcessHits, 0, total_hits);
                 }
 
