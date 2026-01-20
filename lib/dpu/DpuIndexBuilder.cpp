@@ -8,12 +8,6 @@
 #include <cmath> 
 #include <numeric> 
 
-#ifdef DPU_DEBUG_MODE
-  #define DPU_DEBUG_LOG Debug(Debug::INFO)
-#else
-  #define DPU_DEBUG_LOG if (false) Debug(Debug::INFO)
-#endif
-
 namespace mmseqs::dpu {
 
 DpuIndexBuffer DpuIndexBuilder::build(
@@ -103,6 +97,13 @@ DpuIndexBuffer DpuIndexBuilder::build(
             current_count = 0;
         }
         buffer.entries.push_back({entry.local_id, entry.pos});
+        
+        // DEBUG: Log if we are about to overflow uint16_t (65535 -> 0)
+        if (current_count == 65535) {
+            LOG_INDEX("WARNING: [Overflow] Chunk " << global_chunk_id << " DPU " << dpu_id 
+                      << " K-mer " << current_kmer << " reached 65536 hits (wrapping to 0!)");
+        }
+        
         current_count++;
     }
     if (current_kmer != 0xFFFFFFFF) {
@@ -172,52 +173,40 @@ DpuIndexBuffer DpuIndexBuilder::build(
                << ", EmptyBuckets=" << empty_buckets << "/" << NUM_BUCKETS << " (" << (empty_buckets*100/NUM_BUCKETS) << "%)"
                << ", Collisions=" << collision_buckets << " (" << (collision_buckets*100/NUM_BUCKETS) << "%)");
     
-    // // 2. Extended Stats (Distribution & Utilization)
-     #ifdef DPU_LOG_INDEX_EXTENDED
-     {
-         std::vector<uint32_t> chain_lengths;
-         chain_lengths.reserve(NUM_BUCKETS);
-         std::vector<uint32_t> bucket_fills; // Utilization of individual bucket structs (0 to BUCKET_CAPACITY)
-         bucket_fills.reserve(final_buckets.size());
-    
-         // Analyze Chains
-         uint32_t max_chain = 0;
-         for(uint32_t i = 0; i < NUM_BUCKETS; ++i) {
-             uint32_t len = 0;
-             uint32_t curr = i;
-             while(curr != CHAIN_END_IDX) {
-                 bucket_fills.push_back(final_buckets[curr].count);
-                 len++;
-                 curr = final_buckets[curr].next_idx;
-             }
-             chain_lengths.push_back(len);
-             if(len > max_chain) max_chain = len;
-         }
-    
-         // Compute Chain Stats
-         double avg_chain = std::accumulate(chain_lengths.begin(), chain_lengths.end(), 0.0) / chain_lengths.size();
-         std::sort(chain_lengths.begin(), chain_lengths.end());
-         uint32_t median_chain = chain_lengths[chain_lengths.size() / 2];
-         uint32_t p95_chain = chain_lengths[chain_lengths.size() * 95 / 100];
-    
-         // Compute Fill Stats
-         double total_fill_items = std::accumulate(bucket_fills.begin(), bucket_fills.end(), 0.0);
-         double avg_fill_pct = (total_fill_items / (bucket_fills.size() * BUCKET_CAPACITY)) * 100.0;
-         std::sort(bucket_fills.begin(), bucket_fills.end());
-         uint32_t median_fill = bucket_fills[bucket_fills.size() / 2];
-    
-         LOG_INDEX_EXTENDED("Chunk " << global_chunk_id << " Stats:"
-                            << "\n\tChain Depth: Avg=" << avg_chain << " Med=" << median_chain << " P95=" << p95_chain << " Max=" << max_chain
-                            << "\n\tBucket Fill: Avg=" << avg_fill_pct << "% Med=" << median_fill << "/" << BUCKET_CAPACITY
-                            << "\n\tTotal Buckets Used: " << final_buckets.size() << " (Overhead factor: " << (float)final_buckets.size()/NUM_BUCKETS << "x)");
-     }
-     #endif
+
     
     size_t total_bytes = final_buckets.size() * sizeof(KmerBucket);
     buffer.buckets.resize(total_bytes);
     std::memcpy(buffer.buckets.data(), final_buckets.data(), total_bytes);
     buffer.num_buckets = static_cast<uint32_t>(final_buckets.size());
     
+    // --- STATS CALCULATION (Exact Definitions) ---
+    size_t overflow_count = 0;
+    size_t total_chain_depth = 0;
+    size_t max_chain_depth = 0;
+    size_t populated_buckets = 0;
+
+    for (uint32_t i = 0; i < NUM_BUCKETS; ++i) {
+        if (final_buckets[i].count > 0) populated_buckets++;
+        if (final_buckets[i].next_idx != CHAIN_END_IDX) overflow_count++;
+        
+        size_t depth = 1;
+        uint32_t curr = final_buckets[i].next_idx;
+        while (curr != CHAIN_END_IDX) {
+            depth++;
+            if (curr >= final_buckets.size()) break; // Safety
+            curr = final_buckets[curr].next_idx;
+        }
+        total_chain_depth += depth;
+        max_chain_depth = std::max(max_chain_depth, depth);
+    }
+
+    LOG_INDEX("Chunk " << global_chunk_id << " Stats: Entries=" << buffer.entries.size() 
+              << " PrimaryBuckets=" << NUM_BUCKETS
+              << " OverflowRate=" << (100.0 * overflow_count / NUM_BUCKETS) << "% (" << overflow_count << " buckets chained)");
+    LOG_INDEX("              AvgChainDepth=" << (double)total_chain_depth / NUM_BUCKETS 
+              << " MaxChainDepth " << max_chain_depth);
+
     return buffer;
 }
 

@@ -1,6 +1,7 @@
 #include "DpuDbSplitter.h"
 #include "shared/DpuSharedTypes.h" 
 #include "Debug.h"
+#include "DpuLog.h"
 #include <algorithm>
 #include <cmath>
 #include <queue>
@@ -86,7 +87,7 @@ std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabaseGreedyKmer(
         if (!chunk.sequence_ids.empty()) result.push_back(chunk.sequence_ids);
     }
     
-    Debug(Debug::INFO) << "[DPU] Greedy Split: " << result.size() << " chunks created.\n";
+    LOG_TRACE("Greedy Split: " << result.size() << " chunks created.");
     return result;
 }
 
@@ -111,7 +112,7 @@ std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabaseBalancedKmer(
     size_t num_waves = (min_chunks + num_dpus - 1) / num_dpus;
     if (num_waves == 0) num_waves = 1;
 
-    Debug(Debug::INFO) << "[DPU] Balanced Splitter: Initial guess " << num_waves << " waves.\n";
+    LOG_TRACE("Balanced Splitter: Initial guess " << num_waves << " waves.");
 
     while (true) {
         size_t num_chunks = num_waves * num_dpus;
@@ -158,9 +159,9 @@ std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabaseBalancedKmer(
                     max_load = std::max(max_load, chunk.current_estimated_bytes);
                 }
             }
-            Debug(Debug::INFO) << "[DPU] Balanced Split: " << num_waves << " waves (" 
-                               << result.size() << " chunks). Load (Min/Max): " 
-                               << min_load/1024 << "KB / " << max_load/1024 << "KB\n";
+            LOG_TRACE("Balanced Split: " << num_waves << " waves (" 
+                      << result.size() << " chunks). Load (Min/Max): " 
+                      << min_load/1024 << "KB / " << max_load/1024 << "KB");
             return result;
         }
 

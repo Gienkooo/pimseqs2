@@ -1,11 +1,6 @@
 #include "DpuQueryPacketGenerator.h"
 #include "Debug.h"
-
-#ifdef DPU_DEBUG_MODE
-  #define DPU_DEBUG_LOG Debug(Debug::INFO)
-#else
-  #define DPU_DEBUG_LOG if (false) Debug(Debug::INFO)
-#endif
+#include "DpuLog.h"
 
 namespace mmseqs::dpu {
 
@@ -105,14 +100,14 @@ void DpuQueryPacketGenerator::loadCurrentQuery() {
         current_num_positions_ = queryLen - window_size + 1;
     } else {
         current_num_positions_ = 0;
-        DPU_DEBUG_LOG << "[Streamer] Query " << current_query_idx_ << " too short (" << queryLen << " < " << window_size << ")\n";
+        LOG_TRACE("Streamer: Query " << current_query_idx_ << " too short (" << queryLen << " < " << window_size << ")");
     }
     
     current_query_loaded_ = true;
     current_seq_pos_ = 0;
     stats_.queries_started++;
     
-    DPU_DEBUG_LOG << "[Streamer] Loaded query " << current_query_idx_ << " (len=" << queryLen << ", positions=" << current_num_positions_ << ")\n";
+    LOG_TRACE("Streamer: Loaded query " << current_query_idx_ << " (len=" << queryLen << ", positions=" << current_num_positions_ << ")");
 }
 
 bool DpuQueryPacketGenerator::advanceToNextQuery() {
@@ -170,7 +165,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             stats_.queries_completed++;
             last_batch_complete_queries_++;
             
-            DPU_DEBUG_LOG << "[Streamer] Wrote deferred sentinel for query " << current_query_idx_ << "\n";
+            LOG_TRACE("Streamer: Wrote deferred sentinel for query " << current_query_idx_);
             
             if (!advanceToNextQuery()) {
                 break;  // No more queries
@@ -313,9 +308,9 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
                     pending_query_pos_ = query_pos;
                     has_pending_kmers_ = true;
                     
-                    DPU_DEBUG_LOG << "[Streamer] Spillover: " << similar_kmers.second 
-                                  << " k-mers, wrote " << actually_written 
-                                  << ", pending " << (similar_kmers.second - actually_written) << "\n";
+                    LOG_TRACE("Streamer: Spillover: " << similar_kmers.second 
+                              << " k-mers, wrote " << actually_written 
+                              << ", pending " << (similar_kmers.second - actually_written));
                     
                     return written;  // Buffer full
                 }
@@ -334,7 +329,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
                 stats_.queries_completed++;
                 last_batch_complete_queries_++;
                 
-                DPU_DEBUG_LOG << "[Streamer] Query " << current_query_idx_  << " complete, wrote sentinel\n";
+                LOG_TRACE("Streamer: Query " << current_query_idx_  << " complete, wrote sentinel");
                 
                 // Advance to next query
                 if (!advanceToNextQuery()) {
@@ -343,7 +338,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             } else {
                 // No room for sentinel - defer to next batch
                 current_query_sentinel_pending_ = true;
-                DPU_DEBUG_LOG << "[Streamer] Query " << current_query_idx_ << " complete, sentinel deferred\n";
+                LOG_TRACE("Streamer: Query " << current_query_idx_ << " complete, sentinel deferred");
                 return written;
             }
         }

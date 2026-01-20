@@ -181,6 +181,23 @@ typedef struct {
 
 DPU_STATIC_ASSERT(sizeof(KmerBatchDescriptor) % 8 == 0, "KmerBatchDescriptor must be 8-byte aligned");
 
+/* Calculate total static usage */
+#define DPU_MRAM_ESTIMATED_USAGE ( \
+    sizeof(KmerBatchDescriptor) +  \
+    sizeof(KmerCheckpoint) +       \
+    sizeof(KmerResultHeader) +     \
+    DPU_STATE_TABLE_SIZE +         \
+    KMER_QUERY_BUFFER_SIZE +       \
+    MAX_DPU_INDEX_SIZE +           \
+    KMER_MIN_OUTPUT_BUFFER_SIZE    \
+)
+
+/* Compile-time check (Safety Net) */
+DPU_STATIC_ASSERT(
+    DPU_MRAM_ESTIMATED_USAGE <= DPU_MRAM_TOTAL_SIZE, 
+    "CRITICAL: DPU MRAM Usage exceeds 64MB! Reduce MAX_DPU_INDEX_SIZE or Buffers."
+);
+
 /* --- 1. Common Batch Header --- */
 struct DpuBatchHeader {
     uint32_t batch_id;

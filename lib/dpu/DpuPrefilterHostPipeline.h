@@ -194,7 +194,8 @@ class DpuPrefilterHostPipeline {
   
   std::vector<std::vector<KmerDoubleHit>> executeKmerBatchWithOverflow(
       const KmerRunContext& ctx,
-      const std::vector<std::vector<uint8_t>>& descriptors);
+      const std::vector<std::vector<uint8_t>>& descriptors,
+      uint32_t& out_overflows);
   
   // Async pipeline helper: sends batch to DPUs and executes kernel
   std::vector<std::vector<KmerDoubleHit>> processBatchOnDpu(
@@ -203,7 +204,8 @@ class DpuPrefilterHostPipeline {
       const std::vector<DpuIndexBuffer>& wave_indices,
       const std::vector<std::vector<uint32_t>>& splits,
       size_t wave_start,
-      size_t wave_size);
+      size_t wave_size,
+      uint32_t& out_overflows);
   
   void runDpuUngappedBatch(
       Parameters& par,
