@@ -26,6 +26,9 @@ __host uint32_t g_hit_write_offset;
 __host uint32_t g_overflow;
 
 __host uint8_t g_effective_tasklets;
+/* Pooled WRAM scratch buffer shared by tasklets (allocated by tasklet 0) */
+uint8_t *g_scratch_pool = NULL;
+uint32_t g_scratch_stride = 0;
 
 __dma_aligned QueryMetadata g_query_meta[MAX_BATCH_QUERIES];
 
@@ -260,15 +263,51 @@ int main() {
 
     if (tasklet_id == 0) {
         mem_reset();
+
+        /* Compute per-tasklet scratch layout used in compute_sw_tiled() */
+        const uint32_t a = ALIGN8((T_TILE_SIZE + 1) * sizeof(int32_t));
+        const uint32_t b = ALIGN8((Q_TILE_SIZE + 1) * sizeof(int32_t));
+        const uint32_t p_target = ALIGN8(T_TILE_SIZE);
+        const uint32_t p_pssm = ALIGN8(Q_TILE_SIZE * ALPHA_SIZE + 8);
+        const uint32_t per_tasklet = (4u * a) + (2u * b) + p_target + p_pssm + 1024u;
+        const uint32_t stride = ALIGN8(per_tasklet);
+
+        uint8_t req = g_bd.header.num_active_tasklets;
+        if (req == 0 || req > MAX_SAFE_TASKLETS) req = MAX_SAFE_TASKLETS;
+
+        uint8_t eff = req;
+        uint8_t *pool_raw = NULL;
+        while (eff >= 1) {
+            pool_raw = (uint8_t *)mem_alloc((size_t)eff * stride + 8);
+            if (pool_raw) break;
+            eff--;
+        }
+
+        if (!pool_raw) {
+            /* Failed to allocate even for 1 tasklet */
+            g_effective_tasklets = 0;
+            g_scratch_pool = NULL;
+            g_scratch_stride = 0;
+        } else {
+            g_scratch_pool = (uint8_t *)ALIGN8_PTR(pool_raw);
+            g_scratch_stride = stride;
+            g_effective_tasklets = eff;
+        }
     }
     barrier_wait(&my_barrier);
 
-    uint8_t *scratch_buffer_raw = NULL;
-    uint8_t *scratch_buffer = NULL;
+    /* Recompute activity after allocation/downshift */
+    is_active = (tasklet_id < g_effective_tasklets);
 
+    /* If allocation failed for all tasklets, bail out early. Tasklet 0
+     * already wrote an empty header before allocation, so simply return. */
+    if (g_effective_tasklets == 0) {
+        return 0;
+    }
+
+    uint8_t *scratch_buffer = NULL;
     if (is_active) {
-        scratch_buffer_raw  = (uint8_t *)mem_alloc(SCRATCH_SIZE + 8);
-        scratch_buffer      = (uint8_t *)ALIGN8_PTR(scratch_buffer_raw);
+        scratch_buffer = g_scratch_pool + ((size_t)tasklet_id * (size_t)g_scratch_stride);
     }
 
     uint32_t max_query_len = g_bd.header.query_len;
@@ -348,9 +387,9 @@ int main() {
                     pssm_addr,
                     mram_scratch_vectors,
                     scratch_buffer,
-                    SCRATCH_SIZE,
-                    (int32_t)g_bd.gap_open_cost,    // Cast to int32
-                    (int32_t)g_bd.gap_extend_cost); // Cast to int32
+                    g_scratch_stride,
+                    (int32_t)g_bd.gap_open_cost,   
+                    (int32_t)g_bd.gap_extend_cost);
                 
                 if (false && sw.score < current_min_score) 
                 {
@@ -401,7 +440,10 @@ int main() {
     if (tasklet_id == 0) {
         __dma_aligned uint32_t count_buf[2];
         count_buf[0] = g_hit_count;
-        count_buf[1] = g_overflow;
+        /* Pack effective tasklets into the high 32-bits of the 8-byte header.
+         * The host will parse the upper 32 bits as the observed effective
+         * tasklet count for this DPU. */
+        count_buf[1] = (uint32_t)g_effective_tasklets;
         mram_write(count_buf, (__mram_ptr void*)results_base, 8);
     }
     

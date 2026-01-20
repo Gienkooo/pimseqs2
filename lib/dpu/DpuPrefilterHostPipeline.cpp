@@ -30,6 +30,7 @@
 #include "DpuKernelManager.h"
 #include "DpuGroupManager.h"
 #include "Sequence.h"
+#include "shared/DpuSharedTypes.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1070,7 +1071,30 @@ namespace mmseqs::dpu
         // Kernel MAX_SAFE_TASKLETS=11 due to WRAM constraints (stack + SW buffers + scratch)
         // Host matches kernel limit for optimal resource usage
         const uint8_t MAX_KERNEL_TASKLETS = 11;
-        uint8_t active_tasklets = MAX_KERNEL_TASKLETS;
+
+        // Compute per-tasklet WRAM footprint for the gapped tiled kernel so the
+        // host can request a safe number of tasklets. This mirrors the
+        // WRAM layout inside `compute_sw_tiled()` in the DPU kernel.
+        const size_t gapped_wram_per_tasklet =
+            /* 4 x (T_TILE_SIZE+1) int32 vectors */
+            (size_t)DpuCommunicationManager::alignToMram(((T_TILE_SIZE + 1) * sizeof(int32_t))) * 4u
+            /* 2 x (Q_TILE_SIZE+1) int32 vectors */
+            + (size_t)DpuCommunicationManager::alignToMram(((Q_TILE_SIZE + 1) * sizeof(int32_t))) * 2u
+            /* target tile buffer */
+            + (size_t)DpuCommunicationManager::alignToMram(T_TILE_SIZE)
+            /* pssm tile cache */
+            + (size_t)DpuCommunicationManager::alignToMram(Q_TILE_SIZE * ALPHA_SIZE + 8)
+            /* safety stack/misc reserve */
+            + 1024u;
+
+        uint8_t active_tasklets = std::min<uint8_t>(MAX_KERNEL_TASKLETS, calculateActiveTasklets((uint32_t)gapped_wram_per_tasklet));
+
+        // Statistics for kernel downshifting (updated while gathering results)
+        uint64_t taskletDownshiftEvents = 0;
+        uint64_t sumEffective = 0;
+        uint64_t effectiveSamples = 0;
+        uint8_t minEffective = 255;
+        uint8_t maxEffective = 0;
 
         // Pre-calculate max query sizes for layout
         const uint32_t max_query_len = qdbr->getMaxSeqLen();
@@ -1085,9 +1109,11 @@ namespace mmseqs::dpu
         
         const uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(GappedBatchDescriptor));
 
-        // Calculate scratch memory needed for tiled implementation
-        const uint32_t vec_bytes = DpuCommunicationManager::alignToMram((max_query_len + 1) * sizeof(int32_t));
-        const uint32_t scratch_size = (2 * vec_bytes) * active_tasklets;
+        // Calculate scratch memory needed for tiled implementation (MRAM vectors)
+        const size_t vec_stride_mram = DpuCommunicationManager::alignToMram((Q_TILE_SIZE + 1) * sizeof(int32_t));
+        const size_t num_q_tiles_mram = (max_query_len + Q_TILE_SIZE - 1) / Q_TILE_SIZE;
+        const size_t single_vec_size_mram = num_q_tiles_mram * vec_stride_mram;
+        const size_t scratch_size = (size_t)active_tasklets * 2u * single_vec_size_mram;
 
         Debug(Debug::INFO) << "DPU Gapped Batch Debug:\n"
                            << "  sizeof(GappedBatchDescriptor) = " << sizeof(GappedBatchDescriptor) << "\n"
@@ -1211,6 +1237,8 @@ namespace mmseqs::dpu
                 init_bd.header.targets_data_offset = max_layout.target_data_offset;
                 init_bd.header.results_offset = max_layout.results_offset;
                 init_bd.header.results_buffer_size = max_layout.results_capacity;
+                // Request the host-tuned tasklet count in the descriptor header
+                init_bd.header.num_active_tasklets = active_tasklets;
                 bds[d] = init_bd;
             }
 
@@ -1332,6 +1360,15 @@ namespace mmseqs::dpu
                                 uint64_t hdr = 0;
                                 memcpy(&hdr, header_bufs[d].data(), 8);
                                 const uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+                                const uint32_t hi = static_cast<uint32_t>((hdr >> 32) & 0xFFFFFFFFu);
+                                if (hi > 0) { // Extract effective tasklets
+                                    // Record observed effective tasklets (hi == effective_tasklets)
+                                    sumEffective += hi;
+                                    effectiveSamples++;
+                                    if (hi < minEffective) minEffective = (uint8_t)hi;
+                                    if (hi > maxEffective) maxEffective = (uint8_t)hi;
+                                    if (hi < active_tasklets) taskletDownshiftEvents++;
+                                }
                                 const uint32_t max_hits = maxHitsPerDpu[d];
                                 if (hit_count > max_hits) {
                                     Debug(Debug::ERROR) << "[DPU] Gapped batch overflow detected for DPU " << d
@@ -1383,6 +1420,14 @@ namespace mmseqs::dpu
                     auto timer = dpu_comm_.timeSlot(PS::HostProcessHits);
                     processDpuHits(dpu_hits, batch, tdbr, par, evaluer, sameDB, taxonomyHook, batch_results);
                     dpu_comm_.recordSlotMetrics(PS::HostProcessHits, 0, total_hits);
+                }
+
+                // Report tasklet tuning summary if any downshift occurred
+                if (effectiveSamples > 0) {
+                    double avgEff = (double)sumEffective / (double)effectiveSamples;
+                    Debug(Debug::INFO) << "[DPU] Tasklet tuning: requested=" << (int)active_tasklets
+                                       << " observed=" << (int)minEffective << ".." << (int)maxEffective
+                                       << " (events=" << taskletDownshiftEvents << ", avg=" << avgEff << ")\n";
                 }
 
                 for (size_t i = 0; i < batch_results.size(); ++i) {

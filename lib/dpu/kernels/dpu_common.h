@@ -30,7 +30,6 @@
 #endif
 
 /* --- Common Constants --- */
-#define ALPHA_SIZE 21
 #define NEG_INF (-10000)  /* Safe value for int16 math */
 
 /* =============================================================================

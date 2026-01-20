@@ -27,6 +27,8 @@ extern "C" {
 #define T_TILE_SIZE 64
 #endif
 
+#define ALPHA_SIZE 21
+
 /* Coverage Modes */
 #define DPU_COV_MODE_BIDIRECTIONAL  0
 #define DPU_COV_MODE_TARGET         1
