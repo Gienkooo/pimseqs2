@@ -52,7 +52,7 @@ private:
 
     // Estimates Kmer size in MRAM (Index Entries only).
     static size_t estimateSequenceSizeBytes(uint32_t len) {
-        return len * 9; 
+        return len * 10; 
     }
 };
 
