@@ -8,6 +8,7 @@
 /* --- Macros & Constants --- */
 
 #define ALIGN8(x) (((x) + 7) & ~7U)
+#define ALIGN8_DOWN(x) ((x) & ~7U)
 #define MRAM_ALIGN_SIZE(x) ALIGN8(x)
 
 #define MAX_MRAM_TRANSFER_SIZE 2048
