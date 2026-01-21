@@ -39,7 +39,7 @@ log "   The CPU will now perform $(($NUM_Q * $NUM_T)) alignments."
 # Run CPU
 log "2. Running Gapped Alignment on CPU with candidate pairs..."
 "$MMSEQS_BIN" align "$QUERY_DB" "$TARGET_DB" "$CANDIDATE_DB" "$CPU_DB" \
-    --threads $(nproc) -v 3 -e "$E_VALUE" --comp-bias-corr 0 \
+    --threads $(nproc) -v 3 -e "$E_VALUE" --comp-bias-corr 0 --alignment-mode 1 \
     > "$OUT_DIR/gapped_cpu.log" 2>&1
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     cat "$OUT_DIR/gapped_cpu.log"
