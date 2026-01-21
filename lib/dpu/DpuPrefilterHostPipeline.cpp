@@ -215,17 +215,6 @@ namespace mmseqs::dpu
                 if (Alignment::checkCriteria(res, isIdentity, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr)) {
                     out_results[q_idx].push_back(res);
                 }
-                else
-                {
-                    DPU_DEBUG_LOG << "[DPU]   Hit filtered out: qIdx=" << q_idx
-                                  << ", targetKey=" << targetKey
-                                  << ", score=" << hit.score
-                                  << ", evalue=" << evalue
-                                  << ", seqId=" << res.seqId
-                                  << ", alnLen=" << res.alnLength
-                                  << ", qcov=" << res.qcov
-                                  << ", dbcov=" << res.dbcov
-                                  << "\n";}
             }
         }
     }
@@ -1069,24 +1058,21 @@ namespace mmseqs::dpu
         std::vector<float> compBias(qdbr->getMaxSeqLen() + 1, 0.0f);
 
         // DYNAMIC TASKLET CALCULATION
-        // Kernel MAX_SAFE_TASKLETS=11 due to WRAM constraints (stack + SW buffers + scratch)
         // Host matches kernel limit for optimal resource usage
-        const uint8_t MAX_KERNEL_TASKLETS = 11;
+        const uint8_t MAX_KERNEL_TASKLETS = 14;
 
-        // Compute per-tasklet WRAM footprint for the gapped tiled kernel so the
-        // host can request a safe number of tasklets. This mirrors the
-        // WRAM layout inside `compute_sw_tiled()` in the DPU kernel.
-        const size_t gapped_wram_per_tasklet =
-            /* 4 x (T_TILE_SIZE+1) int32 vectors */
-            (size_t)DpuCommunicationManager::alignToMram(((T_TILE_SIZE + 1) * sizeof(int32_t))) * 4u
-            /* 2 x (Q_TILE_SIZE+1) int32 vectors */
-            + (size_t)DpuCommunicationManager::alignToMram(((Q_TILE_SIZE + 1) * sizeof(int32_t))) * 2u
-            /* target tile buffer */
-            + (size_t)DpuCommunicationManager::alignToMram(T_TILE_SIZE)
-            /* pssm tile cache */
-            + (size_t)DpuCommunicationManager::alignToMram(Q_TILE_SIZE * ALPHA_SIZE + 8)
-            /* safety stack/misc reserve */
-            + 1024u;
+        size_t struct_size = 0;
+        // 1. Vertical Vectors (H_col, E_col) -> aligned 8
+        struct_size += DpuCommunicationManager::alignToMram((Q_TILE_SIZE + 2) * 4) * 2;
+        // 2. Horizontal Vectors (H_top, F_top, H_bot, F_bot) -> aligned 8
+        struct_size += DpuCommunicationManager::alignToMram((T_TILE_SIZE + 2) * 4) * 4;
+        // 3. Target Tile -> aligned 8
+        struct_size += DpuCommunicationManager::alignToMram(T_TILE_SIZE + 8);
+        // 4. PSSM Tile -> aligned 8
+        struct_size += DpuCommunicationManager::alignToMram(Q_TILE_SIZE* ALPHA_SIZE + 32);
+
+        // Add safety margin for stack (recursion is 0, but locals exist)
+        const size_t gapped_wram_per_tasklet = struct_size + 1024;
 
         uint8_t active_tasklets = std::min<uint8_t>(MAX_KERNEL_TASKLETS, calculateActiveTasklets((uint32_t)gapped_wram_per_tasklet));
 
@@ -2274,28 +2260,28 @@ namespace mmseqs::dpu
 
         /* Defensive check: some host codepaths may produce a biased PSSM (e.g., +128 offset
            used for unsigned SIMD kernels). Detect and remove +128 bias if present. */
-        bool biased = false;
-        for (size_t i = 0; i < pssm.size(); ++i)
-        {
-            if ((int)pssm[i] > 100)
-            {
-                biased = true;
-                break;
-            }
-        }
-        if (biased)
-        {
-            for (size_t i = 0; i < pssm.size(); ++i)
-            {
-                int v = (int)pssm[i];
-                v -= 128;
-                if (v > 127)
-                    v = 127;
-                else if (v < -128)
-                    v = -128;
-                pssm[i] = static_cast<int8_t>(v);
-            }
-        }
+        // bool biased = false;
+        // for (size_t i = 0; i < pssm.size(); ++i)
+        // {
+        //     if ((int)pssm[i] > 100)
+        //     {
+        //         biased = true;
+        //         break;
+        //     }
+        // }
+        // if (biased)
+        // {
+        //     for (size_t i = 0; i < pssm.size(); ++i)
+        //     {
+        //         int v = (int)pssm[i];
+        //         v -= 128;
+        //         if (v > 127)
+        //             v = 127;
+        //         else if (v < -128)
+        //             v = -128;
+        //         pssm[i] = static_cast<int8_t>(v);
+        //     }
+        // }
         return pssm;
     }
 
@@ -2316,10 +2302,8 @@ namespace mmseqs::dpu
             if (target_id >= tdbr->getSize())
                 continue;
 
-            size_t seq_len = 0;
             const char *seq = tdbr->getData(target_id, 0);
-            while (seq[seq_len] != '\0')
-                seq_len++;
+            size_t seq_len = tdbr->getSeqLen(target_id);
 
             TargetMetadata meta;
             meta.target_id = target_id;
