@@ -21,10 +21,10 @@ extern "C" {
 
 /* Smith-Waterman tiling constants */
 #ifndef Q_TILE_SIZE
-#define Q_TILE_SIZE 64
+#define Q_TILE_SIZE 32
 #endif
 #ifndef T_TILE_SIZE
-#define T_TILE_SIZE 64
+#define T_TILE_SIZE 32
 #endif
 
 #define ALPHA_SIZE 21

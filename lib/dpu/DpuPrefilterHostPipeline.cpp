@@ -1059,7 +1059,7 @@ namespace mmseqs::dpu
 
         // DYNAMIC TASKLET CALCULATION
         // Host matches kernel limit for optimal resource usage
-        const uint8_t MAX_KERNEL_TASKLETS = 14;
+        const uint8_t MAX_KERNEL_TASKLETS = 12;
 
         size_t struct_size = 0;
         // 1. Vertical Vectors (H_col, E_col) -> aligned 8

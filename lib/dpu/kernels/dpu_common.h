@@ -55,7 +55,7 @@
  * ============================================================================= */
 
 /* Tasklet limits - WRAM is 64KB shared by all tasklets */
-#define MAX_SAFE_TASKLETS 11    /* Conservative limit for combined kernel */
+#define MAX_SAFE_TASKLETS 14    /* Conservative limit for combined kernel */
 #define MAX_BATCH_QUERIES 128   /* Maximum queries cached in WRAM (global, shared) */
 
 /* Calculate per-tasklet scratch budget based on tasklet count.
