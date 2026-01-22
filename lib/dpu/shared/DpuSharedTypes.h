@@ -64,13 +64,13 @@ extern "C" {
 #define DPU_INDEX_BUCKETS_SIZE   (NUM_BUCKETS * BUCKET_SIZE)    /* 16 MB */
 #define DPU_STATE_TABLE_SIZE     (MAX_DPU_SEQS * 4)             /* 32 KB */
 #define DPU_FIXED_INDEX_OVERHEAD (DPU_INDEX_BUCKETS_SIZE + DPU_STATE_TABLE_SIZE)
-#define MAX_DPU_INDEX_SIZE       (34 * 1024 * 1024) 
+#define MAX_DPU_INDEX_SIZE       (44 * 1024 * 1024) 
 
 #define MAX_DPU_SEQS 8192       
 
 /* Buffer Size Configuration */
-#define KMER_QUERY_BUFFER_SIZE      (12 * 1024 * 1024)    
-#define KMER_MIN_OUTPUT_BUFFER_SIZE (1 * 1024 * 1024)
+#define KMER_QUERY_BUFFER_SIZE      (16 * 1024 * 1024)
+#define KMER_MIN_OUTPUT_BUFFER_SIZE (1024)
 
 /* ==================== HASH CALCULATION ==================== */
 /* MurmurHash3 Finalizer (fast integer hash)
