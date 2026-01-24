@@ -315,10 +315,10 @@ namespace mmseqs::dpu
             runDpuUngappedBatch(par, subMat, tinySubMat, qdbr, tdbr, evaluer, taxonomyHook, sameDB, resultWriter);
         }
     }
+
     // ============================================================================
     // 1. KMER BATCH
     // ============================================================================
-
     void DpuPrefilterHostPipeline::runDpuKmerBatch(
         Parameters &par, BaseMatrix *subMat, DBReader<unsigned int> *qdbr,
         DBReader<unsigned int> *tdbr, EvalueComputation *evaluer,
@@ -389,11 +389,11 @@ namespace mmseqs::dpu
         uint64_t totalBatchTransfers = 0;    // Number of query packet batch transfers to DPUs
         uint64_t totalOverflowEvents = 0;    // Number of result overflow events across all DPUs  
 
-        auto ctx = KmerRunContext::create(num_dpus);
-
         // Per-query statistics for final summary
         std::vector<uint64_t> perQueryPackets;
         std::vector<uint64_t> perQueryDoubleHits;
+
+        auto ctx = KmerRunContext::create(num_dpus);
         
         auto splits = DpuDbSplitter::splitDatabaseBalancedKmer(tdbr, num_dpus, MAX_DPU_INDEX_SIZE, MAX_DPU_SEQS);
         
@@ -432,12 +432,11 @@ namespace mmseqs::dpu
             std::vector<std::vector<uint8_t>> wave_index_buffers(num_dpus);
             std::vector<uint32_t> wave_output_capacities(num_dpus, 0);
 
-            for (size_t w = 0; w < wave_size; ++w) {
-                uint32_t dpu_id = static_cast<uint32_t>(w);
-                const auto& index = wave_indices[w];
+            for (uint32_t dpu_id = 0; dpu_id < wave_size; ++dpu_id) {
+                const auto& index = wave_indices[dpu_id];
 
                 if (index.buckets.empty()) {
-                    Debug(Debug::WARNING) << "[CPU] Chunk " << (wave_start + w) << " has empty index, skipping\n";
+                    Debug(Debug::WARNING) << "[CPU] Chunk " << (wave_start + dpu_id) << " has empty index, skipping\n";
                     continue;
                 }
                 
@@ -459,7 +458,7 @@ namespace mmseqs::dpu
                 uint32_t index_used_bytes = buckets_size + entries_size;
                 uint32_t output_buffer_bytes = DPU_MRAM_TOTAL_SIZE - variable_structures_end;
 
-                wave_output_capacities[w] = output_buffer_bytes;
+                wave_output_capacities[dpu_id] = output_buffer_bytes;
 
                 LOG_MRAM("DPU " << dpu_id << " Memory Layout [Input Payload: " 
                         << (variable_structures_end / 1024) << " KB (" 
@@ -480,7 +479,7 @@ namespace mmseqs::dpu
                 LOG_MRAM("    Index Entries: " << index.entries.size() << " entries (" << (entries_size / 1024) << " KB)");
                 LOG_MRAM("  Output Buffer:   " << (output_buffer_bytes / 1024) << " KB (Remaining Space)");
 
-                // === OUTPUT BUFFER: Uses remaining MRAM ===
+                // Output buffer uses remaining MRAM
                 uint32_t results_off = variable_structures_end;
                 
                 // MRAM Safety Check: Ensure everything fits in 64MB
@@ -498,11 +497,11 @@ namespace mmseqs::dpu
                     EXIT(EXIT_FAILURE);
                 }
 
-                // Build merged index buffer (buckets | entries) in variable region
+                // Build merged index buffer (buckets + entries) in variable region
                 uint32_t total_index_size = buckets_size + entries_size;
 
-                wave_index_buffers[w].resize(total_index_size);
-                uint8_t* ptr = wave_index_buffers[w].data();
+                wave_index_buffers[dpu_id].resize(total_index_size);
+                uint8_t* ptr = wave_index_buffers[dpu_id].data();
 
                 // Copy Buckets
                 if (!index.buckets.empty()) memcpy(ptr, index.buckets.data(), index.buckets.size());
@@ -515,10 +514,9 @@ namespace mmseqs::dpu
             }
 
             {
-                // Transfer merged Index Data (Variable Region) in one pass
+                // Transfer merged Index Data
                 dpu_comm_.scatterDataParallel(wave_index_buffers, ctx.VARIABLE_INDEX_START);
 
-                // Log which DPUs received indices
                 for (size_t w = 0; w < wave_size; ++w) {
                     if (!wave_index_buffers[w].empty()) {
                         LOG_INDEX("DPU " << w << ": Loaded index (parallel) size=" << (wave_index_buffers[w].size() / 1024) << " KB");
@@ -526,9 +524,9 @@ namespace mmseqs::dpu
                 }
             }
             
-            // === MULTI-QUERY BATCHING: Streaming packet generation with async double buffering ===
+            // MULTI-QUERY BATCHING: Streaming packet generation with async double buffering
             // Uses DpuQueryPacketGenerator as a stateful iterator that generates packets on-demand.
-            // 3-stage pipeline: CPU fills batch N+1 while DPU executes batch N
+            // CPU fills batch N+1 while DPU executes batch N
             
             std::string resultBuffer;
             
@@ -539,83 +537,15 @@ namespace mmseqs::dpu
                 par.compBiasCorrectionScale, kmerThr
             );
             
-            // Reserve ~1% buffer for sentinel packets and alignment padding
-            uint32_t max_packets_per_batch = (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket)) - 1000;
-            
-            // Double-buffered batch data
+            uint32_t max_packets_per_batch = (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket));
+
             KmerBatchData batches[2];
             for (int i = 0; i < 2; ++i) {
-                batches[i].packets.resize(max_packets_per_batch + 100);
+                batches[i].packets.resize(max_packets_per_batch);
             }
             
             std::vector<std::vector<hit_t>> perQueryRawHits(qdbr->getSize());
             std::vector<uint64_t> perQueryPacketCount(qdbr->getSize(), 0);
-            
-            // Broadcast State Reset only once before the batch loop starts.
-            // It is the DPU kernel's responsibility to handle per-query state resets via sentinels.
-            std::vector<uint8_t> reset_state(DpuCommunicationManager::alignToMram(MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)), 0xFF);
-            dpu_comm_.broadcastData(reset_state.data(), reset_state.size(), ctx.STATE_TABLE_OFF);
-            
-            // Lambda to parse results from one DPU batch
-            auto parseResults = [&](const std::vector<std::vector<KmerDoubleHit>>& per_dpu_results,
-                                    const std::vector<size_t>& batchQueryIndices) {
-                for (size_t w = 0; w < wave_size; ++w) {
-                    const auto& dpu_hits = per_dpu_results[w];
-                    const auto& chunk_targets = splits[wave_start + w];
-                    
-                    if (dpu_hits.empty()) continue;
-                    
-                    uint32_t hits_size_bytes = dpu_hits.size() * sizeof(KmerDoubleHit);
-                    uint32_t capacity_bytes = wave_output_capacities[w];
-                    double usage_pct = (100.0 * hits_size_bytes) / capacity_bytes;
-
-                    LOG_RESULTS("Wave " << w << " DPU " << (wave_start + w) 
-                                << ": " << dpu_hits.size() << " hits (" 
-                                << (hits_size_bytes / 1024) << " KB / " << (capacity_bytes / 1024) << " KB, "
-                                << usage_pct << "% of Output Buffer), chunk has " 
-                                << chunk_targets.size() << " targets");
-                    
-                    size_t queryIdxInBatch = 0;  // Index into batchQueryIndices
-                    size_t hitIdx = 0;
-                    
-                    for (const auto& hit : dpu_hits) {
-                        hitIdx++;
-                        // Check sentinel (32-bit) to detect query delimiters
-                        if (hit.target_id == (uint32_t)KMER_RESULT_SENTINEL_TARGET) {
-                            queryIdxInBatch++;
-                            if (queryIdxInBatch > batchQueryIndices.size()) {
-                                Debug(Debug::ERROR) << "[CPU] ERROR: Received more delimiters than queries sent!\n";
-                            }
-                            continue;
-                        }
-
-                        // Ignore alignment padding hits
-                        if (hit.target_id == (uint32_t)KMER_TARGET_ID_PADDING) {
-                            continue;
-                        }
-                        
-                        if (queryIdxInBatch >= batchQueryIndices.size()) {
-                            Debug(Debug::ERROR) << "[CPU] ERROR: Hit received after all query delimiters!\n";
-                            continue;
-                        }
-                        
-                        if (hit.target_id >= chunk_targets.size()) {
-                            Debug(Debug::ERROR) << "[CPU] FATAL: Invalid TargetID " << hit.target_id 
-                                                << " (max: " << (chunk_targets.size() - 1) << ")\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                        
-                        size_t actualQueryIdx = batchQueryIndices[queryIdxInBatch];
-                        
-                        hit_t shortHit;
-                        shortHit.seqId = chunk_targets[hit.target_id];
-                        shortHit.prefScore = 1;
-                        shortHit.diagonal = hit.diagonal;
-                        
-                        perQueryRawHits[actualQueryIdx].push_back(shortHit);
-                    }
-                }
-            };
             
             // Lambda to fill a batch from the streamer
             auto fillBatch = [&](KmerBatchData& batch) {
@@ -638,17 +568,74 @@ namespace mmseqs::dpu
                     auto stats = streamer.getStats();
                     totalPacketsSent = stats.total_packets;
                     
-                    LOG_BENCH("Generation: " << batch.packet_count << " packets in "
-                              << gen_time << "s (" << (batch.packet_count / gen_time) / 1e6 << " Mpps)");
-                    
-                    LOG_TRACE("Filled batch: " << batch.packet_count << " packets, "
-                                  << batch.query_indices.size() << " queries");
+                    LOG_BENCH("Generation: " << batch.packet_count << " packets in " << gen_time << "s (" << (batch.packet_count / gen_time) / 1e6 << " Mpps)");
+                    LOG_TRACE("Filled batch: " << batch.packet_count << " packets, " << batch.query_indices.size() << " queries");
+
                 } else {
                     batch.valid = false;
                 }
             };
+
+            // Lambda to parse results from one DPU batch
+            auto parseResults = [&](const std::vector<std::vector<KmerDoubleHit>>& per_dpu_results,
+                                    const std::vector<size_t>& batchQueryIndices) {
+                for (size_t dpu_id = 0; dpu_id < wave_size; ++dpu_id) {
+                    const auto& dpu_hits = per_dpu_results[dpu_id];
+                    const auto& chunk_targets = splits[wave_start + dpu_id];
+                    
+                    if (dpu_hits.empty()) continue;
+                    
+                    uint32_t hits_size_bytes = dpu_hits.size() * sizeof(KmerDoubleHit);
+                    uint32_t capacity_bytes = wave_output_capacities[dpu_id];
+                    double usage_pct = (100.0 * hits_size_bytes) / capacity_bytes;
+
+                    LOG_RESULTS("Wave " << dpu_id << " DPU " << (wave_start + dpu_id) 
+                                << ": " << dpu_hits.size() << " hits (" 
+                                << (hits_size_bytes / 1024) << " KB / " << (capacity_bytes / 1024) << " KB, "
+                                << usage_pct << "% of Output Buffer), chunk has " 
+                                << chunk_targets.size() << " targets");
+                    
+                    size_t queryIdxInBatch = 0;  // Index into batchQueryIndices
+                    size_t hitIdx = 0;
+                    
+                    for (const auto& hit : dpu_hits) {
+                        hitIdx++;
+                        // Check sentinel (32-bit) to detect query delimiters
+                        if (hit.target_id == (uint32_t)KMER_RESULT_SENTINEL) {
+                            queryIdxInBatch++;
+                            if (queryIdxInBatch > batchQueryIndices.size()) {
+                                Debug(Debug::ERROR) << "[CPU] ERROR: Received more delimiters than queries sent!\n";
+                            }
+                            continue;
+                        }
+
+                        if (hit.target_id == (uint32_t)KMER_TARGET_ID_PADDING) {
+                            continue;
+                        }
+                        
+                        if (queryIdxInBatch >= batchQueryIndices.size()) {
+                            Debug(Debug::ERROR) << "[CPU] ERROR: Hit received after all query delimiters!\n";
+                            continue;
+                        }
+                        
+                        if (hit.target_id >= chunk_targets.size()) {
+                            Debug(Debug::ERROR) << "[CPU] FATAL: Invalid TargetID " << hit.target_id << " (max: " << (chunk_targets.size() - 1) << ")\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        
+                        size_t actualQueryIdx = batchQueryIndices[queryIdxInBatch];
+                        
+                        hit_t shortHit;
+                        shortHit.seqId = chunk_targets[hit.target_id];
+                        shortHit.prefScore = 1;
+                        shortHit.diagonal = hit.diagonal;
+                        
+                        perQueryRawHits[actualQueryIdx].push_back(shortHit);
+                    }
+                }
+            };
             
-            // === ASYNC DOUBLE-BUFFERED BATCH LOOP ===
+            // ASYNC DOUBLE-BUFFERED BATCH LOOP
             int current = 0;
             
             // Prime the pipeline: fill first batch on CPU
@@ -662,7 +649,7 @@ namespace mmseqs::dpu
                 pendingQueryIndices = batches[current].query_indices;
                 pendingDpuResult = std::async(std::launch::async, [&, current]() {
                     uint32_t batch_overflows = 0;
-                    auto res = processBatchOnDpu(ctx, batches[current], wave_indices, splits, wave_start, wave_size, batch_overflows);
+                    auto res = processKmerBatchOnDpu(ctx, batches[current], wave_indices, splits, wave_start, wave_size, batch_overflows);
                     return std::make_pair(res, batch_overflows);
                 });
                 totalBatchTransfers++;
@@ -714,12 +701,12 @@ namespace mmseqs::dpu
                 current = next;
             }  // End async streaming batch loop
             
-            // === WRITE RESULTS FOR ALL QUERIES ===
-            for (size_t q = 0; q < qdbr->getSize(); ++q) {
-                const auto& raw_hits = perQueryRawHits[q];
-                uint32_t queryKey = qdbr->getDbKey(q);
+            // WRITE RESULTS FOR ALL QUERIES
+            for (size_t query_id = 0; query_id < qdbr->getSize(); ++query_id) {
+                const auto& raw_hits = perQueryRawHits[query_id];
+                uint32_t queryKey = qdbr->getDbKey(query_id);
                 
-                perQueryPackets.push_back(perQueryPacketCount[q]);
+                perQueryPackets.push_back(perQueryPacketCount[query_id]);
                 
                 if (raw_hits.empty()) {
                     perQueryDoubleHits.push_back(0);
@@ -774,8 +761,6 @@ namespace mmseqs::dpu
         auto endTime = std::chrono::high_resolution_clock::now();
         double seconds = std::chrono::duration<double>(endTime - startTime).count();
         
-        
-        // TODO: change to only print when debug
         LOG_RESULTS("[DPU K-mer Prefilter Statistics]");
         LOG_RESULTS("  Total queries processed:      " << qdbr->getSize());
         LOG_RESULTS("  Total query packets sent:     " << totalPacketsSent);
@@ -792,7 +777,6 @@ namespace mmseqs::dpu
     // ============================================================================
     // K-MER BATCH HELPERS
     // ============================================================================
-    
     std::vector<std::vector<uint8_t>> DpuPrefilterHostPipeline::prepareKmerDescriptors(
         const KmerRunContext& ctx,
         const std::vector<DpuIndexBuffer>& wave_indices,
@@ -804,20 +788,20 @@ namespace mmseqs::dpu
         std::vector<std::vector<uint8_t>> descriptors(ctx.num_dpus);
         const uint32_t desc_size = DpuCommunicationManager::alignToMram(sizeof(KmerBatchDescriptor));
 
-        for (uint32_t d = 0; d < ctx.num_dpus; ++d) {
-            descriptors[d].resize(desc_size, 0); // Zero initialize
+        for (uint32_t dpu_id = 0; dpu_id < ctx.num_dpus; ++dpu_id) {
+            descriptors[dpu_id].resize(desc_size, 0);
             
-            if (d >= wave_size || wave_indices[d].buckets.empty()) {
+            if (dpu_id >= wave_size || wave_indices[dpu_id].buckets.empty()) {
                 // Empty descriptor for idle DPUs
                 KmerBatchDescriptor empty_desc = {};
-                memcpy(descriptors[d].data(), &empty_desc, sizeof(empty_desc));
+                memcpy(descriptors[dpu_id].data(), &empty_desc, sizeof(empty_desc));
                 continue;
             }
 
-            const auto& index = wave_indices[d];
-            const auto& chunk = splits[wave_start + d];
+            const auto& index = wave_indices[dpu_id];
+            const auto& chunk = splits[wave_start + dpu_id];
             
-            // Calculate Variable Offsets (Buckets | Entries)
+            // Calculate Variable Offsets (Buckets, Entries, Results)
             uint32_t buckets_off = ctx.VARIABLE_INDEX_START;
             uint32_t buckets_size = DpuCommunicationManager::alignToMram(index.buckets.size());
             uint32_t entries_off = buckets_off + buckets_size;
@@ -834,16 +818,17 @@ namespace mmseqs::dpu
             desc.num_buckets = index.num_buckets;
             desc.num_index_entries = index.entries.size();
             
+            desc.checkpoint_offset = ctx.CHECKPOINT_OFF;
             desc.state_table_offset = ctx.STATE_TABLE_OFF;
             desc.query_packets_offset = ctx.QUERY_PACKETS_OFF;
+
             desc.buckets_offset = buckets_off;
             desc.index_entries_offset = entries_off;
             
             desc.results_offset = results_off;
             desc.results_buffer_size = result_buffer_size;
-            desc.checkpoint_offset = ctx.CHECKPOINT_OFF;
             
-            memcpy(descriptors[d].data(), &desc, sizeof(desc));
+            memcpy(descriptors[dpu_id].data(), &desc, sizeof(desc));
         }
         return descriptors;
     }
@@ -866,33 +851,32 @@ namespace mmseqs::dpu
             dpu_comm_.executeKernels(); // Block until done
             all_dpus_complete = true;   // Assume done until overflow seen
 
-            for (uint32_t d = 0; d < ctx.num_dpus; ++d) {
+            for (uint32_t dpu_id = 0; dpu_id < ctx.num_dpus; ++dpu_id) {
                 // Extract Results Offset from the descriptor we just sent
-                const KmerBatchDescriptor* desc = (const KmerBatchDescriptor*)descriptors[d].data();
+                const KmerBatchDescriptor* desc = (const KmerBatchDescriptor*)descriptors[dpu_id].data();
                 if (desc->num_targets == 0) continue;
 
                 uint32_t overflow = 0;
                 
-                // === REUSE: DpuWorkflow::gatherResultsClamped ===
                 // This handles reading header, checking count, handling alignment, and reading hits
                 auto iteration_hits = workflow_.gatherResultsClamped<KmerDoubleHit>(
-                    d, 
+                    dpu_id, 
                     desc->results_offset, 
                     desc->results_buffer_size, 
                     &overflow 
                 );
 
                 // Filter padding and accumulate
-                accumulated_results[d].reserve(accumulated_results[d].size() + iteration_hits.size());
+                accumulated_results[dpu_id].reserve(accumulated_results[dpu_id].size() + iteration_hits.size());
                 for (const auto& hit : iteration_hits) {
                     if (hit.target_id != KMER_TARGET_ID_PADDING) {
-                        accumulated_results[d].push_back(hit);
+                        accumulated_results[dpu_id].push_back(hit);
                     }
                 }
 
                 // CHECK FOR CORRUPTION (Code 2)
                 if (overflow == 2) {
-                    Debug(Debug::ERROR) << "[DPU] FATAL: Index Corruption detected on DPU " << d << "!\n";
+                    Debug(Debug::ERROR) << "[DPU] FATAL: Index Corruption detected on DPU " << dpu_id << "!\n";
                     Debug(Debug::ERROR) << "       Kernel reported out-of-bounds Bucket, Entry, or Target ID.\n";
                     EXIT(EXIT_FAILURE);
                 }
@@ -900,10 +884,9 @@ namespace mmseqs::dpu
                 if (overflow) {
                     all_dpus_complete = false; // Must relaunch this DPU
                     
-                    // Reset Result Header (Count=0, Overflow=0) at the START of results buffer
-                    // Note: We must write to results_offset now (where header is), NOT RESULTS_HEADER_OFF
+                    // Reset Result Header (Count=0, Overflow=0)
                     KmerResultHeader zero_hdr = {0, 0};
-                    dpu_comm_.scatterDataToDPU(d, &zero_hdr, sizeof(KmerResultHeader), desc->results_offset);
+                    dpu_comm_.scatterDataToDPU(dpu_id, &zero_hdr, sizeof(KmerResultHeader), desc->results_offset);
                 }
             }
             overflow_retries++;
@@ -918,7 +901,7 @@ namespace mmseqs::dpu
         return accumulated_results;
     }
     
-    std::vector<std::vector<KmerDoubleHit>> DpuPrefilterHostPipeline::processBatchOnDpu(
+    std::vector<std::vector<KmerDoubleHit>> DpuPrefilterHostPipeline::processKmerBatchOnDpu(
         const KmerRunContext& ctx,
         const KmerBatchData& batch,
         const std::vector<DpuIndexBuffer>& wave_indices,
@@ -932,20 +915,19 @@ namespace mmseqs::dpu
         }
         
         // 1. Prepare descriptors for this batch
-        auto descriptors = prepareKmerDescriptors(ctx, wave_indices, splits, 
-                                                   batch.packet_count, wave_start, wave_size);
+        auto descriptors = prepareKmerDescriptors(ctx, wave_indices, splits, batch.packet_count, wave_start, wave_size);
         
-        // 2. Transfer: Broadcast Query Packets to all DPUs
         auto t_start_xfer = std::chrono::high_resolution_clock::now();
         
+        // 2. Transfer: Broadcast Query Packets to all DPUs
         uint32_t packets_size = batch.packet_count * sizeof(KmerQueryPacket);
         dpu_comm_.broadcastData(batch.packets.data(), packets_size, ctx.QUERY_PACKETS_OFF);
         
         auto t_end_xfer = std::chrono::high_resolution_clock::now();
         
-        // 3. Execute kernel and gather results (handles overflow internally, includes descriptor scatter)
         auto t_start_exec = std::chrono::high_resolution_clock::now();
         
+        // 3. Execute kernel and gather results (handles overflow internally, includes descriptor scatter)
         auto results = executeKmerBatchWithOverflow(ctx, descriptors, out_overflows);
         
         auto t_end_exec = std::chrono::high_resolution_clock::now();

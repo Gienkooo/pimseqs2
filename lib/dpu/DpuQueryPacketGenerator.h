@@ -55,7 +55,7 @@ public:
     /**
      * Fill buffer with packets until full or all queries exhausted
      * 
-     * Packets for multiple queries are separated by sentinel packets (KMER_PACKET_SENTINEL_KEY). 
+     * Packets for multiple queries are separated by sentinel packets (KMER_PACKET_SENTINEL). 
      * The DPU kernel uses these to reset its state table between queries.
      * 
      * @param buffer Pointer to DMA-aligned packet buffer

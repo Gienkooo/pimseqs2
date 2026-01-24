@@ -155,9 +155,9 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
     unsigned char kmer_buf[32];
     
     while (written < max_packets) {
-        // === 1. Handle pending sentinel from previous batch ===
+        // 1. Handle pending sentinel from previous batch
         if (current_query_sentinel_pending_) {
-            buffer[written].kmer_idx = KMER_PACKET_SENTINEL_KEY;
+            buffer[written].kmer_idx = KMER_PACKET_SENTINEL;
             buffer[written].bucket_idx = 0;
             buffer[written].query_pos = 0;
             written++;
@@ -173,7 +173,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             continue;
         }
         
-        // === 2. Handle pending spillover (leftovers from previous batch) ===
+        // 2. Handle pending spillover (leftovers from previous batch) 
         if (has_pending_kmers_) {
             size_t remaining_in_list = pending_kmer_list_.second - pending_kmer_idx_;
             size_t available_space = max_packets - written;
@@ -199,7 +199,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             }
         }
         
-        // === 3. Check if loading a query is needed ===
+        // 3. Check if loading a query is needed
         if (!current_query_loaded_) {
             if (current_query_idx_ >= qdbr_->getSize()) {
                 break;  
@@ -208,7 +208,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             last_batch_query_indices_.push_back(current_query_idx_);
         }
         
-        // === 4. Process current query positions ===
+        // 4. Process current query positions
         while (current_seq_pos_ < current_num_positions_ && written < max_packets) {
             // Extract k-mer at this position
             const unsigned char* kmer;
@@ -317,11 +317,11 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             }
         }
         
-        // === 5. End of query -> need to insert sentinel ===
+        // 5. End of query -> need to insert sentinel 
         if (current_seq_pos_ >= current_num_positions_ && !has_pending_kmers_) {
             if (written < max_packets) {
                 // Room for sentinel
-                buffer[written].kmer_idx = KMER_PACKET_SENTINEL_KEY;
+                buffer[written].kmer_idx = KMER_PACKET_SENTINEL;
                 buffer[written].bucket_idx = 0;
                 buffer[written].query_pos = 0;
                 written++;

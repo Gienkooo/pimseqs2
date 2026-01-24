@@ -324,7 +324,7 @@ int main() {
             barrier_wait(&g_barrier);
             
             // Reset state for all targets for a new query
-            if (wram_current_packet.kmer_idx == KMER_PACKET_SENTINEL_KEY) {
+            if (wram_current_packet.kmer_idx == KMER_PACKET_SENTINEL) {
                 uint32_t chunk_size = (g_descriptor.num_targets + NR_TASKLETS - 1) / NR_TASKLETS;
                 uint32_t start_target_idx = me() * chunk_size;
                 uint32_t end_target_idx = start_target_idx + chunk_size;
@@ -344,7 +344,7 @@ int main() {
                     mutex_lock(g_output_mutex);
                     if (!g_shared.transaction_aborted && g_shared.total_mram_hits_written + 2 <= max_results) {
                         __dma_aligned KmerDoubleHit sentinel_hits[2];
-                        sentinel_hits[0].target_id = KMER_RESULT_SENTINEL_TARGET;
+                        sentinel_hits[0].target_id = KMER_RESULT_SENTINEL;
                         sentinel_hits[0].diagonal = 0;
                         sentinel_hits[0].padding = 0;
                         sentinel_hits[1].target_id = KMER_TARGET_ID_PADDING;

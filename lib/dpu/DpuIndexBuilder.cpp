@@ -113,7 +113,6 @@ DpuIndexBuffer DpuIndexBuilder::build(
     
     if (buffer.entries.size() % 2 != 0) buffer.entries.push_back({0xFFFF, 0xFFFF});
 
-    // Flatten buckets with 32-bit overflow indices
     std::vector<KmerBucket> final_buckets(NUM_BUCKETS);
     
     for (auto& b : final_buckets) {
@@ -180,7 +179,7 @@ DpuIndexBuffer DpuIndexBuilder::build(
     std::memcpy(buffer.buckets.data(), final_buckets.data(), total_bytes);
     buffer.num_buckets = static_cast<uint32_t>(final_buckets.size());
     
-    // --- STATS CALCULATION (Exact Definitions) ---
+    // 2. Detailed Stats (Index)
     size_t overflow_count = 0;
     size_t total_chain_depth = 0;
     size_t max_chain_depth = 0;
@@ -194,7 +193,7 @@ DpuIndexBuffer DpuIndexBuilder::build(
         uint32_t curr = final_buckets[i].next_idx;
         while (curr != CHAIN_END_IDX) {
             depth++;
-            if (curr >= final_buckets.size()) break; // Safety
+            if (curr >= final_buckets.size()) break;
             curr = final_buckets[curr].next_idx;
         }
         total_chain_depth += depth;

@@ -180,8 +180,8 @@ std::vector<std::vector<uint32_t>> DpuDbSplitter::splitDatabase(
     uint32_t max_seqs_per_dpu
 ) {
     // This function exists only to ensure compilation/linking for existing calls.
-    // Forwards to the Greedy strategy to maintain legacy behavior.
-    return splitDatabaseGreedyKmer(tdbr, num_dpus, mram_limit_bytes, max_seqs_per_dpu);
+    // Forwards to the Balanced strategy to maintain legacy behavior.
+    return splitDatabaseBalancedKmer(tdbr, num_dpus, mram_limit_bytes, max_seqs_per_dpu);
 }
 
 } // namespace mmseqs::dpu

@@ -57,8 +57,8 @@ extern "C" {
 
 #define KMER_TARGET_ID_PADDING 0xFFFE
 
-#define KMER_PACKET_SENTINEL_KEY     0xFFFFFFFF   /* End-of-query marker in packet stream */
-#define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
+#define KMER_PACKET_SENTINEL    0xFFFFFFFF   /* End-of-query marker in packet stream */
+#define KMER_RESULT_SENTINEL    0xFFFFFFFF   /* End-of-query marker in result stream */
 
 /* Fixed MRAM Overhead Calculation */
 #define DPU_INDEX_BUCKETS_SIZE   (NUM_BUCKETS * BUCKET_SIZE)    /* 16 MB */
@@ -81,7 +81,7 @@ static inline uint32_t dpu_compute_hash(uint32_t k) {
     k ^= k >> 13;
     k *= 0xc2b2ae35;
     k ^= k >> 16;
-    return k & (NUM_BUCKETS - 1); /* Modulo 65536 */
+    return k & (NUM_BUCKETS - 1);
 }
 
 /* ==================== BUCKET DATA STRUCTURES ==================== */
@@ -168,13 +168,13 @@ typedef struct {
     uint32_t num_index_entries;     /* Total index entries */
     
     /* MRAM Offsets */
+    uint32_t checkpoint_offset;     /* Checkpoint for resuming after overflow */
     uint32_t state_table_offset;    /* State table for diagonal tracking (MRAM backing store) */
     uint32_t query_packets_offset;  /* Query packet buffer */
     uint32_t buckets_offset;        /* Start of bucket array */
     uint32_t index_entries_offset;  /* Start of entries array */
     uint32_t results_offset;        /* Start of results buffer */
     uint32_t results_buffer_size;   /* Actual output buffer size */
-    uint32_t checkpoint_offset;     /* Checkpoint for resuming after overflow */
     
     uint32_t reserved[1];           /* Padding for 8-byte alignment */
 } __attribute__((packed)) KmerBatchDescriptor;
@@ -192,7 +192,6 @@ DPU_STATIC_ASSERT(sizeof(KmerBatchDescriptor) % 8 == 0, "KmerBatchDescriptor mus
     KMER_MIN_OUTPUT_BUFFER_SIZE    \
 )
 
-/* Compile-time check (Safety Net) */
 DPU_STATIC_ASSERT(
     DPU_MRAM_ESTIMATED_USAGE <= DPU_MRAM_TOTAL_SIZE, 
     "CRITICAL: DPU MRAM Usage exceeds 64MB! Reduce MAX_DPU_INDEX_SIZE or Buffers."

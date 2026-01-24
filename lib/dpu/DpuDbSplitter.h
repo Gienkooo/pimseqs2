@@ -44,7 +44,6 @@ private:
         size_t estimated_size;
     };
 
-    // Helper moved inside the class to access private types
     static std::vector<SequenceMetadata> getMetadata(
         DBReader<unsigned int>* tdbr, 
         size_t mram_limit_bytes

@@ -197,8 +197,7 @@ class DpuPrefilterHostPipeline {
       const std::vector<std::vector<uint8_t>>& descriptors,
       uint32_t& out_overflows);
   
-  // Async pipeline helper: sends batch to DPUs and executes kernel
-  std::vector<std::vector<KmerDoubleHit>> processBatchOnDpu(
+  std::vector<std::vector<KmerDoubleHit>> processKmerBatchOnDpu(
       const KmerRunContext& ctx,
       const KmerBatchData& batch,
       const std::vector<DpuIndexBuffer>& wave_indices,
