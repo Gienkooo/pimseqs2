@@ -796,6 +796,7 @@ namespace mmseqs::dpu
         std::vector<std::vector<uint8_t>> descriptors(ctx.num_dpus);
         const uint32_t desc_size = DpuCommunicationManager::alignToMram(sizeof(KmerBatchDescriptor));
 
+        #pragma omp parallel for schedule(dynamic, 1)
         for (uint32_t dpu_id = 0; dpu_id < ctx.num_dpus; ++dpu_id) {
             descriptors[dpu_id].resize(desc_size, 0);
             
