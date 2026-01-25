@@ -335,6 +335,9 @@ namespace mmseqs::dpu
         kernel_mgr_.loadKernel(DpuKernelManager::KernelType::KMER);
         LOG_TRACE("Loaded KMER kernel");
 
+        const auto rank_sets = dpu_comm_.getRankSets();
+        DpuGroupManager group_mgr(rank_sets);
+
         // Setup parameters
         int ksize = par.kmerSize;
 
@@ -649,7 +652,7 @@ namespace mmseqs::dpu
                 pendingQueryIndices = batches[current].query_indices;
                 pendingDpuResult = std::async(std::launch::async, [&, current]() {
                     uint32_t batch_overflows = 0;
-                    auto res = processKmerBatchOnDpu(ctx, batches[current], wave_indices, splits, wave_start, wave_size, batch_overflows);
+                    auto res = processKmerBatchOnDpu(ctx, batches[current], wave_indices, splits, wave_start, wave_size, batch_overflows, group_mgr);
                     return std::make_pair(res, batch_overflows);
                 });
                 totalBatchTransfers++;
@@ -772,6 +775,11 @@ namespace mmseqs::dpu
             LOG_RESULTS("  Avg packets per batch:        " << (totalPacketsSent / totalBatchTransfers));
             LOG_RESULTS("  Overflow rate:                " << (100.0 * totalOverflowEvents / totalBatchTransfers) << "%");
         }
+
+        if (dpu_comm_.isProfilingEnabled()) {
+            dpu_comm_.dumpProfile("kmer_prefilter");
+            dpu_comm_.resetProfile();
+        }
     }
 
     // ============================================================================
@@ -836,7 +844,8 @@ namespace mmseqs::dpu
     std::vector<std::vector<KmerDoubleHit>> DpuPrefilterHostPipeline::executeKmerBatchWithOverflow(
         const KmerRunContext& ctx,
         const std::vector<std::vector<uint8_t>>& descriptors,
-        uint32_t& out_overflows)
+        uint32_t& out_overflows,
+        DpuGroupManager& group_mgr)
     {
         std::vector<std::vector<KmerDoubleHit>> accumulated_results(ctx.num_dpus);
         bool all_dpus_complete = false;
@@ -848,7 +857,12 @@ namespace mmseqs::dpu
         dpu_comm_.scatterDataParallel(descriptors, 0);
 
         while (!all_dpus_complete) {
-            dpu_comm_.executeKernels(); // Block until done
+            for (uint32_t g = 0; g < group_mgr.getNumGroups(); ++g) {
+                DpuGroupManager::GroupContext dummy_ctx = {};
+                group_mgr.launchGroupAsync(g, dummy_ctx);
+            }
+            
+            group_mgr.syncAllGroups();
             all_dpus_complete = true;   // Assume done until overflow seen
 
             for (uint32_t dpu_id = 0; dpu_id < ctx.num_dpus; ++dpu_id) {
@@ -897,11 +911,6 @@ namespace mmseqs::dpu
         }
 
         LOG_TRACE("Batch complete after " << overflow_retries << " iterations");
-        
-        if (dpu_comm_.isProfilingEnabled()) {
-            dpu_comm_.dumpProfile("kmer_prefilter");
-            dpu_comm_.resetProfile();
-        }
 
         return accumulated_results;
     }
@@ -913,7 +922,8 @@ namespace mmseqs::dpu
         const std::vector<std::vector<uint32_t>>& splits,
         size_t wave_start,
         size_t wave_size,
-        uint32_t& out_overflows)
+        uint32_t& out_overflows,
+        DpuGroupManager& group_mgr)
     {
         if (!batch.valid || batch.packet_count == 0) {
             return std::vector<std::vector<KmerDoubleHit>>(ctx.num_dpus);
@@ -927,7 +937,7 @@ namespace mmseqs::dpu
         dpu_comm_.broadcastData(batch.packets.data(), packets_size, ctx.QUERY_PACKETS_OFF);
         
         // 3. Execute kernel and gather results (handles overflow internally, includes descriptor scatter)
-        auto results = executeKmerBatchWithOverflow(ctx, descriptors, out_overflows);
+        auto results = executeKmerBatchWithOverflow(ctx, descriptors, out_overflows, group_mgr);
           
         return results;
     }
