@@ -154,7 +154,7 @@ namespace mmseqs::dpu {
                 return {};
             }
             
-            seqs.push_back({key, len, size});
+            seqs.emplace_back(SequenceMetadata{static_cast<uint32_t>(i), key, len, size});
             total_db_bytes += size;
             if (len < min_seq_len) min_seq_len = len;
             if (len > max_seq_len) max_seq_len = len;
@@ -168,7 +168,8 @@ namespace mmseqs::dpu {
         // 3. Use heap-based LPT with multi-wave support
         // When all DPUs in current wave are full, create a new wave
         struct DpuState {
-            size_t total_bytes = 0;
+            size_t total_bytes = 0;      // MRAM bytes used
+            uint64_t total_residues = 0; // Workload proxy (sum of target lengths)
             size_t seq_count = 0;
             std::vector<uint32_t> sequence_ids;
         };
@@ -177,18 +178,20 @@ namespace mmseqs::dpu {
         std::vector<std::vector<DpuState>> waves;
         waves.emplace_back(num_dpus);  // First wave
         
-        // Min-heap tracks (load, wave_idx, dpu_idx) - prioritize least loaded DPU
-        auto cmp = [](const std::tuple<size_t, uint32_t, uint32_t>& a, 
-                      const std::tuple<size_t, uint32_t, uint32_t>& b) {
-            return std::get<0>(a) > std::get<0>(b); // Min-heap by load
+        // Min-heap tracks (total_residues, total_bytes, wave_idx, dpu_idx)
+        // Prioritize the DPU with the fewest residues (workload), tie-break by bytes
+        auto cmp = [](const std::tuple<uint64_t, size_t, uint32_t, uint32_t>& a,
+                      const std::tuple<uint64_t, size_t, uint32_t, uint32_t>& b) {
+            if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) > std::get<0>(b);
+            return std::get<1>(a) > std::get<1>(b);
         };
-        std::priority_queue<std::tuple<size_t, uint32_t, uint32_t>,
-                           std::vector<std::tuple<size_t, uint32_t, uint32_t>>,
+        std::priority_queue<std::tuple<uint64_t, size_t, uint32_t, uint32_t>,
+                           std::vector<std::tuple<uint64_t, size_t, uint32_t, uint32_t>>,
                            decltype(cmp)> heap(cmp);
         
         // Initialize heap with first wave
         for (uint32_t d = 0; d < num_dpus; ++d) {
-            heap.push({0, 0, d});
+            heap.push({0ull, 0ull, 0u, d});
         }
 
         // 4. Assign sequences using heap-based LPT (O(n log n))
@@ -196,35 +199,35 @@ namespace mmseqs::dpu {
         
         for (const auto& seq : seqs) {
             bool placed = false;
-            std::vector<std::tuple<size_t, uint32_t, uint32_t>> temp_storage;
+            std::vector<std::tuple<uint64_t, size_t, uint32_t, uint32_t>> temp_storage;
             
             while (!heap.empty()) {
-                auto [load, wave_idx, dpu_idx] = heap.top();
+                auto [res_load, byte_load, wave_idx, dpu_idx] = heap.top();
                 heap.pop();
                 
                 DpuState& state = waves[wave_idx][dpu_idx];
-                bool size_ok = (state.total_bytes + seq.estimated_size) <= mram_limit_bytes;
+                // Reserve 8 bytes once for chunk-level padding/canary
+                bool size_ok = (state.total_bytes + seq.estimated_size) <= (mram_limit_bytes > 8 ? (mram_limit_bytes - 8) : 0);
                 bool count_ok = (state.seq_count + 1) <= max_seqs_per_dpu;
                 
                 if (size_ok && count_ok) {
                     // Assign to this DPU
-                    state.sequence_ids.push_back(seq.db_key);
+                    state.sequence_ids.push_back(seq.seq_idx);
                     state.total_bytes += seq.estimated_size;
+                    state.total_residues += seq.length;
                     state.seq_count++;
                     
-                    // Push back with updated load
-                    heap.push({state.total_bytes, wave_idx, dpu_idx});
+                    // Push back with updated workload and bytes
+                    heap.push({state.total_residues, state.total_bytes, wave_idx, dpu_idx});
                     placed = true;
                     assigned++;
                     
                     // Restore temporarily removed entries
-                    for (auto& p : temp_storage) {
-                        heap.push(p);
-                    }
+                    for (auto& p : temp_storage) heap.push(p);
                     break;
                 } else {
                     // This DPU is full, try next
-                    temp_storage.push_back({load, wave_idx, dpu_idx});
+                    temp_storage.push_back({res_load, byte_load, wave_idx, dpu_idx});
                 }
             }
             
@@ -235,7 +238,7 @@ namespace mmseqs::dpu {
                 
                 // Add new wave's DPUs to heap
                 for (uint32_t d = 0; d < num_dpus; ++d) {
-                    heap.push({0, new_wave_idx, d});
+                    heap.push({0ull, 0ull, new_wave_idx, d});
                 }
                 
                 // Restore temporarily removed entries
@@ -245,12 +248,13 @@ namespace mmseqs::dpu {
                 
                 // Place in first DPU of new wave
                 DpuState& state = waves[new_wave_idx][0];
-                state.sequence_ids.push_back(seq.db_key);
+                state.sequence_ids.push_back(seq.seq_idx);
                 state.total_bytes += seq.estimated_size;
+                state.total_residues += seq.length;
                 state.seq_count++;
                 
                 // Update heap entry for this DPU
-                heap.push({state.total_bytes, new_wave_idx, 0});
+                heap.push({state.total_residues, state.total_bytes, new_wave_idx, 0});
                 assigned++;
             }
         }
@@ -264,6 +268,8 @@ namespace mmseqs::dpu {
         uint32_t active_chunks = 0;
         size_t min_seqs = SIZE_MAX;
         size_t max_seqs = 0;
+        uint64_t min_residues = UINT64_MAX;
+        uint64_t max_residues = 0;
         
         for (auto& wave : waves) {
             for (auto& state : wave) {
@@ -274,6 +280,8 @@ namespace mmseqs::dpu {
                     if (state.total_bytes > max_load) max_load = state.total_bytes;
                     if (state.seq_count < min_seqs) min_seqs = state.seq_count;
                     if (state.seq_count > max_seqs) max_seqs = state.seq_count;
+                    if (state.total_residues < min_residues) min_residues = state.total_residues;
+                    if (state.total_residues > max_residues) max_residues = state.total_residues;
                     active_chunks++;
                 }
             }
@@ -295,8 +303,9 @@ namespace mmseqs::dpu {
         Debug(Debug::INFO) << "[DPU]   Waves: " << num_waves_count << "\n";
         Debug(Debug::INFO) << "[DPU]   Assigned: " << assigned << ", Skipped: " << (total_seqs - assigned) << "\n";
         Debug(Debug::INFO) << "[DPU]   Seqs/DPU: [" << min_seqs << ".." << max_seqs << "]\n";
+        Debug(Debug::INFO) << "[DPU]   Residues/DPU: [" << min_residues << ".." << max_residues << "]\n";
         Debug(Debug::INFO) << "[DPU]   Load Balance: Min=" << min_load/1024 
-                           << "KB Max=" << max_load/1024 << "KB";
+                   << "KB Max=" << max_load/1024 << "KB";
         if (max_load > 0) {
             double imbalance = 100.0 * (max_load - min_load) / max_load;
             Debug(Debug::INFO) << " (imbalance=" << imbalance << "%)";
