@@ -2,6 +2,7 @@
 
 // Standard Libraries
 #include <cstring>
+#include <cstdio>
 #include <unistd.h>
 #include <limits.h>
 #include <limits>
@@ -857,6 +858,8 @@ namespace mmseqs::dpu
         dpu_comm_.broadcastData(&zero_ckpt, sizeof(KmerCheckpoint), ctx.CHECKPOINT_OFF);
         dpu_comm_.scatterDataParallel(descriptors, 0);
 
+        auto start_accel = std::chrono::steady_clock::now();
+
         while (!all_dpus_complete) {
             for (uint32_t g = 0; g < group_mgr.getNumGroups(); ++g) {
                 DpuGroupManager::GroupContext dummy_ctx = {};
@@ -910,6 +913,11 @@ namespace mmseqs::dpu
             }
             overflow_retries++;
         }
+
+        auto end_accel = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = end_accel - start_accel;
+        
+        printf("[ONLY_EXEC] DPU_Count=%d Accelerator_Time_s=%.4f\n   (remember to add scatter time to this)", ctx.num_dpus, elapsed.count());
         
         if (overflow_retries > 1) {
             out_overflows += (overflow_retries - 1);
