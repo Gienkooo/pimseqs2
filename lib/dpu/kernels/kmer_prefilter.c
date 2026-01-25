@@ -66,13 +66,6 @@ __mram_ptr KmerDiagonalStateEntry* mram_state_table;
 /**
  * Look up a k-mer in the hash index, returning offset and count if found.
  * Handles chained overflow buckets.
- * 
- * @param kmer_idx    K-mer value to look up
- * @param bucket_idx  Pre-computed hash bucket index
- * @param out_offset  [out] Start offset in entries array
- * @param out_count   [out] Number of entries for this k-mer
- * @param bucket_cache 8-byte aligned WRAM buffer for bucket reads (256 bytes)
- * @return true if k-mer found, false otherwise
  */
 static bool lookup_bucket(uint32_t kmer_idx, uint16_t bucket_idx,
                           uint32_t* out_offset, uint32_t* out_count,
@@ -102,24 +95,6 @@ static bool lookup_bucket(uint32_t kmer_idx, uint16_t bucket_idx,
 
 /**
  * Reads 4-byte KmerIndexEntry structs from MRAM with proper 8-byte alignment.
- * 
- * The DPU MRAM requires 8-byte aligned addresses for all transfers.
- * KmerIndexEntry is only 4 bytes, so when start_idx is odd, the byte
- * address would end in 0x4, violating alignment requirements.
- * 
- * This function:
- * 1. Calculates the 8-byte aligned read address
- * 2. Reads data including any padding bytes needed for alignment
- * 3. Returns an offset (0 or 1) indicating where valid data starts
- * 
- * OPTIMIZATION: Instead of shifting data (expensive), we return an offset.
- * The caller uses pointer arithmetic: valid_entries = &buffer[offset]
- * 
- * @param mram_base  Pointer to the start of the entries array in MRAM
- * @param start_idx  Index of the first entry to read (0-based)
- * @param count      Number of entries to read
- * @param wram_dst   Destination WRAM buffer (must have space for count+2 entries)
- * @return           Offset where valid data starts: 0 (aligned) or 1 (misaligned by 4)
  */
 static uint32_t read_entries_aligned(__mram_ptr KmerIndexEntry* mram_base, 
                                      uint32_t start_idx, 
@@ -153,24 +128,17 @@ static uint32_t read_entries_aligned(__mram_ptr KmerIndexEntry* mram_base,
 
 /**
  * Parallel MRAM read using all active tasklets.
- * Splits 'size' into (NR_TASKLETS) chunks.
- * PRECONDITION: 'size' and 'src/dst' addresses must be 8-byte aligned.
- * NOTE: Caller must ensure a barrier exists before/after if needed.
  */
 static void mram_read_parallel(__mram_ptr const void* src, void* dst, uint32_t size) {
-    // 1. Calculate chunk size per tasklet (rounded up to 8 bytes for MRAM alignment)
     uint32_t chunk_size = (size + NR_TASKLETS - 1) / NR_TASKLETS;
     chunk_size = ALIGN8(chunk_size);
 
-    // 2. Calculate offset
     uint32_t offset = me() * chunk_size;
 
-    // 3. Perform copy if within bounds
     if (offset < size) {
         uint32_t len = size - offset;
         if (len > chunk_size) len = chunk_size;
         
-        // Reuse safe read for the actual transfer
         mram_read_safe((__mram_ptr uint8_t*)src + offset, (uint8_t*)dst + offset, len);
     }
 }
@@ -290,12 +258,12 @@ int main() {
     // Main processing loop - each iteration is one transaction batch
     while (1) {
         uint32_t batch_start_packet;
-        uint32_t batch_start_hits;
+        // uint32_t batch_start_hits;
         uint32_t tasklet_hit_count = 0;
         
         if (me() == 0) {
             batch_start_packet = g_shared.current_packet_idx;
-            batch_start_hits = g_shared.total_mram_hits_written;
+            // batch_start_hits = g_shared.total_mram_hits_written; 
             g_shared.transaction_aborted = 0;
         }
         barrier_wait(&g_barrier);
@@ -472,8 +440,20 @@ int main() {
         // Transaction Commit or Rollback 
         // 1. LEADER: Update Global State / Headers / Checkpoints
         if (me() == 0) {
+            
+            // Advance packet counter regardless of success/fail to keep loop logic simple.
+            // In case of overflow, the loop will break immediately after this block.
+            g_shared.current_packet_idx = batch_start_packet + TRANSACTION_BATCH_SIZE;
+            if (g_shared.current_packet_idx > g_descriptor.num_query_packets) {
+                g_shared.current_packet_idx = g_descriptor.num_query_packets;
+            }
+
+            /* OPTIMIZATION: Overflow Handling Logic Disabled 
+               We do not rollback or write intermediate checkpoints to save bandwidth.
+            */
+            #if 0
             if (g_shared.transaction_aborted) {
-                // --- ROLLBACK LOGIC ---
+                // --- ROLLBACK LOGIC DISABLED ---
                 g_shared.total_mram_hits_written = batch_start_hits;
                 if (g_shared.overflow_occurred != 2) g_shared.overflow_occurred = 1;
                 
@@ -485,11 +465,7 @@ int main() {
                 mram_write(&result_header, hdr_ptr, sizeof(KmerResultHeader));
             } 
             else {
-                g_shared.current_packet_idx = batch_start_packet + TRANSACTION_BATCH_SIZE;
-                if (g_shared.current_packet_idx > g_descriptor.num_query_packets) {
-                    g_shared.current_packet_idx = g_descriptor.num_query_packets;
-                }
-                
+                // --- CHECKPOINT WRITE DISABLED ---
                 __dma_aligned KmerCheckpoint checkpoint;
                 checkpoint.packet_idx = g_shared.current_packet_idx;
                 checkpoint.entry_idx = 0;
@@ -497,9 +473,11 @@ int main() {
                 checkpoint.valid = 1;
                 mram_write(&checkpoint, mram_checkpoint, sizeof(KmerCheckpoint));
             }
+            #endif
         }
         barrier_wait(&g_barrier);
         
+        #if 0
         if (!g_shared.transaction_aborted) {
             uint32_t state_size = DPU_ALIGN_SIZE(g_descriptor.num_targets * sizeof(KmerDiagonalStateEntry));
             if (state_size > MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)) {
@@ -508,6 +486,7 @@ int main() {
 
             mram_write_parallel(wram_state_table, mram_state_table, state_size);
         }
+        #endif
         barrier_wait(&g_barrier);
         
         if (g_shared.overflow_occurred) {
@@ -515,15 +494,20 @@ int main() {
         }
     }
     
-    // PHASE 3: Finalize processing if no overflow occurred
-    if (me() == 0 && !g_shared.overflow_occurred) {
+    // PHASE 3: Finalize processing
+    if (me() == 0) {
+        // Write header if successful OR if overflow occurred (to notify host)
+        // Original logic was "&& !g_shared.overflow_occurred", but since we disabled 
+        // intermediate overflow reporting, we must write the final header state here.
+        
         __dma_aligned KmerResultHeader result_header;
         result_header.total_hits = g_shared.total_mram_hits_written;
-        result_header.overflow = 0;
+        result_header.overflow = g_shared.overflow_occurred; // Reports 0, 1, or 2
         
         __mram_ptr KmerResultHeader* hdr_ptr = (__mram_ptr KmerResultHeader*)(mram_base + g_descriptor.results_offset);
         mram_write(&result_header, hdr_ptr, sizeof(KmerResultHeader));
         
+        // Reset Checkpoint (Finish)
         __dma_aligned KmerCheckpoint checkpoint;
         checkpoint.packet_idx = g_descriptor.num_query_packets;
         checkpoint.entry_idx = 0;
