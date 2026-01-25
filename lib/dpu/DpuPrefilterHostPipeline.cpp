@@ -861,8 +861,12 @@ namespace mmseqs::dpu
                 DpuGroupManager::GroupContext dummy_ctx = {};
                 group_mgr.launchGroupAsync(g, dummy_ctx);
             }
-            
+
             group_mgr.syncAllGroups();
+            for (uint32_t g = 0; g < group_mgr.getNumGroups(); ++g) {
+                group_mgr.releaseGroup(g);
+            }
+
             all_dpus_complete = true;   // Assume done until overflow seen
 
             for (uint32_t dpu_id = 0; dpu_id < ctx.num_dpus; ++dpu_id) {
