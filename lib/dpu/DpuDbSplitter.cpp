@@ -123,6 +123,7 @@ namespace mmseqs::dpu {
 
     // ============================================================================
     // distributeForParallelism: LPT algorithm for maximum DPU utilization
+    // Now supports MULTIPLE WAVES when database exceeds single-wave capacity
     // ============================================================================
     std::vector<std::vector<uint32_t>> DpuDbSplitter::distributeForParallelism(
         DBReader<unsigned int>* tdbr,
@@ -164,41 +165,44 @@ namespace mmseqs::dpu {
             return a.length > b.length;
         });
 
-        // 3. Initialize per-DPU state
+        // 3. Use heap-based LPT with multi-wave support
+        // When all DPUs in current wave are full, create a new wave
         struct DpuState {
             size_t total_bytes = 0;
             size_t seq_count = 0;
             std::vector<uint32_t> sequence_ids;
         };
-        std::vector<DpuState> dpu_states(num_dpus);
-
-        // 4. Min-heap for LPT assignment (dpu with least load gets next job)
-        // pair: (current_load, dpu_id)
-        auto cmp = [](const std::pair<size_t, uint32_t>& a, const std::pair<size_t, uint32_t>& b) {
-            return a.first > b.first; // Min-heap
+        
+        // Wave-based storage: each wave has num_dpus DPU states
+        std::vector<std::vector<DpuState>> waves;
+        waves.emplace_back(num_dpus);  // First wave
+        
+        // Min-heap tracks (load, wave_idx, dpu_idx) - prioritize least loaded DPU
+        auto cmp = [](const std::tuple<size_t, uint32_t, uint32_t>& a, 
+                      const std::tuple<size_t, uint32_t, uint32_t>& b) {
+            return std::get<0>(a) > std::get<0>(b); // Min-heap by load
         };
-        std::priority_queue<std::pair<size_t, uint32_t>, 
-                           std::vector<std::pair<size_t, uint32_t>>,
+        std::priority_queue<std::tuple<size_t, uint32_t, uint32_t>,
+                           std::vector<std::tuple<size_t, uint32_t, uint32_t>>,
                            decltype(cmp)> heap(cmp);
-
+        
+        // Initialize heap with first wave
         for (uint32_t d = 0; d < num_dpus; ++d) {
-            heap.push({0, d});
+            heap.push({0, 0, d});
         }
 
-        // 5. Assign sequences using LPT
+        // 4. Assign sequences using heap-based LPT (O(n log n))
         size_t assigned = 0;
-        size_t skipped = 0;
         
         for (const auto& seq : seqs) {
-            // Find DPU with minimum load that can accept this sequence
             bool placed = false;
-            std::vector<std::pair<size_t, uint32_t>> temp_storage;
+            std::vector<std::tuple<size_t, uint32_t, uint32_t>> temp_storage;
             
             while (!heap.empty()) {
-                auto [load, dpu_id] = heap.top();
+                auto [load, wave_idx, dpu_idx] = heap.top();
                 heap.pop();
                 
-                DpuState& state = dpu_states[dpu_id];
+                DpuState& state = waves[wave_idx][dpu_idx];
                 bool size_ok = (state.total_bytes + seq.estimated_size) <= mram_limit_bytes;
                 bool count_ok = (state.seq_count + 1) <= max_seqs_per_dpu;
                 
@@ -209,64 +213,87 @@ namespace mmseqs::dpu {
                     state.seq_count++;
                     
                     // Push back with updated load
-                    heap.push({state.total_bytes, dpu_id});
+                    heap.push({state.total_bytes, wave_idx, dpu_idx});
                     placed = true;
                     assigned++;
                     
-                    // Re-add any DPUs we temporarily removed
+                    // Restore temporarily removed entries
                     for (auto& p : temp_storage) {
                         heap.push(p);
                     }
                     break;
                 } else {
                     // This DPU is full, try next
-                    temp_storage.push_back({load, dpu_id});
+                    temp_storage.push_back({load, wave_idx, dpu_idx});
                 }
             }
             
             if (!placed) {
-                // All DPUs are at capacity - should not happen with proper MRAM limits
-                Debug(Debug::WARNING) << "[DPU] Could not place sequence " << seq.db_key 
-                                      << " (len=" << seq.length << ") - all DPUs full\n";
-                skipped++;
-                // Restore heap
+                // All DPUs in all waves are full - create new wave
+                uint32_t new_wave_idx = waves.size();
+                waves.emplace_back(num_dpus);
+                
+                // Add new wave's DPUs to heap
+                for (uint32_t d = 0; d < num_dpus; ++d) {
+                    heap.push({0, new_wave_idx, d});
+                }
+                
+                // Restore temporarily removed entries
                 for (auto& p : temp_storage) {
                     heap.push(p);
                 }
+                
+                // Place in first DPU of new wave
+                DpuState& state = waves[new_wave_idx][0];
+                state.sequence_ids.push_back(seq.db_key);
+                state.total_bytes += seq.estimated_size;
+                state.seq_count++;
+                
+                // Update heap entry for this DPU
+                heap.push({state.total_bytes, new_wave_idx, 0});
+                assigned++;
             }
         }
 
-        // 6. Build result (only include non-empty DPUs)
+        // 5. Build result (flatten waves, only include non-empty chunks)
         std::vector<std::vector<uint32_t>> result;
-        result.reserve(num_dpus);
+        result.reserve(waves.size() * num_dpus);
         
         size_t min_load = SIZE_MAX;
         size_t max_load = 0;
-        uint32_t active_dpus = 0;
+        uint32_t active_chunks = 0;
         size_t min_seqs = SIZE_MAX;
         size_t max_seqs = 0;
         
-        for (uint32_t d = 0; d < num_dpus; ++d) {
-            if (!dpu_states[d].sequence_ids.empty()) {
-                result.push_back(std::move(dpu_states[d].sequence_ids));
-                size_t bytes = dpu_states[d].total_bytes;
-                size_t count = dpu_states[d].seq_count;
-                
-                if (bytes < min_load) min_load = bytes;
-                if (bytes > max_load) max_load = bytes;
-                if (count < min_seqs) min_seqs = count;
-                if (count > max_seqs) max_seqs = count;
-                active_dpus++;
+        for (auto& wave : waves) {
+            for (auto& state : wave) {
+                if (!state.sequence_ids.empty()) {
+                    result.push_back(std::move(state.sequence_ids));
+                    
+                    if (state.total_bytes < min_load) min_load = state.total_bytes;
+                    if (state.total_bytes > max_load) max_load = state.total_bytes;
+                    if (state.seq_count < min_seqs) min_seqs = state.seq_count;
+                    if (state.seq_count > max_seqs) max_seqs = state.seq_count;
+                    active_chunks++;
+                }
             }
         }
+        
+        if (active_chunks == 0) {
+            min_load = 0;
+            min_seqs = 0;
+        }
 
-        // 7. Enhanced diagnostics
+        size_t num_waves_count = waves.size();
+
+        // 6. Enhanced diagnostics
         Debug(Debug::INFO) << "[DPU] === Parallel Distribution Summary ===\n";
         Debug(Debug::INFO) << "[DPU]   Input: " << total_seqs << " sequences, " 
                            << total_db_bytes/1024 << "KB total\n";
         Debug(Debug::INFO) << "[DPU]   Seq lengths: [" << min_seq_len << ".." << max_seq_len << "]\n";
-        Debug(Debug::INFO) << "[DPU]   Available DPUs: " << num_dpus << ", Active: " << active_dpus << "\n";
-        Debug(Debug::INFO) << "[DPU]   Assigned: " << assigned << ", Skipped: " << skipped << "\n";
+        Debug(Debug::INFO) << "[DPU]   Available DPUs: " << num_dpus << ", Active: " << active_chunks << "\n";
+        Debug(Debug::INFO) << "[DPU]   Waves: " << num_waves_count << "\n";
+        Debug(Debug::INFO) << "[DPU]   Assigned: " << assigned << ", Skipped: " << (total_seqs - assigned) << "\n";
         Debug(Debug::INFO) << "[DPU]   Seqs/DPU: [" << min_seqs << ".." << max_seqs << "]\n";
         Debug(Debug::INFO) << "[DPU]   Load Balance: Min=" << min_load/1024 
                            << "KB Max=" << max_load/1024 << "KB";

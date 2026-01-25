@@ -115,7 +115,8 @@ class DpuPrefilterHostPipeline {
       EvalueComputation* evaluer,
       bool sameDB,
       QueryMatcherTaxonomyHook* taxonomyHook,
-      std::vector<std::vector<Matcher::result_t>>& out_results);
+      std::vector<std::vector<Matcher::result_t>>& out_results,
+      bool is_gpu);
 
   bool canFitAtLeastOneTarget(
       uint32_t num_dpus,

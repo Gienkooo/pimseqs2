@@ -548,6 +548,7 @@ void DpuCommunicationManager::resetProfile() {
 void DpuCommunicationManager::dumpProfile(const char* tag) const {
   if (!profile_enabled_) return;
   static const char* kNames[] = {
+    // DPU Communication
     "broadcast",
     "scatter_single",
     "scatter_parallel",
@@ -557,19 +558,89 @@ void DpuCommunicationManager::dumpProfile(const char* tag) const {
     "launch_sync",
     "launch_async",
     "wait_sync",
-    "wait_async"
+    "wait_async",
+    // Host Processing
+    "host_build_query_batch",
+    "host_build_target_batch",
+    "host_process_hits",
+    "host_result_write",
+    "host_dispatcher_wait",
+    "host_total_batch"
   };
 
-  Debug(Debug::INFO) << "[DPU PROFILE] " << (tag ? tag : "comm") << "\n";
-  for (size_t i = 0; i < static_cast<size_t>(ProfileSlot::Count); ++i) {
+  // Calculate totals for summary
+  double total_dpu_comm_ms = 0;
+  double total_host_proc_ms = 0;
+  
+  for (size_t i = 0; i <= static_cast<size_t>(ProfileSlot::WaitAsync); ++i) {
+    total_dpu_comm_ms += profile_[i].total_ms;
+  }
+  for (size_t i = static_cast<size_t>(ProfileSlot::HostBuildQueryBatch); 
+       i < static_cast<size_t>(ProfileSlot::HostTotalBatch); ++i) {
+    total_host_proc_ms += profile_[i].total_ms;
+  }
+
+  char buf[512];
+  
+  Debug(Debug::INFO) << "[DPU PROFILE] === " << (tag ? tag : "summary") << " ===\n";
+  
+  // DPU Communication section
+  Debug(Debug::INFO) << "[DPU PROFILE] -- DPU Communication --\n";
+  for (size_t i = 0; i <= static_cast<size_t>(ProfileSlot::WaitAsync); ++i) {
     const auto &e = profile_[i];
     if (e.count == 0) continue;
     double avg = e.total_ms / static_cast<double>(e.count);
     double mb = e.bytes / (1024.0 * 1024.0);
-    Debug(Debug::INFO) << "  " << kNames[i] << " count=" << static_cast<unsigned long long>(e.count)
-                       << " total=" << e.total_ms << " ms avg=" << avg << " ms max=" << e.max_ms
-                       << " ms bytes=" << mb << " MB\n";
+    snprintf(buf, sizeof(buf), "[DPU PROFILE]   %s: count=%llu total=%.1fms avg=%.2fms max=%.1fms",
+             kNames[i], (unsigned long long)e.count, e.total_ms, avg, e.max_ms);
+    Debug(Debug::INFO) << buf;
+    if (e.bytes > 0) {
+      snprintf(buf, sizeof(buf), " data=%.2fMB", mb);
+      Debug(Debug::INFO) << buf;
+    }
+    Debug(Debug::INFO) << "\n";
   }
+  
+  // Host Processing section
+  Debug(Debug::INFO) << "[DPU PROFILE] -- Host Processing --\n";
+  for (size_t i = static_cast<size_t>(ProfileSlot::HostBuildQueryBatch); 
+       i < static_cast<size_t>(ProfileSlot::Count); ++i) {
+    const auto &e = profile_[i];
+    if (e.count == 0) continue;
+    double avg = e.total_ms / static_cast<double>(e.count);
+    snprintf(buf, sizeof(buf), "[DPU PROFILE]   %s: count=%llu total=%.1fms avg=%.2fms max=%.1fms",
+             kNames[i], (unsigned long long)e.count, e.total_ms, avg, e.max_ms);
+    Debug(Debug::INFO) << buf;
+    if (e.items > 0) {
+      snprintf(buf, sizeof(buf), " items=%llu", (unsigned long long)e.items);
+      Debug(Debug::INFO) << buf;
+    }
+    if (e.bytes > 0) {
+      double mb = e.bytes / (1024.0 * 1024.0);
+      snprintf(buf, sizeof(buf), " data=%.2fMB", mb);
+      Debug(Debug::INFO) << buf;
+    }
+    Debug(Debug::INFO) << "\n";
+  }
+  
+  // Summary
+  double total_batch_ms = profile_[static_cast<size_t>(ProfileSlot::HostTotalBatch)].total_ms;
+  Debug(Debug::INFO) << "[DPU PROFILE] -- Summary --\n";
+  snprintf(buf, sizeof(buf), "[DPU PROFILE]   DPU comm total: %.1fms (%.1fs)\n", 
+           total_dpu_comm_ms, total_dpu_comm_ms/1000.0);
+  Debug(Debug::INFO) << buf;
+  snprintf(buf, sizeof(buf), "[DPU PROFILE]   Host proc total: %.1fms (%.1fs)\n",
+           total_host_proc_ms, total_host_proc_ms/1000.0);
+  Debug(Debug::INFO) << buf;
+  if (total_batch_ms > 0) {
+    double other_ms = total_batch_ms - total_dpu_comm_ms - total_host_proc_ms;
+    snprintf(buf, sizeof(buf), "[DPU PROFILE]   Batch total: %.1fms (%.1fs)\n",
+             total_batch_ms, total_batch_ms/1000.0);
+    Debug(Debug::INFO) << buf;
+    snprintf(buf, sizeof(buf), "[DPU PROFILE]   Unaccounted: %.1fms\n", other_ms);
+    Debug(Debug::INFO) << buf;
+  }
+  Debug(Debug::INFO) << "[DPU PROFILE] ========================\n";
 }
 
 }  // namespace mmseqs::dpu
