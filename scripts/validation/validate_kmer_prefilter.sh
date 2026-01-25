@@ -22,6 +22,8 @@ DPU_RES="${DPU_TSV:-$OUT_DIR/kmer_dpu.tsv}"
 CPU_DB="$OUT_DIR/kmer_cpu_db"
 DPU_DB="$OUT_DIR/kmer_dpu_db"
 DPU_LOG="$OUT_DIR/kmer_dpu.log"
+CPU_DIAG="$OUT_DIR/kmer_cpu_diag.log"
+DPU_DIAG="$OUT_DIR/kmer_dpu_diag.log"
 
 # Scripts
 COMPARE_SCRIPT="$SCRIPT_DIR/compare_results.py"
@@ -41,6 +43,10 @@ log "Running K-mer Prefilter on CPU..."
     --exact-kmer-matching "$EXACT_KMER_MATCHING" \
     -s "$SENSITIVITY" \
     -k "$KMER" \
+    --mask 0 \
+    --mask-lower-case 0 \
+    --mask-n-repeat 0 \
+    --max-seqs 1000000 \
     --spaced-kmer-mode 0 \
     --spaced-kmer-pattern "$MASK" \
     --diag-score 0 \
@@ -53,10 +59,13 @@ fi
 
 # 3. Run DPU
 log "Running K-mer Prefilter on DPU..."
-"$MMSEQS_BIN" prefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
+DPU_PROFILE=1 "$MMSEQS_BIN" prefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
     --exact-kmer-matching "$EXACT_KMER_MATCHING" \
     -s "$SENSITIVITY" \
     -k "$KMER" \
+    --mask 0 \
+    --mask-lower-case 0 \
+    --mask-n-repeat 0 \
     --spaced-kmer-mode 0 \
     --spaced-kmer-pattern "$MASK" \
     --dpu 1 \
@@ -94,10 +103,10 @@ fi
                 --target "$TARGET_FASTA" \
                 --tsv "$CPU_RES" \
                 --mask "$MASK" \
-                --log "cpu_diag_check.log" 2>&1)
+                --log "$CPU_DIAG" 2>&1)
             
             log "CPU Check Summary: $CPU_FP"
-            log "Detailed logs written to: cpu_diag_check.log"
+            log "Detailed logs written to: $CPU_DIAG"
 
             # DPU Check
             DPU_FP=$(python3 "$CHECKER_SCRIPT" \
@@ -105,10 +114,10 @@ fi
                 --target "$TARGET_FASTA" \
                 --tsv "$DPU_RES" \
                 --mask "$MASK" \
-                --log "dpu_diag_check.log" 2>&1)
+                --log "$DPU_DIAG" 2>&1)
                 
             log "DPU Check Summary: $DPU_FP"
-            log "Detailed logs written to: dpu_diag_check.log"
+            log "Detailed logs written to: $DPU_DIAG"
         else
             log "WARNING: Checker script not found. Skipping."
         fi

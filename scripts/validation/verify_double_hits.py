@@ -172,32 +172,143 @@ def run_exact_simulation_consistency_check(dpu_data, queries, targets, mask_str,
     log.verbose("-" * 65)
     log.summary(f"Exact Simulation Accuracy: {acc:.2f}% ({processed-mismatches}/{processed}) unique sequence pairs")
 
+def get_all_raw_hits_map(q_seq, t_seq, mask_str):
+    """
+    Returns a dictionary: { query_pos_index: set(diagonals) }
+    This represents ALL valid k-mer matches between Q and T.
+    """
+    hits_map = defaultdict(set)
+    mask_indices = [i for i, char in enumerate(mask_str) if char == '1']
+    span = len(mask_str)
+    
+    # 1. Index Target k-mers
+    target_index = defaultdict(list)
+    for j in range(len(t_seq) - span + 1):
+        kmer = extract_masked_kmer(t_seq, j, mask_indices)
+        if kmer: target_index[kmer].append(j)
+        
+    # 2. Scan Query and record all diagonals for every position
+    for i in range(len(q_seq) - span + 1):
+        kmer = extract_masked_kmer(q_seq, i, mask_indices)
+        if kmer and kmer in target_index:
+            for j in target_index[kmer]:
+                diag = i - j
+                hits_map[i].add(diag)
+                
+    return hits_map
+
+def has_double_hit_on_diagonal(target_diag, hits_map):
+    """
+    Checks if target_diag appears twice with no DIFFERENT diagonals 
+    interfering in between.
+    
+    Rule:
+    1. If a position has hits on [target_diag, other_diag], it counts as target_diag (Forgiving).
+    2. If a position has hits on [other_diag] ONLY, it breaks the chain.
+    3. Positions with NO hits (not in hits_map) are ignored (Gaps allowed).
+    """
+    
+    # Get all query positions that have ANY hits, sorted
+    sorted_positions = sorted(hits_map.keys())
+    
+    chain_active = False
+    
+    for i in sorted_positions:
+        diagonals_at_pos = hits_map[i]
+        
+        if target_diag in diagonals_at_pos:
+            # We found our diagonal.
+            if chain_active:
+                # We already had a start, and we haven't broken it.
+                # This matches the condition: Hit -> (Gaps) -> Hit
+                return True
+            else:
+                # Start a new chain
+                chain_active = True
+        else:
+            # We have hits here, but NOT our target diagonal.
+            # This is an interference.
+            chain_active = False
+            
+    return False
+
 def run_geometric_hit_validity_check(dpu_data, queries, targets, mask_str, log):
-    log.verbose("\nGeometric Validity (Hit Existence on Diagonal)")
+    log.verbose("\nGeometric Validity (Double Hit Logic)")
     log.verbose(f"{'QUERY':<15} {'TARGET':<15} {'DIAG':<8} {'SCORE':<6} {'STATUS'}")
     log.verbose("-" * 65)
     
-    mask_indices = [i for i, char in enumerate(mask_str) if char == '1']
-    span = len(mask_str)
+    total_lines = 0
+    false_positives = 0
+    
+    # Group DPU hits by (Query, Target) pair to avoid re-scanning sequences
+    # dpu_data is {(q_id, t_id): [{'score': x, 'diag': y}, ...]}
+    
+    for (q_id, t_id), hits in dpu_data.items():
+        if q_id not in queries or t_id not in targets: continue
+        
+        q_seq = queries[q_id]
+        t_seq = targets[t_id]
+        
+        # 1. Pre-calculate ALL raw hits for this sequence pair
+        # We need this to know if "intervening" hits exist on other diagonals
+        hits_map = get_all_raw_hits_map(q_seq, t_seq, mask_str)
+        
+        # 2. Check each reported diagonal in the TSV
+        for h in hits:
+            total_lines += 1
+            reported_diag = h['diag']
+            
+            is_valid = has_double_hit_on_diagonal(reported_diag, hits_map)
+            
+            if not is_valid:
+                false_positives += 1
+                log.verbose(f"{q_id:<15} {t_id:<15} {reported_diag:<8} {h['score']:<6} INVALID")
+
+    acc = 100.0 * (1.0 - false_positives/total_lines) if total_lines else 0
+    log.verbose("-" * 65)
+    log.summary(f"Geometric Hit Accuracy: {acc:.2f}% ({total_lines-false_positives}/{total_lines}) validated double hits")
+
+
+def run_mmseqs2_cpu_geometric_check(dpu_data, queries, targets, mask_str, log):
+    log.verbose("\nMMseqs2 CPU Exact Logic (Consecutive Diag Matches)")
+    log.verbose(f"{'QUERY':<15} {'TARGET':<15} {'DIAG':<8} {'SCORE':<6} {'STATUS'}")
+    log.verbose("-" * 65)
+    
     total_lines = 0
     false_positives = 0
     
     for (q_id, t_id), hits in dpu_data.items():
         if q_id not in queries or t_id not in targets: continue
+        
         q_seq = queries[q_id]
         t_seq = targets[t_id]
         
+        # 1. Get ALL raw k-mer hits (exact MMseqs2 collection)
+        raw_hits = find_raw_hits(q_seq, t_seq, mask_str)
+        
+        # 2. EXACT MMseqs2 double-hit logic: sort by query pos, scan consecutive diags
+        raw_hits.sort(key=lambda x: x[0])  # sort by i (query pos)
+        valid_diags = set()
+        prev_diag = None
+        for i, j, diag in raw_hits:
+            if diag == prev_diag:
+                valid_diags.add(diag)  # double hit found!
+            prev_diag = diag
+        
+        # 3. Validate each DPU-reported diag
         for h in hits:
             total_lines += 1
-            diag = h['diag']
-            exists = check_diagonal_existence(q_seq, t_seq, diag, mask_indices, span)
-            if not exists:
+            reported_diag = h['diag']
+            is_valid = reported_diag in valid_diags
+            
+            if not is_valid:
                 false_positives += 1
-                log.verbose(f"{q_id:<15} {t_id:<15} {diag:<8} {h['score']:<6} INVALID")
-                
-    acc = 100.0 * (1.0 - false_positives/total_lines) if total_lines else 0
-    log.verbose("-" * 65)
-    log.summary(f"Geometric Hit Accuracy: {acc:.2f}% ({total_lines-false_positives}/{total_lines}) diagonal matches")
+                log.verbose(f"{q_id:<15} {t_id:<15} {reported_diag:<8} {h['score']:<6} INVALID")
+
+        
+        acc = 100.0 * (1.0 - false_positives/total_lines) if total_lines else 0
+    log.summary(f"MMseqs2 CPU Accuracy: {acc:.2f}% ({total_lines-false_positives}/{total_lines}) validated double hits")
+
 
 # ==============================================================================
 # MAIN
@@ -217,8 +328,9 @@ def main():
         print("Failed to load data.")
         sys.exit(1)
         
-    run_exact_simulation_consistency_check(dpu_data, queries, targets, args.mask, log)
+    #run_exact_simulation_consistency_check(dpu_data, queries, targets, args.mask, log)
     run_geometric_hit_validity_check(dpu_data, queries, targets, args.mask, log)
+    #run_mmseqs2_cpu_geometric_check(dpu_data, queries, targets, args.mask, log)
     
     log.close()
 

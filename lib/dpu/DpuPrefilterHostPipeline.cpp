@@ -898,6 +898,11 @@ namespace mmseqs::dpu
 
         LOG_TRACE("Batch complete after " << overflow_retries << " iterations");
         
+        if (dpu_comm_.isProfilingEnabled()) {
+            dpu_comm_.dumpProfile("kmer_prefilter");
+            dpu_comm_.resetProfile();
+        }
+
         return accumulated_results;
     }
     
@@ -917,27 +922,13 @@ namespace mmseqs::dpu
         // 1. Prepare descriptors for this batch
         auto descriptors = prepareKmerDescriptors(ctx, wave_indices, splits, batch.packet_count, wave_start, wave_size);
         
-        auto t_start_xfer = std::chrono::high_resolution_clock::now();
-        
         // 2. Transfer: Broadcast Query Packets to all DPUs
         uint32_t packets_size = batch.packet_count * sizeof(KmerQueryPacket);
         dpu_comm_.broadcastData(batch.packets.data(), packets_size, ctx.QUERY_PACKETS_OFF);
         
-        auto t_end_xfer = std::chrono::high_resolution_clock::now();
-        
-        auto t_start_exec = std::chrono::high_resolution_clock::now();
-        
         // 3. Execute kernel and gather results (handles overflow internally, includes descriptor scatter)
         auto results = executeKmerBatchWithOverflow(ctx, descriptors, out_overflows);
-        
-        auto t_end_exec = std::chrono::high_resolution_clock::now();
-        
-        double xfer_time = std::chrono::duration<double>(t_end_xfer - t_start_xfer).count();
-        double exec_time = std::chrono::duration<double>(t_end_exec - t_start_exec).count();
-        double xfer_mb = packets_size / (1024.0 * 1024.0);
-        
-        LOG_BENCH("DPU: Host->MRAM Xfer " << xfer_time << "s (" << (xfer_mb / xfer_time) << " MB/s), Exec " << exec_time << "s");
-        
+          
         return results;
     }
 
