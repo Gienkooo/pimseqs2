@@ -6,6 +6,7 @@
 #include <cmath>
 #include <queue>
 #include <vector>
+#include <atomic>
 
 namespace mmseqs::dpu {
 
@@ -15,7 +16,7 @@ std::vector<DpuDbSplitter::SequenceMetadata> DpuDbSplitter::getMetadata(
 ) {
     size_t total_seqs = tdbr->getSize();
     std::vector<DpuDbSplitter::SequenceMetadata> seqs;
-    seqs.reserve(total_seqs);
+    seqs.resize(total_seqs); // Resize upfront for thread-safe indexed writes
 
     if (mram_limit_bytes <= DPU_FIXED_INDEX_OVERHEAD) {
         Debug(Debug::ERROR) << "[DPU] MRAM limit (" << mram_limit_bytes 
@@ -25,16 +26,27 @@ std::vector<DpuDbSplitter::SequenceMetadata> DpuDbSplitter::getMetadata(
 
     size_t available_for_entries = mram_limit_bytes - DPU_FIXED_INDEX_OVERHEAD;
 
+    std::atomic<bool> too_large{false};
+    std::atomic<uint32_t> too_large_key{0};
+
+    #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < total_seqs; ++i) {
         uint32_t key = tdbr->getDbKey(i);
         uint32_t len = tdbr->getSeqLen(i);
         size_t marginal_size = estimateSequenceSizeBytes(len);
 
         if (marginal_size > available_for_entries) {
-            Debug(Debug::ERROR) << "[DPU] Sequence " << key << " is too large.\n";
-            return {};
+            too_large_key.store(key, std::memory_order_relaxed);
+            too_large.store(true, std::memory_order_relaxed);
+            continue;
         }
-        seqs.push_back({key, len, marginal_size});
+
+        seqs[i] = {key, len, marginal_size};
+    }
+
+    if (too_large.load(std::memory_order_relaxed)) {
+        Debug(Debug::ERROR) << "[DPU] Sequence " << too_large_key.load() << " is too large.\n";
+        return {};
     }
 
     // LPT Sort (Descending)
