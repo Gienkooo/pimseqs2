@@ -89,7 +89,7 @@ static SwResult compute_sw_tiled(
     uint32_t query_len,
     uintptr_t pssm_mram_base,
     uintptr_t mram_scratch_vectors,
-    TaskletScratch *scratch,  /* Strongly typed pointer */
+    TaskletScratch *scratch, 
     int32_t gap_open,    
     int32_t gap_extend)  
 {
@@ -348,12 +348,13 @@ int main() {
             uintptr_t meta_addr = mram_base + g_bd.header.targets_metadata_offset + (t * sizeof(TargetMetadata));
             mram_read((__mram_ptr void*)meta_addr, &meta, MRAM_ALIGN_SIZE(sizeof(TargetMetadata)));
 
-            // Filter Coverage/Length here if needed (omitted for brevity)
+            if (!can_be_covered(max_query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) {
+                continue;
+            }
 
             for (uint32_t q_idx = 0; q_idx < g_bd.header.num_queries; ++q_idx) {
                 QueryMetadata qmeta = g_query_meta[q_idx];
                 
-                // --- KERNEL CALL ---
                 SwResult sw = compute_sw_tiled(
                     mram_base,
                     g_bd.header.targets_data_offset + meta.offset_in_data, 
@@ -361,23 +362,41 @@ int main() {
                     qmeta.query_len,
                     pssm_base_start + qmeta.pssm_offset_in_batch,
                     my_mram_vectors,
-                    my_scratch, // Pass Typed Struct
+                    my_scratch, 
                     (int32_t)g_bd.gap_open_cost,   
                     (int32_t)g_bd.gap_extend_cost
                 );
                 
-                if (sw.score >= qmeta.min_score) {
-                    __dma_aligned GappedHit hit;
-                    hit.target_id = meta.target_id;
-                    hit.score = sw.score;
-                    hit.q_end = sw.q_end;
-                    hit.t_end = sw.t_end;
-                    hit.padding[0] = (uint16_t)q_idx;
-                    hit.padding[1] = 0;
-
-                    local_hits[local_count++] = hit;
-                    if (local_count == 8) FLUSH_LOCAL_HITS();
+                if (sw.score < qmeta.min_score) {
+                    continue;
                 }
+
+                uint16_t aln_len = (sw.q_end > sw.t_end) ? sw.q_end : sw.t_end;
+                if (g_bd.min_aln_len > 0 && aln_len < g_bd.min_aln_len) 
+                {
+                    continue;
+                }
+                
+                if (!has_coverage(sw.q_end, sw.t_end, qmeta.query_len, meta.target_len, g_bd.cov_mode, g_bd.cov_thr_pct)) 
+                {
+                    continue;
+                }
+                
+                if (!passes_seq_id_threshold(sw.score, sw.q_end, sw.t_end, g_bd.seq_id_thr_pct)) 
+                {
+                    continue;
+                }
+
+                __dma_aligned GappedHit hit;
+                hit.target_id = meta.target_id;
+                hit.score = sw.score;
+                hit.q_end = sw.q_end;
+                hit.t_end = sw.t_end;
+                hit.padding[0] = (uint16_t)q_idx;
+                hit.padding[1] = 0;
+
+                local_hits[local_count++] = hit;
+                if (local_count == 8) FLUSH_LOCAL_HITS();
             }
         }
         FLUSH_LOCAL_HITS();
