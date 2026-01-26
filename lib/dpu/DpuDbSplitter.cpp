@@ -36,7 +36,7 @@ namespace mmseqs::dpu {
                 return {};
             }
             
-            seqs.push_back({key, len, size});
+            seqs.emplace_back(SequenceMetadata{static_cast<uint32_t>(i), key, len, size});
             total_db_bytes += size;
             if (len < min_seq_len) min_seq_len = len;
             if (len > max_seq_len) max_seq_len = len;
@@ -61,7 +61,7 @@ namespace mmseqs::dpu {
 
             if (size_ok && count_ok) {
                 // Fits in current chunk
-                current.sequence_ids.push_back(seq.db_key);
+                current.sequence_ids.push_back(seq.seq_idx);
                 current.current_seq_count++;
                 current.current_estimated_bytes += seq.estimated_size;
                 current.current_total_length += seq.length;
@@ -71,7 +71,7 @@ namespace mmseqs::dpu {
                 DpuChunk& next = chunks.back();
                 
                 // We already validated that the seq fits in an empty chunk in step 1
-                next.sequence_ids.push_back(seq.db_key);
+                next.sequence_ids.push_back(seq.seq_idx);
                 next.current_seq_count++;
                 next.current_estimated_bytes += seq.estimated_size;
                 next.current_total_length += seq.length;

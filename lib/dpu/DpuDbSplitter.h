@@ -35,6 +35,7 @@ public:
 
 private:
     struct SequenceMetadata {
+        uint32_t seq_idx;
         uint32_t db_key;
         uint32_t length;
         size_t estimated_size;
