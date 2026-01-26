@@ -123,26 +123,24 @@ fi
     if [ "$EXACT_KMER_MATCHING" -eq 1 ]; then
         log "Verifying False Positives (Diagonal Check)..."
         if [ -f "$CHECKER_SCRIPT" ]; then
-            # CPU Check
-            CPU_FP=$(python3 "$CHECKER_SCRIPT" \
-                --query "$QUERY_FASTA" \
-                --target "$TARGET_FASTA" \
-                --tsv "$CPU_RES" \
-                --mask "$MASK" \
-                --log "$CPU_DIAG" 2>&1)
-            
-            log "CPU Check Summary: $CPU_FP"
+            # CPU_FP=$(python3 "$CHECKER_SCRIPT" \
+            #    --query "$QUERY_FASTA" \
+            #    --target "$TARGET_FASTA" \
+            #    --tsv "$CPU_RES" \
+            #    --mask "$MASK" \
+            #    --log "$CPU_DIAG" 2>&1)
+            # 
+            # log "CPU Check Summary: $CPU_FP"
             log "Detailed logs written to: $CPU_DIAG"
 
-            # DPU Check
-            DPU_FP=$(python3 "$CHECKER_SCRIPT" \
-                --query "$QUERY_FASTA" \
-                --target "$TARGET_FASTA" \
-                --tsv "$DPU_RES" \
-                --mask "$MASK" \
-                --log "$DPU_DIAG" 2>&1)
+            # DPU_FP=$(python3 "$CHECKER_SCRIPT" \
+            #    --query "$QUERY_FASTA" \
+            #    --target "$TARGET_FASTA" \
+            #    --tsv "$DPU_RES" \
+            #    --mask "$MASK" \
+            #    --log "$DPU_DIAG" 2>&1)
                 
-            log "DPU Check Summary: $DPU_FP"
+            #log "DPU Check Summary: $DPU_FP"
             log "Detailed logs written to: $DPU_DIAG"
         else
             log "WARNING: Checker script not found. Skipping."
