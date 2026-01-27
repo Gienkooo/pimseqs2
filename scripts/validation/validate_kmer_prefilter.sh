@@ -73,6 +73,7 @@ log "Running K-mer Prefilter on CPU..."
     --mask-n-repeat 0 \
     --max-seqs 1000000 \
     --spaced-kmer-mode 0 \
+    --min-ungapped-score 0 \
     --spaced-kmer-pattern "$MASK" \
     --diag-score 0 \
     --threads $(nproc) \
@@ -92,6 +93,7 @@ DPU_PROFILE=1 "$MMSEQS_BIN" prefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
     --mask-lower-case 0 \
     --mask-n-repeat 0 \
     --spaced-kmer-mode 0 \
+    --min-ungapped-score 0  \
     --spaced-kmer-pattern "$MASK" \
     --dpu 1 \
     --dpu-num-dpus "$FINAL_DPU_COUNT" \
@@ -123,24 +125,24 @@ fi
     if [ "$EXACT_KMER_MATCHING" -eq 1 ]; then
         log "Verifying False Positives (Diagonal Check)..."
         if [ -f "$CHECKER_SCRIPT" ]; then
-            # CPU_FP=$(python3 "$CHECKER_SCRIPT" \
-            #    --query "$QUERY_FASTA" \
-            #    --target "$TARGET_FASTA" \
-            #    --tsv "$CPU_RES" \
-            #    --mask "$MASK" \
-            #    --log "$CPU_DIAG" 2>&1)
-            # 
-            # log "CPU Check Summary: $CPU_FP"
+             CPU_FP=$(python3 "$CHECKER_SCRIPT" \
+                --query "$QUERY_FASTA" \
+                --target "$TARGET_FASTA" \
+                --tsv "$CPU_RES" \
+                --mask "$MASK" \
+                --log "$CPU_DIAG" 2>&1)
+             
+             log "CPU Check Summary: $CPU_FP"
             log "Detailed logs written to: $CPU_DIAG"
 
-            # DPU_FP=$(python3 "$CHECKER_SCRIPT" \
-            #    --query "$QUERY_FASTA" \
-            #    --target "$TARGET_FASTA" \
-            #    --tsv "$DPU_RES" \
-            #    --mask "$MASK" \
-            #    --log "$DPU_DIAG" 2>&1)
-                
-            #log "DPU Check Summary: $DPU_FP"
+             DPU_FP=$(python3 "$CHECKER_SCRIPT" \
+                --query "$QUERY_FASTA" \
+                --target "$TARGET_FASTA" \
+                --tsv "$DPU_RES" \
+                --mask "$MASK" \
+                --log "$DPU_DIAG" 2>&1)
+               
+            log "DPU Check Summary: $DPU_FP"
             log "Detailed logs written to: $DPU_DIAG"
         else
             log "WARNING: Checker script not found. Skipping."

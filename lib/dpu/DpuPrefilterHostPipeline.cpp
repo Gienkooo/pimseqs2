@@ -742,13 +742,27 @@ namespace mmseqs::dpu
                     }
                 }
                 
+                if (par.minDiagScoreThr > 0) {
+                    size_t write_idx = 0;
+                    for (size_t i = 0; i < final_query_hits.size(); ++i) {
+                        if (final_query_hits[i].prefScore >= par.minDiagScoreThr) {
+                            final_query_hits[write_idx++] = final_query_hits[i];
+                        }
+                    }
+                    final_query_hits.resize(write_idx);
+                }
+
                 // Sort by score (descending) and then ID
-                std::sort(final_query_hits.begin(), final_query_hits.end(), hit_t::compareHitsByScoreAndId);
+                //std::sort(final_query_hits.begin(), final_query_hits.end(), hit_t::compareHitsByScoreAndId);
                 
                 resultBuffer.clear();
                 resultBuffer.reserve(final_query_hits.size() * 16);
                 
                 for (size_t i = 0; i < final_query_hits.size(); ++i) {
+                    if (final_query_hits[i].prefScore > 255) {
+                        final_query_hits[i].prefScore = 255;
+                    }
+
                     char outbuf[256];
                     size_t len = QueryMatcher::prefilterHitToBuffer(outbuf, final_query_hits[i]);
                     resultBuffer.append(outbuf, len);
