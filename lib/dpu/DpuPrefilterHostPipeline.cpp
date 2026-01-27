@@ -426,7 +426,8 @@ namespace mmseqs::dpu
                 wave_indices[w] = DpuIndexBuilder::build(
                     tdbr, splits[chunk_idx], ksize, subMat, 
                     chunk_idx, chunk_idx % num_dpus,
-                    useSpacedKmers, spacedPattern, patternSpan
+                    useSpacedKmers, spacedPattern, patternSpan,
+                    par.maskMode, par.maskLowerCaseMode, par.maskProb, par.maskNrepeats
                 );
             }
             
@@ -538,7 +539,8 @@ namespace mmseqs::dpu
                 qdbr, kmerGen.get(), indexer.get(), subMat,
                 ksize, useSpacedKmers, spacedPattern, patternSpan,
                 takeOnlyBestKmer, par.compBiasCorrection != 0,
-                par.compBiasCorrectionScale, kmerThr
+                par.compBiasCorrectionScale, kmerThr,
+                par.maskMode, par.maskLowerCaseMode, par.maskProb, par.maskNrepeats
             );
             
             uint32_t max_packets_per_batch = (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket));

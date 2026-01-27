@@ -1,6 +1,7 @@
 #include "DpuQueryPacketGenerator.h"
 #include "Debug.h"
 #include "DpuLog.h"
+#include "Parameters.h"
 
 namespace mmseqs::dpu {
 
@@ -16,7 +17,11 @@ DpuQueryPacketGenerator::DpuQueryPacketGenerator(
     bool take_only_best_kmer,
     bool use_comp_bias,
     float comp_bias_scale,
-    int kmerThr
+    int kmerThr,
+    bool maskMode,
+    int maskLowerCaseMode,
+    float maskProb,
+    int maskNrepeats
 ) : qdbr_(qdbr),
     kmer_gen_(kmer_gen),
     indexer_(indexer),
@@ -29,6 +34,10 @@ DpuQueryPacketGenerator::DpuQueryPacketGenerator(
     use_comp_bias_(use_comp_bias),
     comp_bias_scale_(comp_bias_scale),
     kmer_thr_(kmerThr),
+    maskMode_(maskMode),
+    maskLowerCaseMode_(maskLowerCaseMode),
+    maskProb_(maskProb),
+    maskNrepeats_(maskNrepeats),
     current_query_idx_(0),
     current_seq_pos_(0),
     current_query_loaded_(false),
@@ -75,13 +84,16 @@ void DpuQueryPacketGenerator::loadCurrentQuery() {
     uint32_t queryLen = qdbr_->getSeqLen(current_query_idx_);
     const char* querySeq = qdbr_->getData(current_query_idx_, 0);
     
-    // Encode query sequence
-    current_encoded_seq_.resize(queryLen);
-    for (size_t i = 0; i < queryLen; ++i) {
-        unsigned char aa = static_cast<unsigned char>(querySeq[i]);
-        current_encoded_seq_[i] = (subMat_->aa2num) ? subMat_->aa2num[aa] : 20;
-        if (current_encoded_seq_[i] >= 21) current_encoded_seq_[i] = 20;
+    // Encode query sequence with masking
+    Sequence s(qdbr_->getMaxSeqLen(), Parameters::DBTYPE_AMINO_ACIDS, subMat_, kmer_size_, use_spaced_kmers_, false, true, "");
+    s.mapSequence(current_query_idx_, 0, querySeq, queryLen);
+    
+    if (maskMode_) {
+        Masker masker(*subMat_);
+        masker.maskSequence(s, maskMode_, maskProb_, maskLowerCaseMode_, maskNrepeats_);
     }
+
+    current_encoded_seq_.assign(s.numSequence, s.numSequence + queryLen);
     
     // Calculate composition bias if enabled
     if (use_comp_bias_) {

@@ -64,7 +64,11 @@ public:
         uint32_t dpu_id,
         bool useSpacedKmers = false,
         const uint8_t* spacedPattern = nullptr,
-        int patternSpan = 0
+        int patternSpan = 0,
+        bool maskMode = false,
+        int maskLowerCaseMode = 0,
+        float maskProb = 0.0f,
+        int maskNrepeats = 0
     );
     
     /**

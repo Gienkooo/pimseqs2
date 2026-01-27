@@ -2,6 +2,9 @@
 #include "DpuLog.h" 
 #include "Debug.h"
 #include "Indexer.h"
+#include "Sequence.h"
+#include "Masker.h"
+#include "Parameters.h"
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -19,30 +22,39 @@ DpuIndexBuffer DpuIndexBuilder::build(
     uint32_t dpu_id,
     bool useSpacedKmers,
     const uint8_t* spacedPattern,
-    int patternSpan
+    int patternSpan,
+    bool maskMode,
+    int maskLowerCaseMode,
+    float maskProb,
+    int maskNrepeats
 ) {
     DpuIndexBuffer buffer;
     
     if (target_ids.empty() || kmer_size <= 0) return buffer;
     
     Indexer indexer(subMat->alphabetSize - 1, kmer_size);
+    
+    Sequence s(tdbr->getMaxSeqLen(), Parameters::DBTYPE_AMINO_ACIDS, subMat, kmer_size, useSpacedKmers, false, true, "");
+    std::unique_ptr<Masker> masker;
+    if (maskMode) {
+        masker = std::make_unique<Masker>(*subMat);
+    }
+    
     std::vector<TempIndexEntry> temp_entries;
     temp_entries.reserve(target_ids.size() * 100);
     
     for (size_t local_id = 0; local_id < target_ids.size(); ++local_id) {
         uint32_t db_key = target_ids[local_id];
-        char* seq_data = tdbr->getData(db_key, 0);
         size_t seq_len = tdbr->getSeqLen(db_key);
         
         if (seq_len < (size_t)kmer_size) continue;
         
-        // Encode sequence
-        std::vector<uint8_t> encoded(seq_len);
-        for (size_t i = 0; i < seq_len; ++i) {
-            unsigned char aa = static_cast<unsigned char>(seq_data[i]);
-            encoded[i] = (subMat->aa2num) ? subMat->aa2num[aa] : 20;
-            if (encoded[i] >= 21) encoded[i] = 20;
+        // Encode and mask sequence
+        s.mapSequence(local_id, db_key, tdbr->getData(db_key, 0), seq_len);
+        if (masker) {
+            masker->maskSequence(s, maskMode, maskProb, maskLowerCaseMode, maskNrepeats);
         }
+        const unsigned char* encoded = s.numSequence;
         
         // Extract k-mers
         int windowSize = useSpacedKmers ? patternSpan : kmer_size;
