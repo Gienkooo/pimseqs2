@@ -187,7 +187,7 @@ static inline void flush_hit_buffer(KmerDoubleHit* buffer, uint32_t* count, uint
 int main() {
     // PHASE 1: INITIALIZATION (Leader sets up, all tasklets wait at barrier)
     if (me() == 0) {
-        mram_base = (__mram_ptr uint8_t*)DPU_MRAM_HEAP_POINTER;
+        mram_base = DPU_MRAM_HEAP_POINTER;
         mram_read(mram_base, &g_descriptor, sizeof(KmerBatchDescriptor));
         
         // Initialize MRAM pointers (all offsets are 8-byte aligned by Host)
@@ -458,8 +458,6 @@ int main() {
                 // --- CHECKPOINT WRITE DISABLED ---
                 __dma_aligned KmerCheckpoint checkpoint;
                 checkpoint.packet_idx = g_shared.current_packet_idx;
-                checkpoint.entry_idx = 0;
-                checkpoint.padding = 0;
                 checkpoint.valid = 1;
                 mram_write(&checkpoint, mram_checkpoint, sizeof(KmerCheckpoint));
             }
@@ -497,8 +495,6 @@ int main() {
         // Reset Checkpoint (Finish)
         __dma_aligned KmerCheckpoint checkpoint;
         checkpoint.packet_idx = g_descriptor.num_query_packets;
-        checkpoint.entry_idx = 0;
-        checkpoint.padding = 0;
         checkpoint.valid = 0;
         mram_write(&checkpoint, mram_checkpoint, sizeof(KmerCheckpoint));
     }

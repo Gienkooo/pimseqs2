@@ -145,12 +145,10 @@ DPU_STATIC_ASSERT(sizeof(KmerIndexEntry) == 4, "KmerIndexEntry must be 4 bytes")
 /* Checkpoint Structure - For resuming after output buffer overflow */
 typedef struct {
     uint32_t packet_idx;    /* Index of query packet being processed */
-    uint32_t entry_idx;     /* Offset in entries list */
-    uint32_t valid;         /* 1 if checkpoint active, 0 otherwise */
-    uint32_t padding;       
+    uint32_t valid;         /* 1 if checkpoint active, 0 otherwise */     
 } __attribute__((packed)) KmerCheckpoint;
 
-DPU_STATIC_ASSERT(sizeof(KmerCheckpoint) == 16, "KmerCheckpoint must be 16 bytes");
+DPU_STATIC_ASSERT(sizeof(KmerCheckpoint) == 8, "KmerCheckpoint must be 8 bytes");
 
 /* Result Header - Stores actual double hit count */
 typedef struct {

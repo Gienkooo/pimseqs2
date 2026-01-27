@@ -868,7 +868,7 @@ namespace mmseqs::dpu
         int overflow_retries = 0;
 
         // 1. Initial Launch - Reset checkpoint and send descriptors
-        KmerCheckpoint zero_ckpt = {0, 0, 0, 0};
+        KmerCheckpoint zero_ckpt = {0, 0};
         dpu_comm_.broadcastData(&zero_ckpt, sizeof(KmerCheckpoint), ctx.CHECKPOINT_OFF);
         dpu_comm_.scatterDataParallel(descriptors, 0);
 
