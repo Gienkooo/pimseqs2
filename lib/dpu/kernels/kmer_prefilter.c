@@ -19,7 +19,7 @@ _Static_assert(IS_POWER_OF_2(NR_TASKLETS), "NR_TASKLETS must be a power of 2!");
 #define ENTRY_BUFFER_CAPACITY 510
 #define ENTRY_BUFFER_SIZE (ENTRY_BUFFER_CAPACITY + 2)
 
-#define TRANSACTION_BATCH_SIZE 64
+#define TRANSACTION_BATCH_SIZE 131072
 #define LOCAL_HIT_BUFFER_SIZE 32
 
 BARRIER_INIT(g_barrier, NR_TASKLETS);
@@ -232,15 +232,13 @@ int main() {
     uint32_t total_state_table_entries = g_descriptor.num_targets;
 
     if (g_do_state_table_reset) {
-        uint32_t* wram_state_u32 = (uint32_t*)wram_state_table;
-        
         uint32_t chunk = (total_state_table_entries + NR_TASKLETS - 1) / NR_TASKLETS;
         uint32_t start_idx = me() * chunk;
         uint32_t end_idx = start_idx + chunk;
         if (end_idx > total_state_table_entries) end_idx = total_state_table_entries;
 
         for (uint32_t i = start_idx; i < end_idx; ++i) {
-            wram_state_u32[i] = 0xFFFFFFFF;
+            wram_state_table[i].pos = 0xFFFF;
         }
     } else {
         uint32_t state_size = ALIGN8(total_state_table_entries * sizeof(KmerDiagonalStateEntry));
@@ -258,12 +256,12 @@ int main() {
     // Main processing loop - each iteration is one transaction batch
     while (1) {
         uint32_t batch_start_packet;
-        // uint32_t batch_start_hits;
+        uint32_t batch_start_hits;
         uint32_t tasklet_hit_count = 0;
         
         if (me() == 0) {
             batch_start_packet = g_shared.current_packet_idx;
-            // batch_start_hits = g_shared.total_mram_hits_written; 
+            batch_start_hits = g_shared.total_mram_hits_written; 
             g_shared.transaction_aborted = 0;
         }
         barrier_wait(&g_barrier);
@@ -299,9 +297,8 @@ int main() {
                 if (end_target_idx > g_descriptor.num_targets) end_target_idx = g_descriptor.num_targets;
                 
                 // Reset state entries to "no previous hit"
-                uint32_t* state_as_u32 = (uint32_t*)wram_state_table;
                 for (uint32_t target_idx = start_target_idx; target_idx < end_target_idx; ++target_idx) {
-                    state_as_u32[target_idx] = 0xFFFFFFFF;
+                    wram_state_table[target_idx].pos = 0xFFFF;
                 }
                 
                 flush_hit_buffer(tasklet_hit_buffer, &tasklet_hit_count, max_results);
@@ -440,18 +437,11 @@ int main() {
         // Transaction Commit or Rollback 
         // 1. LEADER: Update Global State / Headers / Checkpoints
         if (me() == 0) {
-            
-            // Advance packet counter regardless of success/fail to keep loop logic simple.
-            // In case of overflow, the loop will break immediately after this block.
             g_shared.current_packet_idx = batch_start_packet + TRANSACTION_BATCH_SIZE;
             if (g_shared.current_packet_idx > g_descriptor.num_query_packets) {
                 g_shared.current_packet_idx = g_descriptor.num_query_packets;
             }
 
-            /* OPTIMIZATION: Overflow Handling Logic Disabled 
-               We do not rollback or write intermediate checkpoints to save bandwidth.
-            */
-            #if 0
             if (g_shared.transaction_aborted) {
                 // --- ROLLBACK LOGIC DISABLED ---
                 g_shared.total_mram_hits_written = batch_start_hits;
@@ -473,11 +463,9 @@ int main() {
                 checkpoint.valid = 1;
                 mram_write(&checkpoint, mram_checkpoint, sizeof(KmerCheckpoint));
             }
-            #endif
         }
         barrier_wait(&g_barrier);
         
-        #if 0
         if (!g_shared.transaction_aborted) {
             uint32_t state_size = DPU_ALIGN_SIZE(g_descriptor.num_targets * sizeof(KmerDiagonalStateEntry));
             if (state_size > MAX_DPU_SEQS * sizeof(KmerDiagonalStateEntry)) {
@@ -486,7 +474,6 @@ int main() {
 
             mram_write_parallel(wram_state_table, mram_state_table, state_size);
         }
-        #endif
         barrier_wait(&g_barrier);
         
         if (g_shared.overflow_occurred) {
