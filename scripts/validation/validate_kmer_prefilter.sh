@@ -18,19 +18,36 @@ SENSITIVITY="${SENSITIVITY:-3.0}"
 
 # overriding number of DPUs
 DPU_COUNT=""
+NO_DIAG_CHECK=0
+
 usage() {
-    echo "Usage: $0 [-n NUM_DPUS]"
-    echo "  -n NUM_DPUS   Number of DPUs to use (overrides automatic detection)"
+    echo "Usage: $0 [-n NUM_DPUS] [--no-diag-check]"
+    echo "  -n NUM_DPUS       Number of DPUs to use"
+    echo "  --no-diag-check   Disable expensive geometric diagonal verification"
 }
-while getopts ":n:h" opt; do
-    case $opt in
-        n) DPU_COUNT="$OPTARG" ;;
-        h) usage; exit 0 ;;
-        \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
-        :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
+
+# Parse args manually to handle long options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n)
+            DPU_COUNT="$2"
+            shift 2
+            ;;
+        --no-diag-check)
+            NO_DIAG_CHECK=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option $1"
+            usage
+            exit 1
+            ;;
     esac
 done
-shift $((OPTIND -1))
 
 # Validate and select final DPU count (default uses get_dpu_count)
 if [ -n "$DPU_COUNT" ]; then
@@ -49,10 +66,6 @@ DPU_LOG="$OUT_DIR/kmer_dpu.log"
 CPU_DIAG="$OUT_DIR/kmer_cpu_diag.log"
 DPU_DIAG="$OUT_DIR/kmer_dpu_diag.log"
 
-# Scripts
-COMPARE_SCRIPT="$SCRIPT_DIR/compare_results.py"
-CHECKER_SCRIPT="$SCRIPT_DIR/verify_double_hits.py"
-
 log "Configuration:"
 log "  Mask: $MASK"
 log "  K-mer: $KMER"
@@ -61,6 +74,7 @@ log "  Sensitivity: $SENSITIVITY"
 log "  Query DB: $QUERY_DB"
 log "  Target DB: $TARGET_DB"
 log "  DPU Count: ${FINAL_DPU_COUNT:-(auto)}"
+log "  Diagonal Check: $( [ $NO_DIAG_CHECK -eq 1 ] && echo "DISABLED" || echo "ENABLED" )"
 
 # 2. Run CPU
 log "Running K-mer Prefilter on CPU..."
@@ -113,41 +127,21 @@ fi
     log "  CPU: $OUT_DIR/kmer_cpu.log"
     log "  DPU: $DPU_LOG"
 
-    log "Results saved to:"
-    log "  CPU: $CPU_RES"
-    log "  DPU: $DPU_RES"
+    # 5. Run Verification Tool
+    VERIFY_TOOL="$SCRIPT_DIR/verify_kmer_impl.py"
+    log "Running Comprehensive Verification..."
 
-    # 5. Compare Results
-    log "Comparing results (CPU vs DPU)..."
-    python3 "$COMPARE_SCRIPT" "$CPU_RES" "$DPU_RES" "KmerPrefilter"
+    CMD="python3 \"$VERIFY_TOOL\" \"$CPU_RES\" \"$DPU_RES\" --kmer \"$KMER\" --mask \"$MASK\""
 
-    # 6. Verify False Positives (Only if Exact Matching is ON)
-    if [ "$EXACT_KMER_MATCHING" -eq 1 ]; then
-        log "Verifying False Positives (Diagonal Check)..."
-        if [ -f "$CHECKER_SCRIPT" ]; then
-             CPU_FP=$(python3 "$CHECKER_SCRIPT" \
-                --query "$QUERY_FASTA" \
-                --target "$TARGET_FASTA" \
-                --tsv "$CPU_RES" \
-                --mask "$MASK" \
-                --log "$CPU_DIAG" 2>&1)
-             
-             log "CPU Check Summary: $CPU_FP"
-            log "Detailed logs written to: $CPU_DIAG"
-
-             DPU_FP=$(python3 "$CHECKER_SCRIPT" \
-                --query "$QUERY_FASTA" \
-                --target "$TARGET_FASTA" \
-                --tsv "$DPU_RES" \
-                --mask "$MASK" \
-                --log "$DPU_DIAG" 2>&1)
-               
-            log "DPU Check Summary: $DPU_FP"
-            log "Detailed logs written to: $DPU_DIAG"
-        else
-            log "WARNING: Checker script not found. Skipping."
-        fi
+    # Add FASTA args if diagonal check is enabled
+    if [ $NO_DIAG_CHECK -eq 0 ]; then
+        CMD="$CMD --query \"$QUERY_FASTA\" --target \"$TARGET_FASTA\""
     else
-        log "Exact matching disabled. Skipping diagonal check."
+        CMD="$CMD --no-diag-check"
     fi
+
+    log "Executing: $CMD"
+    eval $CMD
+
+    log "Verification Complete."
 } 2>&1 | tee -a "$DPU_LOG"
