@@ -16,6 +16,18 @@ extern "C" {
 /* Alignment & Constants */
 #define DPU_MRAM_ALIGN 8
 #define DPU_ALIGN_SIZE(x) (((x) + (DPU_MRAM_ALIGN - 1)) & ~(DPU_MRAM_ALIGN - 1))
+#define MAX_BATCH_QUERIES 128
+#define MAX_BATCH_TARGETS 2048
+
+/* Smith-Waterman tiling constants */
+#ifndef Q_TILE_SIZE
+#define Q_TILE_SIZE 32
+#endif
+#ifndef T_TILE_SIZE
+#define T_TILE_SIZE 32
+#endif
+
+#define ALPHA_SIZE 21
 
 /* Coverage Modes */
 #define DPU_COV_MODE_BIDIRECTIONAL  0
@@ -239,6 +251,39 @@ struct DpuBatchHeader {
 } __attribute__((packed));
 typedef struct DpuBatchHeader DpuBatchHeader;
 
+/* Split contexts to decouple target (static) and query (per-batch) configuration. */
+typedef struct {
+    uint32_t num_targets;
+    uint32_t target_meta_offset;   /* Offset to array of TargetMetadata */
+    uint32_t target_data_offset;   /* Offset to packed sequence data */
+    uint32_t results_offset;       /* Offset to write results */
+    uint32_t results_buffer_size;  /* Size of result buffer */
+    uint32_t pad[3];               /* Align to 8 bytes */
+} __attribute__((packed)) TargetContext;
+
+/* Query/launch-specific context broadcast once per batch. */
+typedef struct {
+    uint32_t num_queries;
+    uint32_t max_query_len;        /* Maximum query length in batch */
+    uint32_t queries_metadata_offset;
+    uint32_t pssm_data_offset;
+    uint32_t num_active_tasklets;
+    int16_t  min_ungapped_score;
+    int16_t  min_score;
+    int16_t  gap_open_cost;
+    int16_t  gap_extend_cost;
+    uint8_t  cov_mode;
+    uint8_t  cov_thr_pct;
+    uint8_t  min_aln_len;
+    uint8_t  seq_id_thr_pct;
+    uint8_t  flags;                /* Bit 0: force_gapped */
+    uint8_t  pad[7];               /* pad to 40 bytes (8-byte aligned) */
+} __attribute__((packed)) QueryContext;
+
+/* Fixed MRAM offsets for contexts */
+#define TARGET_CTX_OFFSET 0
+#define QUERY_CTX_OFFSET  DPU_ALIGN_SIZE(sizeof(TargetContext))
+
 /* Ungapped descriptor */
 struct UngappedBatchDescriptor {
     DpuBatchHeader header;
@@ -265,8 +310,6 @@ struct GappedBatchDescriptor {
     int16_t min_score;
     int16_t gap_open_cost;
     int16_t gap_extend_cost;
-    int16_t xdrop_threshold;
-    int16_t pssm_bias;
     
     uint8_t cov_mode;
     uint8_t cov_thr_pct;
@@ -277,13 +320,13 @@ struct GappedBatchDescriptor {
 
 #ifdef __cplusplus
     GappedBatchDescriptor() = default;
-    GappedBatchDescriptor(const DpuBatchHeader& header, int16_t min_score,
-                          int16_t gap_open_cost, int16_t gap_extend_cost, int16_t xdrop_threshold,
-                          int16_t pssm_bias, uint8_t cov_mode, uint8_t cov_thr_pct,
+    GappedBatchDescriptor(const DpuBatchHeader& header,
+                          int16_t gap_open_cost, int16_t gap_extend_cost,
+                          uint8_t cov_mode, uint8_t cov_thr_pct,
                           uint8_t min_aln_len, uint8_t seq_id_thr_pct)
         : header(header), min_score(min_score), gap_open_cost(gap_open_cost),
-          gap_extend_cost(gap_extend_cost), xdrop_threshold(xdrop_threshold),
-          pssm_bias(pssm_bias), cov_mode(cov_mode), cov_thr_pct(cov_thr_pct),
+          gap_extend_cost(gap_extend_cost),
+          cov_mode(cov_mode), cov_thr_pct(cov_thr_pct),
           min_aln_len(min_aln_len), seq_id_thr_pct(seq_id_thr_pct) {
         padding[0] = 0; padding[1] = 0;
     }
@@ -296,11 +339,8 @@ struct CombinedBatchDescriptor {
     DpuBatchHeader header;
     
     int16_t min_ungapped_score;
-    int16_t min_score;          // Gapped score threshold
     int16_t gap_open_cost;
     int16_t gap_extend_cost;
-    int16_t xdrop_threshold;
-    int16_t pssm_bias;
     
     uint8_t cov_mode;
     uint8_t cov_thr_pct;
@@ -310,12 +350,12 @@ struct CombinedBatchDescriptor {
 #ifdef __cplusplus
     CombinedBatchDescriptor() = default;
     CombinedBatchDescriptor(const DpuBatchHeader& header, int16_t min_ungapped_score,
-                            int16_t min_score, int16_t gap_open_cost, int16_t gap_extend_cost,
-                            int16_t xdrop_threshold, int16_t pssm_bias, uint8_t cov_mode,
+                            int16_t gap_open_cost, int16_t gap_extend_cost,
+                            uint8_t cov_mode,
                             uint8_t cov_thr_pct, uint8_t min_aln_len, uint8_t seq_id_thr_pct)
-        : header(header), min_ungapped_score(min_ungapped_score), min_score(min_score),
+        : header(header), min_ungapped_score(min_ungapped_score), 
           gap_open_cost(gap_open_cost), gap_extend_cost(gap_extend_cost),
-          xdrop_threshold(xdrop_threshold), pssm_bias(pssm_bias), cov_mode(cov_mode),
+          cov_mode(cov_mode),
           cov_thr_pct(cov_thr_pct), min_aln_len(min_aln_len), seq_id_thr_pct(seq_id_thr_pct) {}
 #endif
 } __attribute__((packed));
@@ -329,7 +369,8 @@ typedef struct {
     uint32_t query_len;
     uint32_t pssm_offset_in_batch;
     uint8_t  bias;
-    uint8_t  pad[3];
+    uint8_t  padding_byte;
+    int16_t  min_score;
 } __attribute__((packed)) QueryMetadata;
 
 DPU_STATIC_ASSERT(sizeof(QueryMetadata) == 16, "QueryMetadata must be 16 bytes");
@@ -363,10 +404,10 @@ DPU_STATIC_ASSERT(sizeof(Hit) == 16, "Hit must be 16 bytes");
 
 typedef struct {
     uint32_t target_id;
-    int16_t score;
+    int32_t score;
     uint16_t q_end;
     uint16_t t_end;
-    uint16_t padding[3];
+    uint16_t padding[2];
 } __attribute__((packed)) GappedHit;
 
 DPU_STATIC_ASSERT(sizeof(GappedHit) == 16, "GappedHit must be 16 bytes");

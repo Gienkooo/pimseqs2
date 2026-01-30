@@ -62,6 +62,25 @@ prepare_dbs() {
     fi
 }
 
+fake_pref() {
+    QDB="$1"
+    TDB="$2"
+    RES="$3"
+
+    # 1. Link the "Data" file of the Result DB to the Target DB's index file.
+    #    The Target DB index IS effectively a list of all target IDs.
+    ln -sf "$(readlink -f "${TDB}.index")" "${RES}"
+
+    # 2. Create the Index for the Result DB.
+    #    For every query in QDB, we point to the FULL file we just linked (offset 0, full size).
+    #    This tells mmseqs: "Query N's candidates are ALL targets found in TDB.index"
+    INDEX_SIZE="$(wc -c < "${TDB}.index")"
+    awk -v size="$INDEX_SIZE" '{ print $1"\t0\t"size; }' "${QDB}.index" > "${RES}.index"
+
+    # 3. Create the dbtype file (Type 7 = Generic Index)
+    awk 'BEGIN { printf("%c%c%c%c",7,0,0,0); exit; }' > "${RES}.dbtype"
+}
+
 # Run comparison using Python script
 compare_results() {
     local cpu_res="$1"

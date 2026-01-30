@@ -84,7 +84,7 @@ static void compute_ungapped_diagonal_chunked(
             for (uint32_t t = 0; t < t_len; ++t) {
                 uint8_t aa = target_seq[t];
                 if (aa >= KERNEL_AA_SLOTS) aa = 20;
-                int16_t score_val = (int16_t)pssm_vals[aa] - (int16_t)g_bd.pssm_bias;
+                int16_t score_val = (int16_t)pssm_vals[aa] - (int16_t)0;
                 
                 uint32_t local_q = q - q_start;
                 int32_t local_diag = (int32_t)t - (int32_t)local_q + (int32_t)(chunk_size - 1);
@@ -132,7 +132,7 @@ static void calc_cache(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8
         uint32_t offset = row_addr - scratch->cache_mram_start;
         uint8_t aa = target_subseq[k];
         if (aa >= KERNEL_AA_SLOTS) aa = 20;
-        result[k] = (int8_t)((int16_t)scratch->pssm_cache[offset + aa] - (int16_t)g_bd.pssm_bias);
+        result[k] = (int8_t)((int16_t)scratch->pssm_cache[offset + aa] - (int16_t)0);
     }
 }
 
@@ -143,7 +143,7 @@ static void calc(uintptr_t pssm_mram_base, uint32_t v_a_start, const uint8_t *ta
         uintptr_t aligned_addr = row_addr & ~7U;
         uint32_t offset = row_addr & 7U;
         mram_read((__mram_ptr void *)aligned_addr, temp_read_buf, 32);
-        result[k] = (int8_t)((int16_t)temp_read_buf[offset + ((target_subseq[k] >= KERNEL_AA_SLOTS) ? 20 : target_subseq[k])] - (int16_t)g_bd.pssm_bias);
+        result[k] = (int8_t)((int16_t)temp_read_buf[offset + ((target_subseq[k] >= KERNEL_AA_SLOTS) ? 20 : target_subseq[k])] - (int16_t)0);
     }
 }
 
@@ -163,7 +163,7 @@ static void compute_gapped_score(uint8_t *target_seq, uint32_t t_len,
     /* Read dynamic gap penalties and xdrop from host-provided BatchDescriptor */
     const int16_t Gi = g_bd.gap_open_cost;
     const int16_t Ge = g_bd.gap_extend_cost;
-    const int16_t xdrop_dyn = g_bd.xdrop_threshold;
+    const int16_t xdrop_dyn = 0; // g_bd.xdrop_threshold; --- REMOVED ---
     int16_t *ppv = scratch->ppv;
     int16_t *pv = scratch->pv;
     int16_t *fv = scratch->fv;
@@ -287,7 +287,7 @@ int main() {
 
     bool force_gapped = (g_bd.header.flags & 1);
     int16_t min_ungapped_score_threshold = g_bd.min_ungapped_score;
-    int16_t min_score_threshold = g_bd.min_score;
+    int16_t min_score_threshold = 0; // g_bd.min_score; --- REMOVED ---
     uint32_t query_len = g_bd.header.query_len;
 
     if (tasklet_id == 0) {
@@ -305,7 +305,7 @@ int main() {
         __dma_aligned GappedHit h;
         h.target_id = meta.target_id;
         h.score = 0; h.q_end = 0; h.t_end = 0;
-        h.padding[0] = 0; h.padding[1] = 0; h.padding[2] = 0;
+        h.padding[0] = 0; h.padding[1] = 0;
         
         if (meta.target_len == 0 || meta.target_len > MAX_TARGET_WRAM_LEN) {
             continue;

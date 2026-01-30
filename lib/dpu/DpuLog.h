@@ -2,7 +2,7 @@
 #include "Debug.h"
 
 // --- Toggles ---
-//#define DPU_LOG_TRACE   // High-level milestones
+#define DPU_LOG_TRACE   // High-level milestones
 #define DPU_LOG_BENCH   // Timing/Throughput
 #define DPU_LOG_MRAM    // Memory layout
 #define DPU_LOG_INDEX   // Data quality

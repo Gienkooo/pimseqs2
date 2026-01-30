@@ -177,7 +177,8 @@ public:
         uint64_t hdr = 0;
         comm_.gatherDataFromDPU(dpu_id, &hdr, 8, results_mram_offset);
         uint32_t hitcount = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-        uint32_t overflow = static_cast<uint32_t>(hdr >> 32);
+        uint32_t hi = static_cast<uint32_t>((hdr >> 32) & 0xFFFFFFFFu);
+        uint32_t overflow = (hi >> 31) & 1u;
         if (overflow_out) *overflow_out = overflow;
 
         if (result_capacity_bytes <= 8) return {};
@@ -242,6 +243,46 @@ public:
 
         // 3. Send Target Data
         comm_.scatterDataParallel(t_data, layout.target_data_offset);
+    }
+    
+    // Data-Resident Pattern: Scatter ONLY targets (metadata + data), no descriptor
+    // Use this to pre-load targets once, then broadcast queries multiple times
+    void scatterTargetsOnly(
+        const std::vector<std::vector<TargetMetadata>>& t_meta,
+        const std::vector<std::vector<uint8_t>>& t_data,
+        const MramLayout& layout)
+    {
+        uint32_t num_dpus = t_meta.size();
+        if (num_dpus == 0) return;
+        
+        // 1. Send Target Metadata
+        std::vector<std::vector<uint8_t>> meta_bufs(num_dpus);
+        for (uint32_t i = 0; i < num_dpus; ++i) {
+            if (!t_meta[i].empty()) {
+                uint32_t tmeta_bytes = t_meta[i].size() * sizeof(TargetMetadata);
+                meta_bufs[i].resize(tmeta_bytes); 
+                memcpy(meta_bufs[i].data(), t_meta[i].data(), tmeta_bytes);
+            }
+        }
+        comm_.scatterDataParallel(meta_bufs, layout.target_meta_offset);
+
+        // 2. Send Target Data
+        comm_.scatterDataParallel(t_data, layout.target_data_offset);
+    }
+    
+    // Scatter descriptors only (for updating query info on data-resident targets)
+    template <typename BatchDescT>
+    void scatterDescriptorsOnly(const std::vector<BatchDescT>& descriptors) {
+        uint32_t num_dpus = descriptors.size();
+        if (num_dpus == 0) return;
+        
+        std::vector<std::vector<uint8_t>> desc_bufs(num_dpus);
+        uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(BatchDescT));
+        for (uint32_t i = 0; i < num_dpus; ++i) {
+            desc_bufs[i].resize(bd_size);
+            memcpy(desc_bufs[i].data(), &descriptors[i], sizeof(BatchDescT));
+        }
+        comm_.scatterDataParallel(desc_bufs, 0);
     }
 
     // Parallel Gather Results
@@ -344,6 +385,86 @@ public:
     }
 
     void poll() { group_mgr_.pollAllGroups(); }
+    
+    // Get number of groups currently in flight
+    size_t getInflightCount() const {
+        size_t count = 0;
+        for (bool b : group_in_flight_) { if (b) count++; }
+        return count;
+    }
+    
+    // Check if a specific group is in flight
+    bool isGroupInFlight(uint32_t gid) const {
+        return gid < group_in_flight_.size() && group_in_flight_[gid];
+    }
+    
+    // Get total number of groups
+    uint32_t getNumGroups() const { return static_cast<uint32_t>(group_to_dpu_ids_.size()); }
+    
+    // Find next idle group (returns UINT32_MAX if none)
+    uint32_t findIdleGroup() const {
+        for (uint32_t gid = 0; gid < group_in_flight_.size(); ++gid) {
+            if (!group_in_flight_[gid]) return gid;
+        }
+        return UINT32_MAX;
+    }
+    
+    // Execute with work queue pattern: continuously dispatch work items to idle groups
+    // work_provider returns (has_work, work_item) for a group
+    // on_complete is called when a group finishes with its work_item
+    template <typename WorkT, typename WorkProviderFn, typename OnCompleteFn>
+    void executeWorkQueue(
+        const WorkProviderFn& work_provider,
+        const OnCompleteFn& on_complete,
+        uint32_t max_iterations = UINT32_MAX)
+    {
+        std::vector<WorkT> group_work(group_to_dpu_ids_.size());
+        std::vector<bool> group_has_work(group_to_dpu_ids_.size(), false);
+        uint32_t iterations = 0;
+        
+        while (iterations < max_iterations) {
+            // 1. Drain completed groups and call on_complete
+            while (true) {
+                uint32_t gid = group_mgr_.findCompletedGroup();
+                if (gid == UINT32_MAX) break;
+                
+                if (group_has_work[gid]) {
+                    on_complete(gid, group_to_dpu_ids_[gid], group_work[gid]);
+                    group_has_work[gid] = false;
+                }
+                group_mgr_.releaseGroup(gid);
+                group_in_flight_[gid] = false;
+            }
+            
+            // 2. Try to launch idle groups with new work
+            bool any_launched = false;
+            for (uint32_t gid = 0; gid < group_to_dpu_ids_.size(); ++gid) {
+                if (group_in_flight_[gid]) continue;
+                
+                auto [has_work, work_item] = work_provider(gid, group_to_dpu_ids_[gid]);
+                if (!has_work) continue;
+                
+                group_work[gid] = work_item;
+                group_has_work[gid] = true;
+                
+                DpuGroupManager::GroupContext ctx{};
+                group_mgr_.launchGroupAsync(gid, ctx);
+                group_in_flight_[gid] = true;
+                any_launched = true;
+            }
+            
+            // 3. Check termination: no work in flight and no new work launched
+            size_t inflight = getInflightCount();
+            if (inflight == 0 && !any_launched) break;
+            
+            // 4. Poll and yield if nothing happened
+            if (!any_launched) {
+                group_mgr_.pollAllGroups();
+            }
+            
+            iterations++;
+        }
+    }
 
 private:
     DpuGroupManager& group_mgr_;

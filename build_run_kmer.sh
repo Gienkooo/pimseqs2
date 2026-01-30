@@ -62,5 +62,5 @@ echo "Running K-mer validation..."
 if [ -n "$DPU_COUNT" ]; then
     ./scripts/validation/validate_kmer_prefilter.sh -n "$DPU_COUNT"
 else
-    ./scripts/validation/validate_kmer_prefilter.sh
+    ./scripts/validation/validate_kmer_prefilter.sh -n "8"
 fi
