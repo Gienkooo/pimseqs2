@@ -6,6 +6,8 @@
 #include "DBReader.h"
 #include "BaseMatrix.h"
 #include "SubstitutionMatrix.h"
+#include "Masker.h"
+#include "Sequence.h"
 #include "shared/DpuSharedTypes.h"
 #include <vector>
 #include <cstdint>
@@ -49,13 +51,17 @@ public:
         bool take_only_best_kmer = false,
         bool use_comp_bias = false,
         float comp_bias_scale = 1.0f,
-        int kmerThr = 0
+        int kmerThr = 0,
+        bool maskMode = false,
+        int maskLowerCaseMode = 0,
+        float maskProb = 0.0f,
+        int maskNrepeats = 0
     );
     
     /**
      * Fill buffer with packets until full or all queries exhausted
      * 
-     * Packets for multiple queries are separated by sentinel packets (KMER_PACKET_SENTINEL_KEY). 
+     * Packets for multiple queries are separated by sentinel packets (KMER_PACKET_SENTINEL). 
      * The DPU kernel uses these to reset its state table between queries.
      * 
      * @param buffer Pointer to DMA-aligned packet buffer
@@ -105,6 +111,10 @@ private:
     bool use_comp_bias_;
     float comp_bias_scale_;
     int kmer_thr_;
+    bool maskMode_;
+    int maskLowerCaseMode_;
+    float maskProb_;
+    int maskNrepeats_;
     
     // Iteration State
     size_t current_query_idx_;

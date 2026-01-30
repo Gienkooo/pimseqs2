@@ -1,15 +1,15 @@
 #include "DpuIndexBuilder.h"
+#include "DpuLog.h" 
 #include "Debug.h"
 #include "Indexer.h"
+#include "Sequence.h"
+#include "Masker.h"
+#include "Parameters.h"
 #include <algorithm>
 #include <cstring>
 #include <vector>
-
-#ifdef DPU_DEBUG_MODE
-  #define DPU_DEBUG_LOG Debug(Debug::INFO)
-#else
-  #define DPU_DEBUG_LOG if (false) Debug(Debug::INFO)
-#endif
+#include <cmath> 
+#include <numeric> 
 
 namespace mmseqs::dpu {
 
@@ -18,32 +18,43 @@ DpuIndexBuffer DpuIndexBuilder::build(
     const std::vector<uint32_t>& target_ids,
     int kmer_size,
     BaseMatrix* subMat,
+    uint32_t global_chunk_id,
+    uint32_t dpu_id,
     bool useSpacedKmers,
     const uint8_t* spacedPattern,
-    int patternSpan
+    int patternSpan,
+    bool maskMode,
+    int maskLowerCaseMode,
+    float maskProb,
+    int maskNrepeats
 ) {
     DpuIndexBuffer buffer;
     
     if (target_ids.empty() || kmer_size <= 0) return buffer;
     
     Indexer indexer(subMat->alphabetSize - 1, kmer_size);
+    
+    Sequence s(tdbr->getMaxSeqLen(), Parameters::DBTYPE_AMINO_ACIDS, subMat, kmer_size, useSpacedKmers, false, true, "");
+    std::unique_ptr<Masker> masker;
+    if (maskMode) {
+        masker = std::make_unique<Masker>(*subMat);
+    }
+    
     std::vector<TempIndexEntry> temp_entries;
     temp_entries.reserve(target_ids.size() * 100);
     
     for (size_t local_id = 0; local_id < target_ids.size(); ++local_id) {
         uint32_t db_key = target_ids[local_id];
-        char* seq_data = tdbr->getData(db_key, 0);
         size_t seq_len = tdbr->getSeqLen(db_key);
         
         if (seq_len < (size_t)kmer_size) continue;
         
-        // Encode sequence
-        std::vector<uint8_t> encoded(seq_len);
-        for (size_t i = 0; i < seq_len; ++i) {
-            unsigned char aa = static_cast<unsigned char>(seq_data[i]);
-            encoded[i] = (subMat->aa2num) ? subMat->aa2num[aa] : 20;
-            if (encoded[i] >= 21) encoded[i] = 20;
+        // Encode and mask sequence
+        s.mapSequence(local_id, db_key, tdbr->getData(db_key, 0), seq_len);
+        if (masker) {
+            masker->maskSequence(s, maskMode, maskProb, maskLowerCaseMode, maskNrepeats);
         }
+        const unsigned char* encoded = s.numSequence;
         
         // Extract k-mers
         int windowSize = useSpacedKmers ? patternSpan : kmer_size;
@@ -98,6 +109,13 @@ DpuIndexBuffer DpuIndexBuilder::build(
             current_count = 0;
         }
         buffer.entries.push_back({entry.local_id, entry.pos});
+        
+        // DEBUG: Log if we are about to overflow uint16_t (65535 -> 0)
+        if (current_count == 65535) {
+            LOG_INDEX("WARNING: [Overflow] Chunk " << global_chunk_id << " DPU " << dpu_id 
+                      << " K-mer " << current_kmer << " reached 65536 hits (wrapping to 0!)");
+        }
+        
         current_count++;
     }
     if (current_kmer != 0xFFFFFFFF) {
@@ -107,7 +125,6 @@ DpuIndexBuffer DpuIndexBuilder::build(
     
     if (buffer.entries.size() % 2 != 0) buffer.entries.push_back({0xFFFF, 0xFFFF});
 
-    // Flatten buckets with 32-bit overflow indices
     std::vector<KmerBucket> final_buckets(NUM_BUCKETS);
     
     for (auto& b : final_buckets) {
@@ -152,12 +169,55 @@ DpuIndexBuffer DpuIndexBuilder::build(
             }
         }
     }
+
+    // Statistics Logging
+    // 1. Basic Stats (Trace/Index)
+     size_t empty_buckets = 0;
+     size_t collision_buckets = 0; // Buckets that start a chain (next_idx != END)
+     for(uint32_t i = 0; i < NUM_BUCKETS; ++i) {
+         if (final_buckets[i].count == 0) empty_buckets++;
+         if (final_buckets[i].next_idx != CHAIN_END_IDX) collision_buckets++;
+     }
+    
+     LOG_INDEX("Chunk " << global_chunk_id << " (DPU " << dpu_id << "): Built Index. "
+               << "Entries=" << buffer.entries.size() 
+               << ", EmptyBuckets=" << empty_buckets << "/" << NUM_BUCKETS << " (" << (empty_buckets*100/NUM_BUCKETS) << "%)"
+               << ", Collisions=" << collision_buckets << " (" << (collision_buckets*100/NUM_BUCKETS) << "%)");
+    
+
     
     size_t total_bytes = final_buckets.size() * sizeof(KmerBucket);
     buffer.buckets.resize(total_bytes);
     std::memcpy(buffer.buckets.data(), final_buckets.data(), total_bytes);
     buffer.num_buckets = static_cast<uint32_t>(final_buckets.size());
     
+    // 2. Detailed Stats (Index)
+    size_t overflow_count = 0;
+    size_t total_chain_depth = 0;
+    size_t max_chain_depth = 0;
+    size_t populated_buckets = 0;
+
+    for (uint32_t i = 0; i < NUM_BUCKETS; ++i) {
+        if (final_buckets[i].count > 0) populated_buckets++;
+        if (final_buckets[i].next_idx != CHAIN_END_IDX) overflow_count++;
+        
+        size_t depth = 1;
+        uint32_t curr = final_buckets[i].next_idx;
+        while (curr != CHAIN_END_IDX) {
+            depth++;
+            if (curr >= final_buckets.size()) break;
+            curr = final_buckets[curr].next_idx;
+        }
+        total_chain_depth += depth;
+        max_chain_depth = std::max(max_chain_depth, depth);
+    }
+
+    LOG_INDEX("Chunk " << global_chunk_id << " Stats: Entries=" << buffer.entries.size() 
+              << " PrimaryBuckets=" << NUM_BUCKETS
+              << " OverflowRate=" << (100.0 * overflow_count / NUM_BUCKETS) << "% (" << overflow_count << " buckets chained)");
+    LOG_INDEX("              AvgChainDepth=" << (double)total_chain_depth / NUM_BUCKETS 
+              << " MaxChainDepth " << max_chain_depth);
+
     return buffer;
 }
 

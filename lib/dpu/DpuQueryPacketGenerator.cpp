@@ -1,11 +1,7 @@
 #include "DpuQueryPacketGenerator.h"
 #include "Debug.h"
-
-#ifdef DPU_DEBUG_MODE
-  #define DPU_DEBUG_LOG Debug(Debug::INFO)
-#else
-  #define DPU_DEBUG_LOG if (false) Debug(Debug::INFO)
-#endif
+#include "DpuLog.h"
+#include "Parameters.h"
 
 namespace mmseqs::dpu {
 
@@ -21,7 +17,11 @@ DpuQueryPacketGenerator::DpuQueryPacketGenerator(
     bool take_only_best_kmer,
     bool use_comp_bias,
     float comp_bias_scale,
-    int kmerThr
+    int kmerThr,
+    bool maskMode,
+    int maskLowerCaseMode,
+    float maskProb,
+    int maskNrepeats
 ) : qdbr_(qdbr),
     kmer_gen_(kmer_gen),
     indexer_(indexer),
@@ -34,6 +34,10 @@ DpuQueryPacketGenerator::DpuQueryPacketGenerator(
     use_comp_bias_(use_comp_bias),
     comp_bias_scale_(comp_bias_scale),
     kmer_thr_(kmerThr),
+    maskMode_(maskMode),
+    maskLowerCaseMode_(maskLowerCaseMode),
+    maskProb_(maskProb),
+    maskNrepeats_(maskNrepeats),
     current_query_idx_(0),
     current_seq_pos_(0),
     current_query_loaded_(false),
@@ -80,13 +84,16 @@ void DpuQueryPacketGenerator::loadCurrentQuery() {
     uint32_t queryLen = qdbr_->getSeqLen(current_query_idx_);
     const char* querySeq = qdbr_->getData(current_query_idx_, 0);
     
-    // Encode query sequence
-    current_encoded_seq_.resize(queryLen);
-    for (size_t i = 0; i < queryLen; ++i) {
-        unsigned char aa = static_cast<unsigned char>(querySeq[i]);
-        current_encoded_seq_[i] = (subMat_->aa2num) ? subMat_->aa2num[aa] : 20;
-        if (current_encoded_seq_[i] >= 21) current_encoded_seq_[i] = 20;
+    // Encode query sequence with masking
+    Sequence s(qdbr_->getMaxSeqLen(), Parameters::DBTYPE_AMINO_ACIDS, subMat_, kmer_size_, use_spaced_kmers_, false, true, "");
+    s.mapSequence(current_query_idx_, 0, querySeq, queryLen);
+    
+    if (maskMode_) {
+        Masker masker(*subMat_);
+        masker.maskSequence(s, maskMode_, maskProb_, maskLowerCaseMode_, maskNrepeats_);
     }
+
+    current_encoded_seq_.assign(s.numSequence, s.numSequence + queryLen);
     
     // Calculate composition bias if enabled
     if (use_comp_bias_) {
@@ -105,14 +112,14 @@ void DpuQueryPacketGenerator::loadCurrentQuery() {
         current_num_positions_ = queryLen - window_size + 1;
     } else {
         current_num_positions_ = 0;
-        DPU_DEBUG_LOG << "[Streamer] Query " << current_query_idx_ << " too short (" << queryLen << " < " << window_size << ")\n";
+        LOG_TRACE("Streamer: Query " << current_query_idx_ << " too short (" << queryLen << " < " << window_size << ")");
     }
     
     current_query_loaded_ = true;
     current_seq_pos_ = 0;
     stats_.queries_started++;
     
-    DPU_DEBUG_LOG << "[Streamer] Loaded query " << current_query_idx_ << " (len=" << queryLen << ", positions=" << current_num_positions_ << ")\n";
+    LOG_TRACE("Streamer: Loaded query " << current_query_idx_ << " (len=" << queryLen << ", positions=" << current_num_positions_ << ")");
 }
 
 bool DpuQueryPacketGenerator::advanceToNextQuery() {
@@ -160,9 +167,9 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
     unsigned char kmer_buf[32];
     
     while (written < max_packets) {
-        // === 1. Handle pending sentinel from previous batch ===
+        // 1. Handle pending sentinel from previous batch
         if (current_query_sentinel_pending_) {
-            buffer[written].kmer_idx = KMER_PACKET_SENTINEL_KEY;
+            buffer[written].kmer_idx = KMER_PACKET_SENTINEL;
             buffer[written].bucket_idx = 0;
             buffer[written].query_pos = 0;
             written++;
@@ -170,7 +177,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             stats_.queries_completed++;
             last_batch_complete_queries_++;
             
-            DPU_DEBUG_LOG << "[Streamer] Wrote deferred sentinel for query " << current_query_idx_ << "\n";
+            LOG_TRACE("Streamer: Wrote deferred sentinel for query " << current_query_idx_);
             
             if (!advanceToNextQuery()) {
                 break;  // No more queries
@@ -178,7 +185,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             continue;
         }
         
-        // === 2. Handle pending spillover (leftovers from previous batch) ===
+        // 2. Handle pending spillover (leftovers from previous batch) 
         if (has_pending_kmers_) {
             size_t remaining_in_list = pending_kmer_list_.second - pending_kmer_idx_;
             size_t available_space = max_packets - written;
@@ -204,7 +211,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             }
         }
         
-        // === 3. Check if loading a query is needed ===
+        // 3. Check if loading a query is needed
         if (!current_query_loaded_) {
             if (current_query_idx_ >= qdbr_->getSize()) {
                 break;  
@@ -213,7 +220,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             last_batch_query_indices_.push_back(current_query_idx_);
         }
         
-        // === 4. Process current query positions ===
+        // 4. Process current query positions
         while (current_seq_pos_ < current_num_positions_ && written < max_packets) {
             // Extract k-mer at this position
             const unsigned char* kmer;
@@ -313,20 +320,20 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
                     pending_query_pos_ = query_pos;
                     has_pending_kmers_ = true;
                     
-                    DPU_DEBUG_LOG << "[Streamer] Spillover: " << similar_kmers.second 
-                                  << " k-mers, wrote " << actually_written 
-                                  << ", pending " << (similar_kmers.second - actually_written) << "\n";
+                    LOG_TRACE("Streamer: Spillover: " << similar_kmers.second 
+                              << " k-mers, wrote " << actually_written 
+                              << ", pending " << (similar_kmers.second - actually_written));
                     
                     return written;  // Buffer full
                 }
             }
         }
         
-        // === 5. End of query -> need to insert sentinel ===
+        // 5. End of query -> need to insert sentinel 
         if (current_seq_pos_ >= current_num_positions_ && !has_pending_kmers_) {
             if (written < max_packets) {
                 // Room for sentinel
-                buffer[written].kmer_idx = KMER_PACKET_SENTINEL_KEY;
+                buffer[written].kmer_idx = KMER_PACKET_SENTINEL;
                 buffer[written].bucket_idx = 0;
                 buffer[written].query_pos = 0;
                 written++;
@@ -334,7 +341,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
                 stats_.queries_completed++;
                 last_batch_complete_queries_++;
                 
-                DPU_DEBUG_LOG << "[Streamer] Query " << current_query_idx_  << " complete, wrote sentinel\n";
+                LOG_TRACE("Streamer: Query " << current_query_idx_  << " complete, wrote sentinel");
                 
                 // Advance to next query
                 if (!advanceToNextQuery()) {
@@ -343,7 +350,7 @@ size_t DpuQueryPacketGenerator::fillNextBatch(KmerQueryPacket* buffer, size_t ma
             } else {
                 // No room for sentinel - defer to next batch
                 current_query_sentinel_pending_ = true;
-                DPU_DEBUG_LOG << "[Streamer] Query " << current_query_idx_ << " complete, sentinel deferred\n";
+                LOG_TRACE("Streamer: Query " << current_query_idx_ << " complete, sentinel deferred");
                 return written;
             }
         }

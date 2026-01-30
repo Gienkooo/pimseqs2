@@ -5,6 +5,8 @@ if(NOT HAVE_DPU)
     return()
 endif()
 
+find_package(OpenMP REQUIRED)
+
 # Use DPU compiler found by FindUPMEM.cmake, or find it if not already set
 if(NOT UPMEM_DPU_COMPILER)
     find_program(DPU_COMPILER dpu-upmem-dpurte-clang)
@@ -68,6 +70,10 @@ if(DPU_HOST_SOURCES)
         endif()
     endif()
     message(STATUS "[DPU] Created host library target: mmseqs_dpu")
+
+    if(TARGET OpenMP::OpenMP_CXX)
+	target_link_libraries(mmseqs_dpu PUBLIC OpenMP::OpenMP_CXX)
+    endif()
 else()
     message(WARNING "[DPU] No host-side .cpp files found in ${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
@@ -85,7 +91,7 @@ foreach(KERNEL_SRC ${KERNEL_SOURCES})
     add_custom_command(
         OUTPUT ${KERNEL_BIN}
     COMMAND ${DPU_COMPILER} -O3 -g 
-                -DNR_TASKLETS=14
+                -DNR_TASKLETS=16
                 ${DPU_INCLUDE_FLAGS}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/shared
                 -o ${KERNEL_BIN} ${KERNEL_SRC}

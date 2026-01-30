@@ -10,6 +10,11 @@
 /* --- Macros & Constants --- */
 
 #define ALIGN8(x) (((x) + 7) & ~7U)
+#define ALIGN8_DOWN(x) ((x) & ~7U)
+
+#define MAX_MRAM_TRANSFER_SIZE 2048
+
+#define ALPHA_SIZE 21
 #define ALIGN8_PTR(p) ((void*)(((uintptr_t)(p) + 7) & ~((uintptr_t)7)))
 #define MRAM_ALIGN_SIZE(x) ALIGN8(x)
 
@@ -96,6 +101,44 @@ static inline int16_t sat_add(int16_t a, int16_t b) {
     if (res < NEG_INF) return NEG_INF;
     if (res > 32767) return 32767;
     return (int16_t)res;
+}
+
+/**
+ * Safe MRAM write for transfers larger than 2KB.
+ * PRECONDITIONS:
+ * - wram_src must be 8-byte aligned
+ * - mram_dst must be 8-byte aligned  
+ * - size must be multiple of 8
+ */
+static void mram_write_safe(const void *wram_src, __mram_ptr void *mram_dst, uint32_t size) {
+    uint32_t offset = 0;
+    const uint8_t *src_ptr = (const uint8_t *)wram_src;
+    __mram_ptr uint8_t *dst_ptr = (__mram_ptr uint8_t *)mram_dst;
+
+    while (offset < size) {
+        uint32_t chunk = (size - offset > MAX_MRAM_TRANSFER_SIZE) ? MAX_MRAM_TRANSFER_SIZE : (size - offset);
+        mram_write(&src_ptr[offset], &dst_ptr[offset], chunk);
+        offset += chunk;
+    }
+}
+
+/**
+ * Safe MRAM read for transfers larger than 2KB.
+ * PRECONDITIONS:
+ * - mram_src must be 8-byte aligned
+ * - wram_dst must be 8-byte aligned
+ * - size must be multiple of 8
+ */
+static void mram_read_safe(__mram_ptr const void *mram_src, void *wram_dst, uint32_t size) {
+    uint32_t offset = 0;
+    __mram_ptr const uint8_t *src_ptr = (__mram_ptr const uint8_t *)mram_src;
+    uint8_t *dst_ptr = (uint8_t *)wram_dst;
+
+    while (offset < size) {
+        uint32_t chunk = (size - offset > MAX_MRAM_TRANSFER_SIZE) ? MAX_MRAM_TRANSFER_SIZE : (size - offset);
+        mram_read(&src_ptr[offset], &dst_ptr[offset], chunk);
+        offset += chunk;
+    }
 }
 
 /* --- Common Filter Logic --- */

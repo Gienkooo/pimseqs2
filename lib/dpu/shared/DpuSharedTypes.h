@@ -48,18 +48,18 @@ extern "C" {
 
 /* ==================== K-mer Matching Specific Limits and Structures ==================== 
  * MRAM Layout (Bucketed Hash Index):
- *   [0x000000] Descriptor         (~96 B)
- *   [STATIC]   State Table        (16 KB)   ← Per-sequence diagonal tracking
- *   [STATIC]   Query Buffer       (24 MB)   ← Input packets, fixed size
- *   [VARIABLE] Bucket Array       (~16 MB)  ← 65536 primary buckets + overflow
- *   [VARIABLE] Entries Array      (varies)  ← {target_id, pos} pairs
- *   [VARIABLE] Output Buffer      (remaining MRAM)
- *      ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
- *      ↳ [0x08] Double Hits...      ← Contiguous hit array
+ * [0x000000] Descriptor         (~96 B)   ← Batch metadata
+ * [STATIC]   Checkpoint         (16 B)    ← Recovery state (packet_idx, valid flag)
+ * [STATIC]   State Table        (32 KB)   ← Per-sequence diagonal tracking (8192 * 4B)
+ * [STATIC]   Query Buffer       (12 MB)   ← Input packets, fixed size
+ * [VARIABLE] Bucket Array       (16 MB+)  ← 65536 primary buckets (16MB) + overflow
+ * [VARIABLE] Entries Array      (varies)  ← {target_id, pos} pairs
+ * [VARIABLE] Output Buffer      (remaining)
+ * ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
+ * ↳ [0x08] Double Hits...      ← Contiguous hit array
  */
 
-/* ==================== BUCKETED INDEX PARAMETERS ==================== */
-/* 65536 buckets * 256 bytes = 16 MB Index Size */
+/* Bucketed Index Parameters  */
 #define NUM_BUCKETS 65536
 #define BUCKET_SIZE 256
 #define BUCKET_CAPACITY 20  /* (256 - 2 count - 2 pad - 4 next - 8 pad) / 12 bytes per item = 20 */
@@ -69,18 +69,20 @@ extern "C" {
 
 #define KMER_TARGET_ID_PADDING 0xFFFE
 
-#define KMER_PACKET_SENTINEL_KEY     0xFFFFFFFF   /* End-of-query marker in packet stream */
-#define KMER_RESULT_SENTINEL_TARGET  0xFFFFFFFF   /* End-of-query marker in result stream */
+#define KMER_PACKET_SENTINEL    0xFFFFFFFF   /* End-of-query marker in packet stream */
+#define KMER_RESULT_SENTINEL    0xFFFFFFFF   /* End-of-query marker in result stream */
+
+/* Fixed MRAM Overhead Calculation */
+#define DPU_INDEX_BUCKETS_SIZE   (NUM_BUCKETS * BUCKET_SIZE)    /* 16 MB */
+#define DPU_STATE_TABLE_SIZE     (MAX_DPU_SEQS * 4)             /* 32 KB */
+#define DPU_FIXED_INDEX_OVERHEAD (DPU_INDEX_BUCKETS_SIZE + DPU_STATE_TABLE_SIZE)
+#define MAX_DPU_INDEX_SIZE       (44 * 1024 * 1024) 
 
 #define MAX_DPU_SEQS 8192       
-#define MAX_DPU_INDEX_SIZE (34 * 1024 * 1024) /* 32 MB max index size per DPU */
-#define PACKET_READ_BATCH_SIZE 32
 
 /* Buffer Size Configuration */
-#define KMER_QUERY_BUFFER_SIZE (12 * 1024 * 1024)     /* query packet buffer */
-#define KMER_MIN_OUTPUT_BUFFER_SIZE (1 * 1024 * 1024) /* 1 MB minimum output */
-
-#define MAX_QUERY_PACKETS_PER_LAUNCH (KMER_QUERY_BUFFER_SIZE / sizeof(KmerQueryPacket))
+#define KMER_QUERY_BUFFER_SIZE      (16 * 1024 * 1024)
+#define KMER_MIN_OUTPUT_BUFFER_SIZE (1024)
 
 /* ==================== HASH CALCULATION ==================== */
 /* MurmurHash3 Finalizer (fast integer hash)
@@ -91,7 +93,7 @@ static inline uint32_t dpu_compute_hash(uint32_t k) {
     k ^= k >> 13;
     k *= 0xc2b2ae35;
     k ^= k >> 16;
-    return k & (NUM_BUCKETS - 1); /* Modulo 65536 */
+    return k & (NUM_BUCKETS - 1);
 }
 
 /* ==================== BUCKET DATA STRUCTURES ==================== */
@@ -148,19 +150,17 @@ DPU_STATIC_ASSERT(sizeof(KmerDoubleHit) == 8, "KmerDoubleHit must be 8 bytes");
 typedef struct {
     uint16_t local_target_id;  /* Local target ID within DPU */
     uint16_t pos_j;            /* Position j in target sequence */
-} __attribute__((packed)) KmerCompactIndexEntry;
+} __attribute__((packed)) KmerIndexEntry;
 
-DPU_STATIC_ASSERT(sizeof(KmerCompactIndexEntry) == 4, "KmerCompactIndexEntry must be 4 bytes");
+DPU_STATIC_ASSERT(sizeof(KmerIndexEntry) == 4, "KmerIndexEntry must be 4 bytes");
 
 /* Checkpoint Structure - For resuming after output buffer overflow */
 typedef struct {
     uint32_t packet_idx;    /* Index of query packet being processed */
-    uint32_t entry_idx;     /* Offset in entries list */
-    uint32_t key_idx;       /* Cached binary search result */
-    uint32_t valid;         /* 1 if checkpoint active, 0 otherwise */
+    uint32_t valid;         /* 1 if checkpoint active, 0 otherwise */     
 } __attribute__((packed)) KmerCheckpoint;
 
-DPU_STATIC_ASSERT(sizeof(KmerCheckpoint) == 16, "KmerCheckpoint must be 16 bytes");
+DPU_STATIC_ASSERT(sizeof(KmerCheckpoint) == 8, "KmerCheckpoint must be 8 bytes");
 
 /* Result Header - Stores actual double hit count */
 typedef struct {
@@ -178,17 +178,34 @@ typedef struct {
     uint32_t num_index_entries;     /* Total index entries */
     
     /* MRAM Offsets */
-    uint32_t state_table_offset;    /* State table for diagonal tracking */
+    uint32_t checkpoint_offset;     /* Checkpoint for resuming after overflow */
+    uint32_t state_table_offset;    /* State table for diagonal tracking (MRAM backing store) */
     uint32_t query_packets_offset;  /* Query packet buffer */
     uint32_t buckets_offset;        /* Start of bucket array */
     uint32_t index_entries_offset;  /* Start of entries array */
     uint32_t results_offset;        /* Start of results buffer */
     uint32_t results_buffer_size;   /* Actual output buffer size */
     
-    uint32_t reserved[2];           /* Padding for 8-byte alignment */
+    uint32_t reserved[1];           /* Padding for 8-byte alignment */
 } __attribute__((packed)) KmerBatchDescriptor;
 
 DPU_STATIC_ASSERT(sizeof(KmerBatchDescriptor) % 8 == 0, "KmerBatchDescriptor must be 8-byte aligned");
+
+/* Calculate total static usage */
+#define DPU_MRAM_ESTIMATED_USAGE ( \
+    sizeof(KmerBatchDescriptor) +  \
+    sizeof(KmerCheckpoint) +       \
+    sizeof(KmerResultHeader) +     \
+    DPU_STATE_TABLE_SIZE +         \
+    KMER_QUERY_BUFFER_SIZE +       \
+    MAX_DPU_INDEX_SIZE +           \
+    KMER_MIN_OUTPUT_BUFFER_SIZE    \
+)
+
+DPU_STATIC_ASSERT(
+    DPU_MRAM_ESTIMATED_USAGE <= DPU_MRAM_TOTAL_SIZE, 
+    "CRITICAL: DPU MRAM Usage exceeds 64MB! Reduce MAX_DPU_INDEX_SIZE or Buffers."
+);
 
 /* --- 1. Common Batch Header --- */
 struct DpuBatchHeader {
