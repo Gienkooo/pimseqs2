@@ -1466,8 +1466,7 @@ namespace mmseqs::dpu
         bool sameDB, DBWriter &resultWriter)
     {
         const uint32_t num_dpus = dpu_comm_.getNumDPUsActive();
-        if (num_dpus == 0)
-            return;
+        if (num_dpus == 0) return;
 
         const int query_seq_type = qdbr->getDbtype();
         const bool is_profile = Parameters::isEqualDbtype(query_seq_type, Parameters::DBTYPE_HMM_PROFILE);
@@ -1478,7 +1477,6 @@ namespace mmseqs::dpu
 
         kernel_mgr_.loadKernel(DpuKernelManager::KernelType::UNGAPPED);
 
-        // Use parallel distribution (same as gapped path)
         auto targetBatches = partitionTargetsForParallelism(tdbr, num_dpus);
         if (targetBatches.empty()) {
             Debug(Debug::ERROR) << "[DPU] Database splitting failed for ungapped path\n";
@@ -1488,7 +1486,6 @@ namespace mmseqs::dpu
         std::vector<float> compBias(qdbr->getMaxSeqLen() + 1, 0.0f);
         int16_t minScoreThr = static_cast<int16_t>(par.minDiagScoreThr);
 
-        // Pre-calculate max query sizes for layout (same pattern as gapped)
         const uint32_t max_query_len = qdbr->getMaxSeqLen();
         const uint32_t max_pssm_per_query = max_query_len * 32 + 1024;
         const uint32_t max_queries_per_batch = 64u;
@@ -1499,54 +1496,53 @@ namespace mmseqs::dpu
         q_limits.max_common_bytes = DpuCommunicationManager::alignToMram(q_limits.max_queries * static_cast<uint32_t>(sizeof(QueryMetadata))) +
                         DpuCommunicationManager::alignToMram(max_pssm_per_query * q_limits.max_queries);
 
-        const uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(UngappedBatchDescriptor));
         const uint32_t UNGAPPED_RESULTS_BYTES = 8 * 1024 * 1024;
-
-        // Tasklet calculation for ungapped kernel
-        // Must match kernel constants: TARGET_TILE_SIZE=1024, PSSM_CACHE_SIZE=512, MAX_DIAG_ENTRIES=4096
         const uint32_t TARGET_TILE_SIZE = 1024;
         const uint32_t PSSM_CACHE_SIZE = 512;
         const uint32_t MAX_DIAG_ENTRIES = 4096;
-        uint32_t diag_bytes = MAX_DIAG_ENTRIES * 2; // int16_t per diagonal (8KB)
-        uint32_t wramPerTasklet = TARGET_TILE_SIZE + PSSM_CACHE_SIZE + diag_bytes + 1024; // +1024 for stack/misc
-        // ~10.5KB per tasklet -> 6 tasklets fit in 64KB WRAM
+        uint32_t diag_bytes = MAX_DIAG_ENTRIES * 2;
+        uint32_t wramPerTasklet = TARGET_TILE_SIZE + PSSM_CACHE_SIZE + diag_bytes + 1024;
         uint8_t active_tasklets = std::min<uint8_t>(6, calculateActiveTasklets(wramPerTasklet));
 
-        // Guard: Check sequence length constraints
-        // Diagonal buffer size limits: max_target_len = MAX_DIAG_ENTRIES - max_query_len
-        // Sequences exceeding this will be silently skipped by the kernel
-        const uint32_t max_target_for_diag = (MAX_DIAG_ENTRIES > max_query_len) 
-                                              ? (MAX_DIAG_ENTRIES - max_query_len) 
-                                              : 256;
-        const uint32_t db_max_target_len = tdbr->getMaxSeqLen();
-        if (db_max_target_len > max_target_for_diag) {
-            Debug(Debug::WARNING) << "[DPU] Ungapped kernel constraint: max_query=" << max_query_len 
-                                  << " + max_target=" << db_max_target_len << " = " << (max_query_len + db_max_target_len)
-                                  << " exceeds diagonal buffer (" << MAX_DIAG_ENTRIES << ").\n"
-                                  << "[DPU] Targets longer than " << max_target_for_diag 
-                                  << " residues will be SKIPPED. Consider using gapped mode for long sequences.\n";
+        const uint32_t max_target_for_diag = (MAX_DIAG_ENTRIES > max_query_len) ? (MAX_DIAG_ENTRIES - max_query_len) : 256;
+        if (tdbr->getMaxSeqLen() > max_target_for_diag) {
+            Debug(Debug::WARNING) << "[DPU] Targets longer than " << max_target_for_diag << " residues will be SKIPPED.\n";
         }
 
-        // Storage for accumulated results: [queryIdx] -> list of hits
         std::vector<std::vector<hit_t>> allResults(qdbr->getSize());
 
-        // Profiling alias
+        // Setup Async Dispatcher (Pipelining)
+        const auto rank_sets = dpu_comm_.getRankSets();
+        DpuGroupManager group_mgr(rank_sets);
+        const uint32_t num_groups = group_mgr.getNumGroups();
+
+        std::vector<std::vector<uint32_t>> group_to_dpu_ids(num_groups);
+        std::vector<uint32_t> dpu_to_group(num_dpus, UINT32_MAX);
+        uint32_t global_dpu_idx = 0;
+        for (uint32_t g = 0; g < num_groups; ++g) {
+            uint32_t nr_dpus_in_rank = 0;
+            dpu_get_nr_dpus(rank_sets[g], &nr_dpus_in_rank);
+            for (uint32_t i = 0; i < nr_dpus_in_rank && global_dpu_idx < num_dpus; ++i) {
+                group_to_dpu_ids[g].push_back(global_dpu_idx);
+                dpu_to_group[global_dpu_idx] = g;
+                global_dpu_idx++;
+            }
+        }
+        RankDispatcher dispatcher(group_mgr, group_to_dpu_ids);
+        std::vector<bool> dpu_active(num_dpus, false);
+        std::vector<bool> dpu_ready(num_dpus, false);
+
         using PS = DpuCommunicationManager::ProfileSlot;
 
-        Debug(Debug::INFO) << "DPU Ungapped Batch (Parallel):\n"
+        Debug(Debug::INFO) << "DPU Ungapped Batch (Pipelined):\n"
                            << "  num_dpus = " << num_dpus << "\n"
-                           << "  target_batches = " << targetBatches.size() << "\n"
-                           << "  max_query_len = " << max_query_len << "\n"
-                           << "  max_target_for_diag = " << max_target_for_diag << "\n"
                            << "  active_tasklets = " << (int)active_tasklets << "\n";
 
-        // Loop over Target Batches
         for (size_t bIdx = 0; bIdx < targetBatches.size(); ++bIdx) {
             const auto& perDpuTargetIndices = targetBatches[bIdx];
             std::vector<std::vector<uint8_t>> perDpuTargetData(num_dpus);
             std::vector<std::vector<TargetMetadata>> perDpuTargetMeta(num_dpus);
 
-            // Assemble target data in parallel (same as gapped)
             {
                 auto timer = dpu_comm_.timeSlot(PS::HostBuildTargetBatch);
                 #pragma omp parallel for schedule(dynamic)
@@ -1558,21 +1554,16 @@ namespace mmseqs::dpu
                 }
             }
 
-            // Calculate fixed layout for parallel transfer
             uint32_t max_tdata_size = DpuCommunicationManager::alignToMram(40 * 1024 * 1024);
             DpuWorkflow::MramLayout max_layout = workflow_.calculateLayout(
                 sizeof(UngappedBatchDescriptor), q_limits.max_common_bytes, 16384, q_limits.max_queries, max_tdata_size, sizeof(Hit), 0);
             max_layout.results_capacity = DpuCommunicationManager::alignToMram(UNGAPPED_RESULTS_BYTES);
 
-            std::vector<DpuWorkflow::MramLayout> layouts(num_dpus, max_layout);
             std::vector<UngappedBatchDescriptor> bds(num_dpus);
             std::vector<uint32_t> maxHitsPerDpu(num_dpus, 0);
 
-            // Prepare initial descriptors
             for (uint32_t d = 0; d < num_dpus; ++d) {
-                const uint32_t usable_results = (max_layout.results_capacity > 8u)
-                    ? (max_layout.results_capacity - 8u)
-                    : 0u;
+                const uint32_t usable_results = (max_layout.results_capacity > 8u) ? (max_layout.results_capacity - 8u) : 0u;
                 maxHitsPerDpu[d] = usable_results / static_cast<uint32_t>(sizeof(Hit));
 
                 UngappedBatchDescriptor init_bd{};
@@ -1588,10 +1579,8 @@ namespace mmseqs::dpu
                 bds[d] = init_bd;
             }
 
-            // Parallel Scatter Targets (key optimization!)
             workflow_.scatterBatchParallel(bds, perDpuTargetMeta, perDpuTargetData, max_layout);
 
-            // Process queries in batches
             size_t q_cursor = 0;
             while (q_cursor < qdbr->getSize()) {
                 auto batch_timer = dpu_comm_.timeSlot(PS::HostTotalBatch);
@@ -1601,16 +1590,11 @@ namespace mmseqs::dpu
                     auto timer = dpu_comm_.timeSlot(PS::HostBuildQueryBatch);
                     batch = buildQueryBatch(q_cursor, qdbr, subMat, par, compBias, q_limits, evaluer, minScoreThr, nullptr);
                 }
-                if (batch.empty) {
-                    Debug(Debug::ERROR) << "[DPU] Ungapped batch could not fit any query at cursor " << q_cursor;
-                    break;
-                }
+                if (batch.empty) break;
                 q_cursor = batch.next_q_idx;
 
-                // Broadcast common data (queries + PSSMs)
                 workflow_.broadcastCommon(batch.common_buffer->data(), batch.common_size, max_layout.common_data_offset);
 
-                // Prepare per-DPU descriptors
                 std::vector<std::vector<uint8_t>> bd_bufs(num_dpus);
                 const uint32_t qmeta_size = static_cast<uint32_t>(batch.meta.size() * sizeof(QueryMetadata));
                 const uint32_t pssm_size = static_cast<uint32_t>(batch.pssm.size());
@@ -1632,7 +1616,7 @@ namespace mmseqs::dpu
                     bd.header.results_offset = max_layout.results_offset;
                     bd.header.results_buffer_size = max_layout.results_capacity;
                     bd.header.num_active_tasklets = active_tasklets;
-                    bd.min_score = 0; // per-query thresholds used instead of batch-level min_score
+                    bd.min_score = 0;
                     bd.gap_open_cost = static_cast<int16_t>(par.gapOpen.values.aminoacid());
                     bd.gap_extend_cost = static_cast<int16_t>(par.gapExtend.values.aminoacid());
                     bd.pssm_bias = 0;
@@ -1641,79 +1625,101 @@ namespace mmseqs::dpu
                     memcpy(bd_bufs[d].data(), &bd, sizeof(UngappedBatchDescriptor));
                 }
 
-                // Parallel scatter descriptors
                 dpu_comm_.scatterDataParallel(bd_bufs, 0);
 
-                // Clear results headers
                 uint64_t zero_hdr = 0;
                 dpu_comm_.broadcastData(&zero_hdr, 8, max_layout.results_offset);
 
-                // Launch all DPUs synchronously
-                dpu_comm_.executeKernels();
+                // --- PIPELINED EXECUTION ---
+                std::fill(dpu_active.begin(), dpu_active.end(), false);
+                std::fill(dpu_ready.begin(), dpu_ready.end(), false);
+                size_t inflight_groups = 0;
 
-                // Parallel gather results
-                std::vector<std::vector<Hit>> dpu_hits(num_dpus);
-                {
-                    auto timer = dpu_comm_.timeSlot(PS::HostDispatcherWait);
-
-                    // Gather headers in parallel
-                    std::vector<std::vector<uint8_t>> header_bufs;
-                    dpu_comm_.gatherDataParallel(header_bufs, 8, max_layout.results_offset);
-
-                    // Parse headers
-                    std::vector<uint32_t> hit_counts(num_dpus, 0);
-                    uint32_t max_hit_count = 0;
-                    for (uint32_t d = 0; d < num_dpus; ++d) {
-                        if (perDpuTargetMeta[d].empty() || header_bufs[d].size() < 8) continue;
-                        uint64_t hdr = 0;
-                        memcpy(&hdr, header_bufs[d].data(), 8);
-                        uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
-                        if (hit_count > maxHitsPerDpu[d]) {
-                            Debug(Debug::ERROR) << "[DPU] Ungapped overflow: DPU " << d 
-                                << " hits=" << hit_count << " max=" << maxHitsPerDpu[d];
-                            EXIT(EXIT_FAILURE);
-                        }
-                        hit_counts[d] = hit_count;
-                        if (hit_count > max_hit_count) max_hit_count = hit_count;
-                    }
-
-                    // Parallel gather hits
-                    if (max_hit_count > 0) {
-                        const uint32_t transfer_size = DpuCommunicationManager::alignToMram(
-                            max_hit_count * static_cast<uint32_t>(sizeof(Hit)));
-                        std::vector<std::vector<uint8_t>> hit_bufs;
-                        dpu_comm_.gatherDataParallel(hit_bufs, transfer_size, max_layout.results_offset + 8);
-
-                        for (uint32_t d = 0; d < num_dpus; ++d) {
-                            if (hit_counts[d] == 0) continue;
-                            dpu_hits[d].resize(hit_counts[d]);
-                            memcpy(dpu_hits[d].data(), hit_bufs[d].data(), hit_counts[d] * sizeof(Hit));
-                        }
-                    }
+                for (uint32_t gid = 0; gid < num_groups; ++gid) {
+                    bool launched = dispatcher.launchGroup(gid, [&](uint32_t d) {
+                        if (d >= perDpuTargetMeta.size()) return false;
+                        if (perDpuTargetMeta[d].empty()) return false;
+                        dpu_active[d] = true;
+                        return true;
+                    });
+                    if (launched) inflight_groups++;
                 }
 
-                // Process hits
-                {
-                    auto timer = dpu_comm_.timeSlot(PS::HostProcessHits);
-                    uint64_t total_hits = 0;
-                    for (uint32_t d = 0; d < num_dpus; ++d) {
-                        for (const auto& hit : dpu_hits[d]) {
-                            if (hit.query_id >= batch.meta.size()) continue;
-                            size_t q_global = batch.qids[hit.query_id];
-                            hit_t res;
-                            res.seqId = tdbr->getDbKey(hit.target_id);
-                            res.prefScore = hit.score;
-                            res.diagonal = hit.diagonal;
-                            allResults[q_global].push_back(res);
-                            total_hits++;
+                auto timer = dpu_comm_.timeSlot(PS::HostDispatcherWait);
+                while (inflight_groups > 0) {
+                    size_t drained = dispatcher.drainCompleted([&](uint32_t d) {
+                        if (!dpu_active[d]) return;
+                        dpu_ready[d] = true;
+                    });
+
+                    if (drained == 0) {
+                        dispatcher.poll();
+                    } else {
+                        inflight_groups -= drained;
+
+                        // Gather Headers
+                        std::vector<std::vector<uint8_t>> header_bufs(num_dpus);
+                        for (uint32_t d = 0; d < num_dpus; ++d) {
+                            if (dpu_ready[d]) header_bufs[d].resize(8);
                         }
+                        dpu_comm_.gatherDataParallel(header_bufs, 8, max_layout.results_offset);
+
+                        // Parse Headers
+                        std::vector<uint32_t> hit_counts(num_dpus, 0);
+                        uint32_t max_hit_count = 0;
+                        for (uint32_t d = 0; d < num_dpus; ++d) {
+                            if (!dpu_ready[d]) continue;
+                            uint64_t hdr = 0;
+                            memcpy(&hdr, header_bufs[d].data(), 8);
+                            uint32_t hit_count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+                            if (hit_count > maxHitsPerDpu[d]) {
+                                Debug(Debug::ERROR) << "[DPU] Overflow DPU " << d << ": " << hit_count;
+                                EXIT(EXIT_FAILURE);
+                            }
+                            hit_counts[d] = hit_count;
+                            if (hit_count > max_hit_count) max_hit_count = hit_count;
+                        }
+
+                        // Gather Hits
+                        std::vector<std::vector<uint8_t>> hit_bufs(num_dpus);
+                        if (max_hit_count > 0) {
+                            const uint32_t transfer_size = DpuCommunicationManager::alignToMram(
+                                max_hit_count * static_cast<uint32_t>(sizeof(Hit)));
+                            for (uint32_t d = 0; d < num_dpus; ++d) {
+                                if (dpu_ready[d]) hit_bufs[d].resize(transfer_size);
+                            }
+                            dpu_comm_.gatherDataParallel(hit_bufs, transfer_size, max_layout.results_offset + 8);
+                        }
+
+                        // Process Hits (Pipelined)
+                        uint64_t total_hits = 0;
+                        for (uint32_t d = 0; d < num_dpus; ++d) {
+                            if (!dpu_ready[d]) continue;
+                            
+                            uint32_t count = hit_counts[d];
+                            if (count > 0) {
+                                const Hit* hits_raw = reinterpret_cast<const Hit*>(hit_bufs[d].data());
+                                for (uint32_t i = 0; i < count; ++i) {
+                                    const Hit& hit = hits_raw[i];
+                                    if (hit.query_id >= batch.meta.size()) continue;
+                                    size_t q_global = batch.qids[hit.query_id];
+                                    hit_t res;
+                                    res.seqId = tdbr->getDbKey(hit.target_id);
+                                    res.prefScore = hit.score;
+                                    res.diagonal = hit.diagonal;
+                                    allResults[q_global].push_back(res);
+                                    total_hits++;
+                                }
+                            }
+                            dpu_ready[d] = false;
+                            dpu_active[d] = false;
+                        }
+                        dpu_comm_.recordSlotMetrics(PS::HostProcessHits, 0, total_hits);
                     }
-                    dpu_comm_.recordSlotMetrics(PS::HostProcessHits, 0, total_hits);
                 }
             }
-        } // End Target Batch Loop
+        }
 
-        // Write Results
         {
             auto timer = dpu_comm_.timeSlot(PS::HostResultWrite);
             for (size_t qId = 0; qId < qdbr->getSize(); ++qId) {
