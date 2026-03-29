@@ -314,8 +314,19 @@ void Prefiltering::setupSplit(DBReader<unsigned int>& tdbr, const int alphabetSi
         //TODO add PROFILE_STATE (just 6-mers)
         std::pair<int, int> splitSettings = Prefiltering::optimizeSplit(memoryLimit, &tdbr, alphabetSize, kmerSize, querySeqTyp, threads);
         if (splitSettings.second == -1) {
-            Debug(Debug::ERROR) << "Cannot fit databases into " << ByteParser::format(memoryLimit) << ". Please use a computer with more main memory.\n";
-            EXIT(EXIT_FAILURE);
+#ifdef HAVE_DPU
+            // DPU mode builds its own index and does not use the CPU index table,
+            // so the CPU memory estimate is irrelevant — skip the fatal exit.
+            const Parameters& parDpu = Parameters::getInstance();
+            if (parDpu.dpu) {
+                Debug(Debug::WARNING) << "Cannot fit CPU index into " << ByteParser::format(memoryLimit)
+                                      << " but DPU mode is active (uses own index). Continuing.\n";
+            } else
+#endif
+            {
+                Debug(Debug::ERROR) << "Cannot fit databases into " << ByteParser::format(memoryLimit) << ". Please use a computer with more main memory.\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
         if (kmerSize == 0) {
             // set k-mer based on aa size in database
@@ -751,7 +762,15 @@ bool Prefiltering::runSplit(const std::string &resultDB, const std::string &resu
             sequenceLookup = NULL;
         }
 
+        // DPU mode builds its own index via DpuIndexBuilder — skip the expensive CPU index
+#ifdef HAVE_DPU
+        const Parameters& parCheck = Parameters::getInstance();
+        if (!parCheck.dpu) {
+            getIndexTable(split, dbFrom, dbSize);
+        }
+#else
         getIndexTable(split, dbFrom, dbSize);
+#endif
     } else if (splitMode == Parameters::QUERY_DB_SPLIT) {
         qdbr->decomposeDomainByAminoAcid(split, splits, &queryFrom, &querySize);
         if (querySize == 0) {

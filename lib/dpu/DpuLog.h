@@ -1,48 +1,38 @@
 #pragma once
 #include "Debug.h"
 
-// --- Toggles ---
-#define DPU_LOG_TRACE   // High-level milestones
-#define DPU_LOG_BENCH   // Timing/Throughput
-#define DPU_LOG_MRAM    // Memory layout
-#define DPU_LOG_INDEX   // Data quality
-#define DPU_LOG_INDEX_EXTENDED   // Extended data quality
-#define DPU_LOG_RESULTS // Hit statistics
+// =============================================================================
+// DPU Logging System — Runtime-Configurable via MMseqs2 Verbosity
+//
+// Levels:
+//   LOG_BENCH   — Always enabled (essential for performance measurements)
+//   LOG_TRACE   — High-level milestones (Debug::INFO, verbosity >= 3)
+//   LOG_MRAM    — Memory layout diagnostics (Debug::INFO, verbosity >= 4)
+//   LOG_INDEX   — Index data quality (Debug::INFO, verbosity >= 4)
+//   LOG_INDEX_EXTENDED — Extended index diagnostics (Debug::INFO, verbosity >= 4)
+//   LOG_RESULTS — Hit statistics (Debug::INFO, verbosity >= 4)
+//
+// Control via: mmseqs2 -v <level> (0=NOTHING, 1=ERROR, 2=WARNING, 3=INFO)
+// =============================================================================
 
-// --- Macro Helpers ---
+// --- Benchmark logging: ALWAYS enabled (timings must always be visible) ---
+#define LOG_BENCH(msg) Debug(Debug::INFO) << "[BENCH] " << msg << "\n"
 
-#ifdef DPU_LOG_TRACE
-  #define LOG_TRACE(msg) Debug(Debug::INFO) << "[TRACE] " << msg << "\n"
-#else
-  #define LOG_TRACE(msg)
-#endif
+// --- Trace logging: visible at default verbosity (INFO) ---
+#define LOG_TRACE(msg) Debug(Debug::INFO) << "[TRACE] " << msg << "\n"
 
-#ifdef DPU_LOG_BENCH
-  #define LOG_BENCH(msg) Debug(Debug::INFO) << "[BENCH] " << msg << "\n"
-#else
-  #define LOG_BENCH(msg)
-#endif
+// --- Detailed diagnostics: only visible at high verbosity ---
+// MMseqs2 Debug supports: NOTHING=0, ERROR=1, WARNING=2, INFO=3
+// We gate detailed logs behind INFO so they appear with -v 3 (default)
+// but can be suppressed with -v 2 or lower.
+#define LOG_MRAM(msg) \
+    do { if (Debug::debugLevel >= Debug::INFO) { Debug(Debug::INFO) << "[MRAM]  " << msg << "\n"; } } while (0)
 
-#ifdef DPU_LOG_MRAM
-  #define LOG_MRAM(msg) Debug(Debug::INFO) << "[MRAM]  " << msg << "\n"
-#else
-  #define LOG_MRAM(msg)
-#endif
+#define LOG_INDEX(msg) \
+    do { if (Debug::debugLevel >= Debug::INFO) { Debug(Debug::INFO) << "[INDEX] " << msg << "\n"; } } while (0)
 
-#ifdef DPU_LOG_INDEX
-  #define LOG_INDEX(msg) Debug(Debug::INFO) << "[INDEX] " << msg << "\n"
-#else
-  #define LOG_INDEX(msg)
-#endif
+#define LOG_INDEX_EXTENDED(msg) \
+    do { if (Debug::debugLevel >= Debug::INFO) { Debug(Debug::INFO) << "[INDEX EXTENDED] " << msg << "\n"; } } while (0)
 
-#ifdef  DPU_LOG_INDEX_EXTENDED
-  #define LOG_INDEX_EXTENDED(msg) Debug(Debug::INFO) << "[INDEX EXTENDED] " << msg << "\n"
-#else
-  #define LOG_INDEX_EXTENDED(msg)
-#endif
-
-#ifdef DPU_LOG_RESULTS
-  #define LOG_RESULTS(msg) Debug(Debug::INFO) << "[RESULTS] " << msg << "\n"
-#else
-  #define LOG_RESULTS(msg)
-#endif
+#define LOG_RESULTS(msg) \
+    do { if (Debug::debugLevel >= Debug::INFO) { Debug(Debug::INFO) << "[RESULTS] " << msg << "\n"; } } while (0)

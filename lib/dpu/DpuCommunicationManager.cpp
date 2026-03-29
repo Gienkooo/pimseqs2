@@ -570,11 +570,19 @@ void DpuCommunicationManager::dumpProfile(const char* tag) const {
 
   // Calculate totals for summary
   double total_dpu_comm_ms = 0;
+  double total_dpu_exec_ms = 0;
   double total_host_proc_ms = 0;
   
-  for (size_t i = 0; i <= static_cast<size_t>(ProfileSlot::WaitAsync); ++i) {
+  // Communication slots: 0 to 5 (broadcast through load_kernel)
+  for (size_t i = 0; i <= static_cast<size_t>(ProfileSlot::LoadKernel); ++i) {
     total_dpu_comm_ms += profile_[i].total_ms;
   }
+  // Execution slots: 6 to 9 (launch and wait)
+  for (size_t i = static_cast<size_t>(ProfileSlot::LaunchSync); 
+       i <= static_cast<size_t>(ProfileSlot::WaitAsync); ++i) {
+    total_dpu_exec_ms += profile_[i].total_ms;
+  }
+  // Host slots
   for (size_t i = static_cast<size_t>(ProfileSlot::HostBuildQueryBatch); 
        i < static_cast<size_t>(ProfileSlot::HostTotalBatch); ++i) {
     total_host_proc_ms += profile_[i].total_ms;
@@ -586,7 +594,7 @@ void DpuCommunicationManager::dumpProfile(const char* tag) const {
   
   // DPU Communication section
   Debug(Debug::INFO) << "[DPU PROFILE] -- DPU Communication --\n";
-  for (size_t i = 0; i <= static_cast<size_t>(ProfileSlot::WaitAsync); ++i) {
+  for (size_t i = 0; i <= static_cast<size_t>(ProfileSlot::LoadKernel); ++i) {
     const auto &e = profile_[i];
     if (e.count == 0) continue;
     double avg = e.total_ms / static_cast<double>(e.count);
@@ -598,6 +606,19 @@ void DpuCommunicationManager::dumpProfile(const char* tag) const {
       snprintf(buf, sizeof(buf), " data=%.2fMB", mb);
       Debug(Debug::INFO) << buf;
     }
+    Debug(Debug::INFO) << "\n";
+  }
+
+  // DPU Execution section
+  Debug(Debug::INFO) << "[DPU PROFILE] -- DPU Execution --\n";
+  for (size_t i = static_cast<size_t>(ProfileSlot::LaunchSync); 
+       i <= static_cast<size_t>(ProfileSlot::WaitAsync); ++i) {
+    const auto &e = profile_[i];
+    if (e.count == 0) continue;
+    double avg = e.total_ms / static_cast<double>(e.count);
+    snprintf(buf, sizeof(buf), "[DPU PROFILE]   %s: count=%llu total=%.1fms avg=%.2fms max=%.1fms",
+             kNames[i], (unsigned long long)e.count, e.total_ms, avg, e.max_ms);
+    Debug(Debug::INFO) << buf;
     Debug(Debug::INFO) << "\n";
   }
   
@@ -629,11 +650,14 @@ void DpuCommunicationManager::dumpProfile(const char* tag) const {
   snprintf(buf, sizeof(buf), "[DPU PROFILE]   DPU comm total: %.1fms (%.1fs)\n", 
            total_dpu_comm_ms, total_dpu_comm_ms/1000.0);
   Debug(Debug::INFO) << buf;
+  snprintf(buf, sizeof(buf), "[DPU PROFILE]   DPU exec total: %.1fms (%.1fs)\n", 
+           total_dpu_exec_ms, total_dpu_exec_ms/1000.0);
+  Debug(Debug::INFO) << buf;
   snprintf(buf, sizeof(buf), "[DPU PROFILE]   Host proc total: %.1fms (%.1fs)\n",
            total_host_proc_ms, total_host_proc_ms/1000.0);
   Debug(Debug::INFO) << buf;
   if (total_batch_ms > 0) {
-    double other_ms = total_batch_ms - total_dpu_comm_ms - total_host_proc_ms;
+    double other_ms = total_batch_ms - total_dpu_comm_ms - total_dpu_exec_ms - total_host_proc_ms;
     snprintf(buf, sizeof(buf), "[DPU PROFILE]   Batch total: %.1fms (%.1fs)\n",
              total_batch_ms, total_batch_ms/1000.0);
     Debug(Debug::INFO) << buf;

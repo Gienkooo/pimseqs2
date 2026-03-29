@@ -68,7 +68,7 @@ class DpuCommunicationManager {
   void waitForKernel(uint32_t dpu_id);
   bool isExecutionComplete(uint32_t dpu_id);
 
-  static constexpr uint32_t MRAM_SIZE = 64 * 1024 * 1024;  // 64 MB
+  static constexpr uint32_t MRAM_SIZE = 64 * 1024 * 1024;  // 64 MB TODO header constants
   static constexpr uint32_t WRAM_SIZE = 64 * 1024;         // 64 KB
   static constexpr uint32_t MRAM_ALIGN = 8;                // 8-byte
 

@@ -2,7 +2,8 @@
 
 #include "shared/DpuSharedTypes.h"
 #include "DpuCommunicationManager.h"
-#include "DpuWorkflow.h"
+#include "DpuMramAllocator.h"
+#include "DpuRankDispatcher.h"
 #include "DpuKernelManager.h"
 
 #include "DBReader.h"
@@ -51,8 +52,137 @@ class DpuPrefilterHostPipeline {
 
  private:
   DpuCommunicationManager dpu_comm_;
-  DpuWorkflow workflow_;
   DpuKernelManager kernel_mgr_; 
+  
+  // Pipeline-native typed communication helpers that replace the duplicate DpuWorkflow middleman
+  void broadcastCommonData(const void* data, uint32_t size, uint32_t mram_offset) {
+      if (size == 0) return;
+      uint32_t aligned = DpuCommunicationManager::alignToMram(size);
+      if (size == aligned) {
+          dpu_comm_.broadcastData(data, aligned, mram_offset);
+      } else {
+          std::vector<uint8_t> buf(aligned, 0);
+          memcpy(buf.data(), data, size);
+          dpu_comm_.broadcastData(buf.data(), aligned, mram_offset);
+      }
+  }
+
+  template <typename BatchDescT>
+  void scatterBatchToDpus(const std::vector<BatchDescT>& descriptors, const std::vector<std::vector<TargetMetadata>>& t_meta, const std::vector<std::vector<uint8_t>>& t_data, uint32_t meta_off, uint32_t data_off) {
+      uint32_t num_dpus = descriptors.size();
+      if (num_dpus == 0) return;
+
+      std::vector<std::vector<uint8_t>> desc_bufs(num_dpus);
+      uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(BatchDescT));
+      for (uint32_t i = 0; i < num_dpus; ++i) {
+          desc_bufs[i].resize(bd_size);
+          memcpy(desc_bufs[i].data(), &descriptors[i], sizeof(BatchDescT));
+      }
+      dpu_comm_.scatterDataParallel(desc_bufs, 0);
+
+      std::vector<std::vector<uint8_t>> meta_bufs(num_dpus);
+      for (uint32_t i = 0; i < num_dpus; ++i) {
+          if (!t_meta[i].empty()) {
+              uint32_t tmeta_bytes = t_meta[i].size() * sizeof(TargetMetadata);
+              meta_bufs[i].resize(tmeta_bytes); 
+              memcpy(meta_bufs[i].data(), t_meta[i].data(), tmeta_bytes);
+          }
+      }
+      dpu_comm_.scatterDataParallel(meta_bufs, meta_off);
+      dpu_comm_.scatterDataParallel(t_data, data_off);
+  }
+
+  void scatterUngappedTargetsOnly(const std::vector<std::vector<TargetMetadata>>& t_meta, const std::vector<std::vector<uint8_t>>& t_data, uint32_t meta_off, uint32_t data_off);
+  
+  template <typename BatchDescT>
+  void scatterDescriptorsOnly(const std::vector<BatchDescT>& descriptors) {
+      uint32_t num_dpus = descriptors.size();
+      if (num_dpus == 0) return;
+      std::vector<std::vector<uint8_t>> desc_bufs(num_dpus);
+      uint32_t bd_size = DpuCommunicationManager::alignToMram(sizeof(BatchDescT));
+      for (uint32_t i = 0; i < num_dpus; ++i) {
+          desc_bufs[i].resize(bd_size);
+          memcpy(desc_bufs[i].data(), &descriptors[i], sizeof(BatchDescT));
+      }
+      dpu_comm_.scatterDataParallel(desc_bufs, 0);
+  }
+
+  template <typename HitType>
+  std::vector<HitType> gatherResultsClamped(uint32_t dpu_id, uint32_t results_mram_offset, uint32_t result_capacity_bytes, uint32_t& out_overflow) {
+      uint64_t hdr = 0;
+      dpu_comm_.gatherDataFromDPU(dpu_id, &hdr, 8, results_mram_offset);
+      uint32_t hitcount = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+      uint32_t hi = static_cast<uint32_t>((hdr >> 32) & 0xFFFFFFFFu);
+      out_overflow = (hi >> 31) & 1u;
+
+      if (result_capacity_bytes <= 8) return {};
+      uint32_t maxHits = (result_capacity_bytes - 8) / sizeof(HitType);
+      if (hitcount > maxHits) hitcount = maxHits;
+      if (hitcount == 0) return {};
+
+      uint32_t hits_offset = results_mram_offset + 8;
+      uint32_t data_size = hitcount * sizeof(HitType);
+      uint32_t aligned_size = DpuCommunicationManager::alignToMram(data_size);
+
+      std::vector<HitType> hits(hitcount);
+      if (aligned_size != data_size) {
+          std::vector<uint8_t> buf(aligned_size);
+          dpu_comm_.gatherDataFromDPU(dpu_id, buf.data(), aligned_size, hits_offset);
+          memcpy(hits.data(), buf.data(), data_size);
+      } else {
+          dpu_comm_.gatherDataFromDPU(dpu_id, hits.data(), aligned_size, hits_offset);
+      }
+      return hits;
+  }
+  
+  std::vector<KmerDoubleHit> gatherKmerResultsClamped(
+      uint32_t dpu_id, 
+      uint32_t results_mram_offset, 
+      uint32_t result_capacity_bytes, 
+      uint32_t& out_overflow);
+
+  template <typename HitType>
+  std::vector<std::vector<HitType>> gatherResultsParallel(uint32_t results_mram_offset, uint32_t result_capacity_bytes) {
+      uint32_t num_dpus = dpu_comm_.getNumDPUsActive();
+      std::vector<std::vector<HitType>> all_hits(num_dpus);
+
+      std::vector<std::vector<uint8_t>> count_bufs;
+      dpu_comm_.gatherDataParallel(count_bufs, 8, results_mram_offset);
+
+      uint32_t max_hits = 0;
+      std::vector<uint32_t> hit_counts(num_dpus);
+
+      for (uint32_t i = 0; i < num_dpus; ++i) {
+          uint64_t hdr = 0;
+          memcpy(&hdr, count_bufs[i].data(), 8);
+          uint32_t count = static_cast<uint32_t>(hdr & 0xFFFFFFFFu);
+          
+          if (result_capacity_bytes > 8) {
+              uint32_t max_cap = (result_capacity_bytes - 8) / sizeof(HitType);
+              if (count > max_cap) count = max_cap;
+          } else {
+              count = 0;
+          }
+          hit_counts[i] = count;
+          if (count > max_hits) max_hits = count;
+      }
+
+      if (max_hits == 0) return all_hits;
+
+      uint32_t transfer_size = max_hits * sizeof(HitType);
+      uint32_t aligned_transfer = DpuCommunicationManager::alignToMram(transfer_size);
+      
+      std::vector<std::vector<uint8_t>> hit_bufs;
+      dpu_comm_.gatherDataParallel(hit_bufs, aligned_transfer, results_mram_offset + 8);
+
+      for (uint32_t i = 0; i < num_dpus; ++i) {
+          if (hit_counts[i] > 0) {
+              all_hits[i].resize(hit_counts[i]);
+              memcpy(all_hits[i].data(), hit_bufs[i].data(), hit_counts[i] * sizeof(HitType));
+          }
+      }
+      return all_hits;
+  } 
 
   // Shared batch container for query packing across gapped/combined modes.
   struct BatchData {
@@ -75,26 +205,7 @@ class DpuPrefilterHostPipeline {
       uint32_t max_common_bytes;
   };
 
-  struct TargetChunk {
-      bool valid = false;
-      size_t count = 0;
-      std::vector<uint32_t> indices;
-      std::vector<uint8_t> data;
-      std::vector<TargetMetadata> meta;
-      DpuWorkflow::MramLayout layout{};
-  };
 
-  TargetChunk buildTargetChunk(
-      uint32_t dpu_id, 
-      size_t cursor, 
-      const std::vector<std::vector<uint32_t>>& perDpuTargetIndices, 
-      DBReader<unsigned int>* tdbr,
-      BaseMatrix* subMat,
-      uint32_t query_count, 
-      uint32_t common_size, 
-      uint32_t scratch_bytes,
-      size_t descriptor_size,
-      size_t result_size);
 
   BatchData buildQueryBatch(
       size_t start_q_idx,
@@ -118,44 +229,7 @@ class DpuPrefilterHostPipeline {
       std::vector<std::vector<Matcher::result_t>>& out_results,
       bool is_gpu);
 
-  bool canFitAtLeastOneTarget(
-      uint32_t num_dpus,
-      const std::vector<uint32_t>& perDpuLens,
-      uint32_t query_count,
-      uint32_t common_size,
-      uint32_t scratch_bytes,
-      size_t descriptor_size,
-      size_t result_size);
 
-  void processGappedHits(
-      const std::vector<GappedHit>& hits, 
-      const TargetChunk& chunk,
-      uint32_t queryLen,
-      unsigned int queryKey,
-      bool sameDB,
-      Parameters& par,
-      DBReader<unsigned int>* tdbr,
-      EvalueComputation* evaluer,
-      std::vector<Matcher::result_t>& resultsForQuery);
-
-  void processUngappedHits(
-      const std::vector<Hit>& hits,
-      const TargetChunk& chunk,
-      const std::vector<unsigned int>& batchQueryKeys,
-      DBReader<unsigned int>* tdbr,
-      std::vector<std::vector<hit_t>>& resultsByQuery);
-
-  void processCombinedHits(
-      const std::vector<GappedHit>& hits,
-      const TargetChunk& chunk,
-      const std::vector<unsigned int>& batchQueryKeys,
-      const std::vector<uint32_t>& batchQueryLens,
-      bool sameDB,
-      Parameters& par,
-      DBReader<unsigned int>* tdbr,
-      EvalueComputation* evaluer,
-      QueryMatcherTaxonomyHook* taxonomyHook,
-      std::vector<std::vector<Matcher::result_t>>& resultsByQuery);
   
   void runDpuKmerBatch(
       Parameters& par,
@@ -261,6 +335,7 @@ class DpuPrefilterHostPipeline {
   std::vector<std::vector<uint32_t>> buildLoadBalancedDistribution(
       DBReader<unsigned int>* tdbr, uint32_t num_dpus);
 
+  int getMaxTargetsPerDpu(std::vector<std::vector<TargetMetadata>> &perDpuTargetMeta);
 };
 
 }  // namespace mmseqs::dpu

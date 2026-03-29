@@ -44,3 +44,9 @@ build.old/
 .vscode/
 vsc.code-workspace
 scripts/validation/results/
+scripts/validation/tmp_pair/
+scripts/tmp_mode*/
+scripts/tmp_compare/
+*.log
+*_dump
+*_dump.*

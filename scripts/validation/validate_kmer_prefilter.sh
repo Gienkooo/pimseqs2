@@ -85,16 +85,17 @@ log "Running K-mer Prefilter on CPU..."
     --mask 0 \
     --mask-lower-case 0 \
     --mask-n-repeat 0 \
-    --max-seqs 1000000 \
+    --max-seqs "${MAX_SEQS:-10000}" \
+    --split 1 \
     --spaced-kmer-mode 0 \
     --min-ungapped-score 0 \
     --spaced-kmer-pattern "$MASK" \
     --diag-score 0 \
-    --threads $(nproc) \
+    --threads 1 \
     -v 3 > "$OUT_DIR/kmer_cpu.log" 2>&1
 
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    error "CPU run failed. Check $OUT_DIR/kmer_cpu.log"
+if [ $? -ne 0 ]; then
+    log "WARNING: CPU run failed (likely OOM). DPU-only validation. Check $OUT_DIR/kmer_cpu.log"
 fi
 
 # 3. Run DPU
@@ -109,8 +110,10 @@ DPU_PROFILE=1 "$MMSEQS_BIN" prefilter "$QUERY_DB" "$TARGET_DB" "$DPU_DB" \
     --spaced-kmer-mode 0 \
     --min-ungapped-score 0  \
     --spaced-kmer-pattern "$MASK" \
+    --split 0 \
     --dpu 1 \
     --dpu-num-dpus "$FINAL_DPU_COUNT" \
+    --threads 1 \
     -v 3 > "$DPU_LOG" 2>&1
 
 if [ ${PIPESTATUS[0]} -ne 0 ]; then

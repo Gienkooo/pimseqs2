@@ -14,13 +14,13 @@
 #define T_TILE_SIZE 128   
 
 typedef struct {
-    int16_t H_col[Q_TILE_SIZE + 2] __attribute__((aligned(8)));
-    int16_t E_col[Q_TILE_SIZE + 2] __attribute__((aligned(8)));
+    int16_t H_col[Q_TILE_SIZE + 4] __attribute__((aligned(8)));
+    int16_t E_col[Q_TILE_SIZE + 4] __attribute__((aligned(8)));
 
-    int16_t H_top[T_TILE_SIZE + 2] __attribute__((aligned(8)));
-    int16_t F_top[T_TILE_SIZE + 2] __attribute__((aligned(8)));
-    int16_t H_bot[T_TILE_SIZE + 2] __attribute__((aligned(8)));
-    int16_t F_bot[T_TILE_SIZE + 2] __attribute__((aligned(8)));
+    int16_t H_top[T_TILE_SIZE + 4] __attribute__((aligned(8)));
+    int16_t F_top[T_TILE_SIZE + 4] __attribute__((aligned(8)));
+    int16_t H_bot[T_TILE_SIZE + 4] __attribute__((aligned(8)));
+    int16_t F_bot[T_TILE_SIZE + 4] __attribute__((aligned(8)));
 
     uint8_t target_tile[T_TILE_SIZE + 8] __attribute__((aligned(8)));
     int8_t pssm_tile[Q_TILE_SIZE * ALPHA_SIZE + 32] __attribute__((aligned(8)));
@@ -94,7 +94,7 @@ static bool compute_ungapped_diagonal(
         {
             uint32_t q_chunk_len = min_u32(U_Q_TILE, q_len - q_start);
             uintptr_t pssm_src = pssm_mram_base + (q_start * ALPHA_SIZE);
-            mram_read_unaligned_bulk(pssm_src, pssm_cache, q_chunk_len * ALPHA_SIZE);
+            mram_read_aligned_bulk(pssm_src, pssm_cache, q_chunk_len * ALPHA_SIZE);
 
             int8_t *pssm_col_ptr = pssm_cache; 
 
@@ -222,11 +222,11 @@ static SwResult compute_sw_tiled(
             // Load PSSM
             uintptr_t tile_addr = pssm_mram_base + (uintptr_t)q_start * ALPHA_SIZE;
             uint32_t tile_bytes = q_size * ALPHA_SIZE;
-            if ((tile_addr & 7U) == 0) {
-                mram_read_aligned_bulk(tile_addr, pssm_tile, tile_bytes);
-            } else {
-                mram_read_unaligned_bulk(tile_addr, pssm_tile, tile_bytes);
+            if ((tile_addr & 7U) != 0) {
+                // Defensive catch, though statically impossible with host pipeline
+                continue; 
             }
+            mram_read_aligned_bulk(tile_addr, pssm_tile, tile_bytes);
 
             H_bot[0] = H_col[q_size];
             F_bot[0] = NEG_INF;

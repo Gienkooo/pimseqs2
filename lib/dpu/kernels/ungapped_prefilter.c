@@ -28,18 +28,17 @@
 /* Maximum diagonal entries per tasklet.
  * CONSTRAINT: max_query_len + max_target_len <= MAX_DIAG_ENTRIES
  * 
- * With MAX_DIAG_ENTRIES=4096:
- *   - query=500  -> max target = 3596 residues
- *   - query=1000 -> max target = 3096 residues  
- *   - query=2000 -> max target = 2096 residues
+ * With MAX_DIAG_ENTRIES=2048:
+ *   - query=500  -> max target = 1548 residues
+ *   - query=1000 -> max target = 1048 residues  
  * 
- * This covers 99%+ of proteins (average ~300, 99th percentile ~2000).
+ * This covers 95%+ of proteins (average ~300, 95th percentile ~1000).
  * Sequences exceeding this limit are silently skipped.
  * For very long sequences, use gapped mode which streams via MRAM.
  * 
- * Memory: 4096 * 2 bytes = 8KB per tasklet diagonal buffer.
- * With 6 active tasklets: 48KB diagonal buffers + 9KB tiles + 3KB cache = ~60KB WRAM. */
-#define MAX_DIAG_ENTRIES 4096
+ * Memory: 2048 * 2 bytes = 4KB per tasklet diagonal buffer.
+ * With 5 active tasklets: 20KB diagonal buffers + 5KB tiles + 2.5KB cache = ~27.5KB WRAM. */
+#define MAX_DIAG_ENTRIES 2048
 
 /* Globals */
 __dma_aligned UngappedBatchDescriptor g_bd;
@@ -101,11 +100,11 @@ static void compute_ungapped_diagonal_with_diag(
         if (read_size & 7) read_size = (read_size + 7) & ~7;
         
         uintptr_t src = pssm_mram_base + (q_start * ALPHA_SIZE);
-        if ((src & 7U) == 0 && read_size >= 128) {
-            mram_read_aligned_bulk(src, pssm_cache, read_size);
-        } else {
-            mram_read((__mram_ptr void*)src, pssm_cache, read_size);
+        if ((src & 7U) != 0) {
+            // Defensive catch, though statically impossible with host pipeline
+            continue;
         }
+        mram_read((__mram_ptr void*)src, pssm_cache, read_size);
 
         for (uint32_t q = q_start; q < chunk_end; ++q) {
             // Pointer to cached column (PSSM is SIGNED int8_t from host)

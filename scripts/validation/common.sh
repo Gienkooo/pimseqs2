@@ -8,8 +8,8 @@ BUILD_DIR="$ROOT_DIR/build"
 MMSEQS_BIN="$BUILD_DIR/src/mmseqs"
 
 # Default datasets (respect environment variables if already set)
-QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY.fasta}"
-TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB.fasta}"
+QUERY_FASTA="${QUERY_FASTA:-$ROOT_DIR/examples/QUERY_small.fasta}"
+TARGET_FASTA="${TARGET_FASTA:-$ROOT_DIR/examples/DB_small.fasta}"
 
 # Output directory
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"

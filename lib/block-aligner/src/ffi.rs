@@ -319,7 +319,7 @@ macro_rules! gen_functions {
      $matrix:ty, $profile:ty, $trace:literal, $x_drop:literal) => {
         #[doc = $new_doc]
         #[no_mangle]
-        pub unsafe extern fn $new_name(query_len: usize,
+        pub unsafe extern "C" fn $new_name(query_len: usize,
                                        reference_len: usize,
                                        max_size: usize) -> BlockHandle {
             let aligner = Box::new(Block::<$trace, $x_drop>::new(query_len, reference_len, max_size));
@@ -328,7 +328,7 @@ macro_rules! gen_functions {
 
         #[doc = $align_doc]
         #[no_mangle]
-        pub unsafe extern fn $align_name(b: BlockHandle,
+        pub unsafe extern "C" fn $align_name(b: BlockHandle,
                                          q: *const PaddedBytes,
                                          r: *const PaddedBytes,
                                          m: *const $matrix,
@@ -341,7 +341,7 @@ macro_rules! gen_functions {
 
         #[doc = $align_profile_doc]
         #[no_mangle]
-        pub unsafe extern fn $align_profile_name(b: BlockHandle,
+        pub unsafe extern "C" fn $align_profile_name(b: BlockHandle,
                                                  q: *const PaddedBytes,
                                                  r: *const $profile,
                                                  s: SizeRange,
@@ -352,7 +352,7 @@ macro_rules! gen_functions {
 
         #[doc = $align_aa_doc]
         #[no_mangle]
-        pub unsafe extern fn $align_aa_name(b: BlockHandle,
+        pub unsafe extern "C" fn $align_aa_name(b: BlockHandle,
                                              q: *const PaddedBytes,
                                              q_bias: *const PosBias,
                                              r: *const PaddedBytes,
@@ -368,7 +368,7 @@ macro_rules! gen_functions {
 
         #[doc = $align_3di_doc]
         #[no_mangle]
-        pub unsafe extern fn $align_3di_name(b: BlockHandle,
+        pub unsafe extern "C" fn $align_3di_name(b: BlockHandle,
                                              q: *const PaddedBytes,
                                              q_3di: *const PaddedBytes,
                                              q_bias: *const PosBias,
@@ -386,28 +386,28 @@ macro_rules! gen_functions {
 
         #[doc = $res_doc]
         #[no_mangle]
-        pub unsafe extern fn $res_name(b: BlockHandle) -> AlignResult {
+        pub unsafe extern "C" fn $res_name(b: BlockHandle) -> AlignResult {
             let aligner = &*(b as *const Block<$trace, $x_drop>);
             aligner.res()
         }
 
         #[doc = $trace_doc]
         #[no_mangle]
-        pub unsafe extern fn $trace_name(b: BlockHandle, query_idx: usize, reference_idx: usize, cigar: *mut Cigar) {
+        pub unsafe extern "C" fn $trace_name(b: BlockHandle, query_idx: usize, reference_idx: usize, cigar: *mut Cigar) {
             let aligner = &*(b as *const Block<$trace, $x_drop>);
             aligner.trace().cigar(query_idx, reference_idx, &mut *cigar);
         }
 
         #[doc = $trace_eq_doc]
         #[no_mangle]
-        pub unsafe extern fn $trace_eq_name(b: BlockHandle, q: *const PaddedBytes, r: *const PaddedBytes, query_idx: usize, reference_idx: usize, cigar: *mut Cigar) {
+        pub unsafe extern "C" fn $trace_eq_name(b: BlockHandle, q: *const PaddedBytes, r: *const PaddedBytes, query_idx: usize, reference_idx: usize, cigar: *mut Cigar) {
             let aligner = &*(b as *const Block<$trace, $x_drop>);
             aligner.trace().cigar_eq(&*q, &*r, query_idx, reference_idx, &mut *cigar);
         }
 
         #[doc = $free_doc]
         #[no_mangle]
-        pub unsafe extern fn $free_name(b: BlockHandle) {
+        pub unsafe extern "C" fn $free_name(b: BlockHandle) {
             drop(Box::from_raw(b as *mut Block<$trace, $x_drop>));
         }
     };

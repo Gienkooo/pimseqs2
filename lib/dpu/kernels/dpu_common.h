@@ -14,11 +14,9 @@
 
 #define MAX_MRAM_TRANSFER_SIZE 2048
 
-#define ALPHA_SIZE 21
 #define ALIGN8_PTR(p) ((void*)(((uintptr_t)(p) + 7) & ~((uintptr_t)7)))
 #define MRAM_ALIGN_SIZE(x) ALIGN8(x)
 
-/* Debug print control - disable for production and benchmark builds */
 #ifndef DPU_DEBUG
 #define DPU_DEBUG 0
 #endif
@@ -34,52 +32,23 @@
 #define NR_TASKLETS 1
 #endif
 
-/* --- Common Constants --- */
-#define NEG_INF (-10000)  /* Safe value for int16 math */
+#define NEG_INF (-10000)  
 
-/* =============================================================================
- * WRAM BUDGET CALCULATION (64KB total):
- * 
- *   - Stack per tasklet:         ~2KB   (DPU runtime requirement)
- *   - Global descriptors:        ~256B  (g_bd, hit counters)
- *   - Global query cache:        ~1KB   (g_query_meta[128] * 8B)
- *   - Per-tasklet scratch heap:  variable (allocated via mem_alloc)
- *
- * For N tasklets, available heap = 64KB - (N * 2KB) - 1.5KB globals = ~62.5KB - N*2KB
- *   - 8 tasklets:  62.5 - 16 = 46.5KB heap → 5.8KB per tasklet scratch
- *   - 11 tasklets: 62.5 - 22 = 40.5KB heap → 3.7KB per tasklet scratch  
- *   - 14 tasklets: 62.5 - 28 = 34.5KB heap → 2.5KB per tasklet scratch
- *   - 16 tasklets: 62.5 - 32 = 30.5KB heap → 1.9KB per tasklet scratch
- *
- * Scratch requirements per tasklet:
- *   - Ungapped: diag_buffer + pssm_cache + target_chunk ≈ 2-4KB depending on seq len
- *   - Gapped SW: H_top/F_top/H_bot/F_bot/H_col/E_col + target_tile + pssm_tile ≈ 2KB
- *   - Combined: max(ungapped, gapped) ≈ 3-4KB
- *
- * Safe defaults: 8-11 tasklets with 3-4KB scratch each.
- * ============================================================================= */
+#define MAX_SAFE_TASKLETS 14    
+#define MAX_BATCH_QUERIES 128 
 
-/* Tasklet limits - WRAM is 64KB shared by all tasklets */
-#define MAX_SAFE_TASKLETS 14    /* Conservative limit for combined kernel */
-#define MAX_BATCH_QUERIES 128   /* Maximum queries cached in WRAM (global, shared) */
-
-/* Calculate per-tasklet scratch budget based on tasklet count.
- * Formula: (60KB available - globals) / num_tasklets with safety margin */
 #define WRAM_AVAILABLE_HEAP(n)  (60 * 1024 - (n) * 2048)
 #define SCRATCH_PER_TASKLET(n)  (WRAM_AVAILABLE_HEAP(n) / (n))
 
-/* Default gap costs (can be overridden by batch descriptor) */
 #define DEFAULT_GAP_OPEN 11
 #define DEFAULT_GAP_EXTEND 1
 
-/* --- Smith-Waterman Result Type --- */
 typedef struct {
     int32_t score;
     uint16_t q_end;
     uint16_t t_end;
 } SwResult;
 
-/* Compile-time shift-based multiplication helpers */
 #define MUL_2(x)   ((x) << 1)
 #define MUL_3(x)   (((x) << 1) + (x))
 #define MUL_4(x)   ((x) << 2)
@@ -87,8 +56,6 @@ typedef struct {
 #define MUL_21(x)   (((x) << 4) + ((x) << 2) + (x))
 #define MUL_100(x)  (((x) << 6) + ((x) << 5) + ((x) << 2))
 #define MUL_1656(x) (((x) << 10) + ((x) << 9) + ((x) << 7) - ((x) << 3))
-
-/* --- Utilities --- */
 
 static inline int16_t max2(int16_t a, int16_t b) { return (a > b) ? a : b; }
 static inline int16_t max3(int16_t a, int16_t b, int16_t c) { return max2(a, max2(b, c)); }
@@ -218,76 +185,6 @@ static inline void mram_read_aligned_bulk(uintptr_t src, void *dst, uint32_t len
     }
 }
 
-/* Safe unaligned MRAM read helper for SMALL payloads (up to 24 bytes).
- * For larger payloads, use mram_read_unaligned_bulk() instead. */
-static inline void mram_read_unaligned_bytes(uintptr_t src, void *dst, uint32_t len)
-{
-    uint32_t off = (uint32_t)(src & 7U);
-    uintptr_t aligned_src = src & ~7U;
-    uint32_t need = ALIGN8(len + off);
-    
-    /* Enforce DMA constraints: min 8 bytes, max 2048 bytes */
-    if (need < 8) need = 8;
-    if (need > 32) need = 32;  /* Buffer size limit */
-
-    __dma_aligned uint8_t tmp[32];
-
-    /* Read aligned region into temp buffer */
-    mram_read((__mram_ptr void *)aligned_src, tmp, need);
-
-    /* Copy requested payload into destination */
-    memcpy((uint8_t *)dst, tmp + off, len);
-}
-
-/* Bulk unaligned MRAM read for larger payloads - more efficient than multiple small reads */
-static inline void mram_read_unaligned_bulk(uintptr_t src, void *dst, uint32_t len)
-{
-    uint32_t off = (uint32_t)(src & 7U);
-    uintptr_t aligned = src & ~7U;
-    uint8_t *out = (uint8_t *)dst;
-
-    if (off != 0)
-    {
-        uint32_t head = 8U - off;
-        if (head > len)
-            head = len;
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp + off, head);
-        aligned += 8;
-        out += head;
-        len -= head;
-    }
-
-    /* Middle section: process aligned chunks of at least 8 bytes.
-     * Note: Direct MRAM read to 'out' requires 'out' to be aligned,
-     * which is guaranteed since we handled the head above. */
-    uint32_t mid = len & ~7U;
-    if (mid >= 8)  /* Enforce minimum 8-byte DMA constraint */
-    {
-        mram_read((__mram_ptr void *)aligned, out, mid);
-        aligned += mid;
-        out += mid;
-        len -= mid;
-    }
-    else if (mid > 0)
-    {
-        /* Less than 8 bytes aligned: use temp buffer */
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp, mid);
-        aligned += 8;
-        out += mid;
-        len -= mid;
-    }
-
-    if (len)
-    {
-        __dma_aligned uint8_t tmp[8];
-        mram_read((__mram_ptr void *)aligned, tmp, 8);
-        memcpy(out, tmp, len);
-    }
-}
 
 /* Optimized MRAM fill using 64-byte buffer to balance efficiency vs stack usage.
  * With 11+ tasklets, stack space is precious. 64 bytes = 32 int16 elements.

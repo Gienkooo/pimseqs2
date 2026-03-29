@@ -48,6 +48,69 @@ MMseqs2 requires an AMD or Intel 64-bit system (check with `uname -a | grep x86_
 > We recently added support for GPU-accelerated protein sequence and profile searches. This requires an NVIDIA GPU of the Ampere generation or newer for full speed, however, also works at reduced speed for Turing-generation GPUs. The bioconda- and precompiled binaries will not work on older GPU generations (e.g. Volta or Pascal).
 > Check the [wiki](https://github.com/soedinglab/MMseqs2/wiki#compile-from-source-for-linux-with-gpu-support) for instructions on how to get started.
 
+### PIM-Accelerated Search (UPMEM DPU)
+
+This fork adds experimental support for **Processing-In-Memory (PIM)** acceleration using [UPMEM](https://www.upmem.com/) DPU hardware. PIM offloads the computationally intensive prefilter step directly to DPU processors embedded within DRAM modules, reducing data movement between CPU and memory.
+
+#### Supported Prefilter Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **Ungapped** | `--prefilter-mode 1 --dpu 1` | Diagonal-based ungapped alignment on DPUs |
+| **Gapped** | `--prefilter-mode 2 --dpu 1` | Smith-Waterman gapped alignment on DPUs |
+| **K-mer** | `--prefilter-mode 0 --dpu 1` | K-mer seed-and-extend prefiltering on DPUs |
+| **Combined** | `--prefilter-mode 3 --dpu 1` | Ungapped prefilter + gapped extension pipeline on DPUs |
+
+#### Building with DPU Support
+
+Requires the [UPMEM SDK](https://sdk.upmem.com/) to be installed. Build with:
+
+```bash
+mkdir build && cd build
+cmake -DHAVE_DPU=1 -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+```
+
+If no UPMEM hardware is detected, MMseqs2 automatically falls back to the UPMEM functional simulator.
+
+#### Usage
+
+```bash
+# Create databases
+mmseqs createdb query.fasta queryDB
+mmseqs createdb target.fasta targetDB
+
+# Run DPU-accelerated ungapped prefilter
+mmseqs ungappedprefilter queryDB targetDB resultDB --dpu 1 --prefilter-mode 1
+
+# Control DPU count (default: all available)
+mmseqs ungappedprefilter queryDB targetDB resultDB --dpu 1 --dpu-num-dpus 64
+```
+
+#### Architecture
+
+The DPU host pipeline (`lib/dpu/`) is organized into the following components:
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Pipeline** | `DpuPrefilterHostPipeline` | Orchestrates batching, data transfer, and result collection |
+| **Communication** | `DpuCommunicationManager` | Low-level DPU data transfer (scatter, gather, broadcast) |
+| **MRAM Allocator** | `DpuMramAllocator` | Bump allocator for safe, sequential MRAM partitioning |
+| **Group Manager** | `DpuGroupManager` | Manages DPU rank groups for parallel execution |
+| **Rank Dispatcher** | `DpuRankDispatcher` | Asynchronous multi-rank work queue scheduler |
+| **Kernel Manager** | `DpuKernelManager` | Resolves and loads DPU kernel binaries |
+| **Shared Types** | `shared/DpuSharedTypes.h` | Descriptor structs shared between host and DPU kernels |
+
+DPU kernels (in `lib/dpu/kernels/`) run directly on the DPU processors and implement the core alignment algorithms within the 64KB WRAM and 64MB MRAM constraints of each DPU.
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DPU_NUM_DPUS` | All available | Number of DPUs to allocate |
+| `DPU_PROFILE` | 0 | Set to `1` to enable DPU profiling output |
+| `DPU_HEALTH_CHECK` | 0 | Set to `1` to run DPU health diagnostics at startup |
+
 MMseqs2 comes with a bash command and parameter auto completion, which can be activated by adding the following to your $HOME/.bash_profile:
 
 <pre>

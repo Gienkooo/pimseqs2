@@ -37,27 +37,8 @@ extern "C" {
 #define DPU_COV_MODE_LENGTH_TARGET  4
 #define DPU_COV_MODE_LENGTH_SHORTER 5
 
-// Kernel contract: when adding new DPU kernels, follow these rules:
-// - Include `dpu_common.h` for shared helpers/macros.
-// - Use a descriptor struct whose first field is `DpuBatchHeader`.
-// - Honor `header.num_active_tasklets` (use `is_tasklet_active()` in kernels).
-// - Results MRAM layout: write a 32-bit hit count at results_offset (first 4 bytes)
-//   and start hits at `results_offset + 8` (8-byte aligned header).
-
 #define DPU_MRAM_TOTAL_SIZE (64 * 1024 * 1024) 
-
-/* ==================== K-mer Matching Specific Limits and Structures ==================== 
- * MRAM Layout (Bucketed Hash Index):
- * [0x000000] Descriptor         (~96 B)   ← Batch metadata
- * [STATIC]   Checkpoint         (16 B)    ← Recovery state (packet_idx, valid flag)
- * [STATIC]   State Table        (32 KB)   ← Per-sequence diagonal tracking (8192 * 4B)
- * [STATIC]   Query Buffer       (12 MB)   ← Input packets, fixed size
- * [VARIABLE] Bucket Array       (16 MB+)  ← 65536 primary buckets (16MB) + overflow
- * [VARIABLE] Entries Array      (varies)  ← {target_id, pos} pairs
- * [VARIABLE] Output Buffer      (remaining)
- * ↳ [0x00] Result Header (8 B) ← Count + Overflow flag
- * ↳ [0x08] Double Hits...      ← Contiguous hit array
- */
+#define DPU_MRAM_TARGET_BUDGET (40 * 1024 * 1024)
 
 /* Bucketed Index Parameters  */
 #define NUM_BUCKETS 65536
@@ -320,7 +301,7 @@ struct GappedBatchDescriptor {
 
 #ifdef __cplusplus
     GappedBatchDescriptor() = default;
-    GappedBatchDescriptor(const DpuBatchHeader& header,
+    GappedBatchDescriptor(const DpuBatchHeader& header, int16_t min_score,
                           int16_t gap_open_cost, int16_t gap_extend_cost,
                           uint8_t cov_mode, uint8_t cov_thr_pct,
                           uint8_t min_aln_len, uint8_t seq_id_thr_pct)
