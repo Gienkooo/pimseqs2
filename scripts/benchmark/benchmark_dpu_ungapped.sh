@@ -70,13 +70,12 @@ MAX_SEQS="10000"
 # Minimum ungapped score threshold (default 15, override with MIN_UNGAPPED env var)
 MIN_UNGAPPED="15"
 
-DPU_COUNTS="2048,1024,512,256,128,64,2496"
-DPU_COUNTS_FOR_LOOP=( 2048 1024 512 256 128 64 2496 )
+DPU_COUNTS="2555,2048,1024,512,256,128,64"
 
 CMD_DPU_STR="\"$MMSEQS_BIN\" ungappedprefilter \"$QUERY_DB\" \"$TARGET_DB\" \"$OUT_DIR/${PREFILTER_MODE_NAME}_dpu_db-{dpus}\" \
 --prefilter-mode \"$PREFILTER_MODE\" --comp-bias-corr 0 --dpu 1 -v 3 \
 -e \"$E_VALUE\" --max-seqs \"$MAX_SEQS\" --min-ungapped-score \"$MIN_UNGAPPED\" --dpu-num-dpus \"{dpus}\" \
-2>&1 | tee \"$OUT_DIR/${PREFILTER_MODE_NAME}_dpu-{dpus}.log\""
+2>&1 | tee \"$OUT_DIR/bench_dpu_${PREFILTER_MODE_NAME}-{dpus}.log\""
 
 BENCHMARK_RESULT="$OUT_DIR/bench_dpu_${PREFILTER_MODE_NAME}_params_dpus.json"
 BENCHMARK_RAW="$OUT_DIR/bench_dpu_raw.json"
@@ -104,10 +103,6 @@ else
 fi
 
 hyperfine "${HF_ARGS[@]}" "$CMD_DPU_STR"
-
-for dpu_count in "${DPU_COUNTS_FOR_LOOP[@]}"; do
-    "$MMSEQS_BIN" createtsv "$QUERY_DB" "$TARGET_DB" "$OUT_DIR/${PREFILTER_MODE_NAME}_dpu_db-${dpu_count}" "$OUT_DIR/${PREFILTER_MODE_NAME}_dpu-${dpu_count}.tsv"
-done
 
 if [ "$ENABLE_ENERGY" == "true" ]; then
     echo "[BENCHMARK] Merging DRAM Energy Data..."
